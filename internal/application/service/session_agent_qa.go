@@ -305,6 +305,7 @@ func (s *sessionService) buildAgentConfig(
 		LLMCallTimeout:              customAgent.Config.LLMCallTimeout,
 		MaxCompletionTokens:         customAgent.Config.MaxCompletionTokens,
 		RetainRetrievalHistory:      customAgent.Config.RetainRetrievalHistory,
+		AppInfo:                     req.AppInfo,
 		SharedAgentReadOnly:         req.SharedAgentReadOnly,
 	}
 
@@ -613,15 +614,26 @@ func (s *sessionService) configureSkillsFromAgent(
 		return
 	}
 	agentConfig.SandboxConfigID = customAgent.Config.SandboxConfigID
+	// The deployment's skills/preloaded directory is seeded for "all" and
+	// "selected" as a fallback source: buildAgentConfig fills TenantSkills
+	// (the sandbox image) afterward, and skills.Manager gives that priority
+	// over this directory per skill name. Without this, a skill picked from
+	// the /skills picker that was never installed into any tenant sandbox
+	// is silently never offered to the model, even though the picker lists
+	// it as available.
+	preloadedDir := []string{getPreloadedSkillsDir()}
 	switch customAgent.Config.SkillsSelectionMode {
 	case "all":
 		agentConfig.SkillsEnabled = true
 		agentConfig.AllowedSkills = nil
-		logger.Infof(ctx, "SkillsSelectionMode=all: using installed sandbox skills")
+		agentConfig.SkillDirs = preloadedDir
+		logger.Infof(ctx, "SkillsSelectionMode=all: using installed sandbox skills, "+
+			"falling back to preloaded skills when none are installed")
 	case "selected":
 		if len(customAgent.Config.SelectedSkills) > 0 {
 			agentConfig.SkillsEnabled = true
 			agentConfig.AllowedSkills = customAgent.Config.SelectedSkills
+			agentConfig.SkillDirs = preloadedDir
 			logger.Infof(ctx, "SkillsSelectionMode=selected: enabled %d selected skills: %v",
 				len(customAgent.Config.SelectedSkills), customAgent.Config.SelectedSkills)
 		} else {

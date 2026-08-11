@@ -63,6 +63,19 @@ type MessageService interface {
 	// the frontend "download files generated in this session" drawer and
 	// to clean up storage blobs on session deletion.
 	GetSessionArtifacts(ctx context.Context, sessionID string) (types.MessageArtifacts, error)
+
+	// SubmitMessageFeedback records a like/dislike vote on an assistant
+	// message. reasons/reasonText only apply to a dislike vote; a like vote
+	// ignores them. One-shot: returns apperrors.ErrMessageFeedbackAlreadySubmitted
+	// if the message already carries a vote.
+	SubmitMessageFeedback(
+		ctx context.Context,
+		sessionID string,
+		messageID string,
+		feedbackType string,
+		reasons []string,
+		reasonText string,
+	) (*types.Message, error)
 }
 
 // MessageRepository defines the message repository interface
@@ -120,4 +133,9 @@ type MessageRepository interface {
 	// GetSessionAttachments returns every user-uploaded attachment recorded in
 	// the session. Implementations should project only the attachments column.
 	GetSessionAttachments(ctx context.Context, sessionID string) (types.MessageAttachments, error)
+	// UpdateMessageFeedback records a like/dislike vote, but only if the
+	// message doesn't already carry one. Returns gorm.ErrRecordNotFound if
+	// the message doesn't exist under sessionID, or
+	// apperrors.ErrMessageFeedbackAlreadySubmitted if it already has a vote.
+	UpdateMessageFeedback(ctx context.Context, sessionID, messageID string, feedback types.MessageFeedback) error
 }

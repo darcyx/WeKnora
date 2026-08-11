@@ -1346,8 +1346,8 @@
                       </div>
                       <div class="setting-control sandbox-select-control">
                         <t-radio-group v-model="skillsSelectionMode">
-                          <t-radio-button value="all" :disabled="!canEnableSkills">{{ $t('agent.editor.skillsAll') }}</t-radio-button>
-                          <t-radio-button value="selected" :disabled="!canEnableSkills">{{ $t('agent.editor.skillsSelected') }}</t-radio-button>
+                          <t-radio-button value="all">{{ $t('agent.editor.skillsAll') }}</t-radio-button>
+                          <t-radio-button value="selected">{{ $t('agent.editor.skillsSelected') }}</t-radio-button>
                           <t-radio-button value="none">{{ $t('agent.editor.skillsNone') }}</t-radio-button>
                         </t-radio-group>
                         <p v-if="!hasSandboxSelected && sandboxConfigOptions.length > 1" class="desc empty-hint">
@@ -2075,9 +2075,6 @@ const catalogReady = ref(false);
 const installingCatalogId = ref('');
 const skillsSelectionMode = ref<'all' | 'selected' | 'none'>('none');
 const hasSandboxSelected = computed(() => !!formData.value.config.sandbox_config_id);
-const canEnableSkills = computed(() =>
-  hasSandboxSelected.value || namedSandboxConfigs().length === 1,
-);
 const canInstallSkills = computed(() => authStore.hasRole('admin'));
 
 type CatalogSkillRow = SkillCatalogItem & {
@@ -2161,19 +2158,6 @@ function canInstallSkillRow(skill: CatalogSkillRow): boolean {
   return !skill.installed || skill.installStatus === 'failed'
 }
 
-function namedSandboxConfigs(): SandboxConfigRecord[] {
-  return chatResources.sandboxConfigs.filter((cfg) => isNamedSandboxBackend(cfg.sandbox_type))
-}
-
-function autoBindSoleSandbox() {
-  if (skillsSelectionMode.value === 'none') return
-  if (formData.value.config.sandbox_config_id) return
-  const configs = namedSandboxConfigs()
-  if (configs.length === 1) {
-    formData.value.config.sandbox_config_id = configs[0].id
-  }
-}
-
 function openSkillSettings() {
   const configId = formData.value.config.sandbox_config_id || ''
   uiStore.openSettings('skills', configId || undefined)
@@ -2239,7 +2223,6 @@ function pruneSelectedSkills() {
 }
 
 async function syncInstalledSkills(force = false) {
-  autoBindSoleSandbox()
   const configId = formData.value.config.sandbox_config_id || ''
   await editorResources.ensureSkills(configId, force)
   try {
@@ -3598,7 +3581,6 @@ const initSkillsSelectionMode = () => {
   } else {
     skillsSelectionMode.value = 'none';
   }
-  autoBindSoleSandbox();
 };
 
 // 内置智能体：填入系统默认值
@@ -3703,11 +3685,9 @@ watch(skillsSelectionMode, (mode) => {
   } else if (mode === 'all') {
     // 全部 Skills，清空指定列表
     formData.value.config.selected_skills = [];
-    autoBindSoleSandbox()
-  } else {
-    autoBindSoleSandbox()
   }
-  // selected 模式保持 selected_skills 不变
+  // selected 模式保持 selected_skills 不变；两种模式都不强制绑定沙箱，
+  // "不启用"仍是合法选择——预装技能不依赖任何沙箱镜像即可使用。
 });
 
 // 监听模式变化，自动调整配置

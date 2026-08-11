@@ -248,10 +248,13 @@ func (s *agentService) CreateAgentEngine(
 		}
 	}
 
-	// TenantSkills is the sandbox image. SkillDirs is the host
-	// skills/preloaded tree and is no longer filled on the QA path; it
-	// remains so tests (and any caller that still points at a host
-	// directory) can construct a manager.
+	// TenantSkills is the sandbox image and takes priority when installed;
+	// SkillDirs is the host skills/preloaded tree, populated by
+	// configureSkillsFromAgent as the fallback for a skill picked from the
+	// /skills picker without being installed into any tenant sandbox. A
+	// caller that builds AgentConfig directly (bypassing the QA picker) and
+	// leaves both unset gets no skills manager, matching
+	// TestCreateAgentEngineShellFollowsSkillsEnabledWithoutInstalledSkills.
 	//
 	// The shell is registered above by registerSandboxShellIfAllowed and
 	// follows SkillsEnabled rather than requiring a ready skill to already

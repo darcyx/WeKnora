@@ -425,7 +425,7 @@ func TestSkillsManagerOffersTheInjectedInstalledSkills(t *testing.T) {
 		require.Equal(t, []string{"pdf-tools"}, skillNamesOf(mgr))
 	})
 
-	t.Run("host preloaded skills are not offered beside the sandbox image", func(t *testing.T) {
+	t.Run("host preloaded skills are offered beside the sandbox image", func(t *testing.T) {
 		dir := t.TempDir()
 		skillDir := filepath.Join(dir, "document-analyzer")
 		require.NoError(t, os.MkdirAll(skillDir, 0o755))
@@ -447,8 +447,8 @@ func TestSkillsManagerOffersTheInjectedInstalledSkills(t *testing.T) {
 		}, tools.NewToolRegistry())
 
 		require.NoError(t, err)
-		require.Equal(t, []string{"pdf-tools"}, skillNamesOf(mgr),
-			"the host skills/preloaded tree is not what the sandbox image carries")
+		require.Equal(t, []string{"document-analyzer", "pdf-tools"}, skillNamesOf(mgr),
+			"the preloaded tree and the sandbox image are merged, tenant skills shadowing same-named preloaded ones")
 	})
 
 	t.Run("injected rows are offered", func(t *testing.T) {

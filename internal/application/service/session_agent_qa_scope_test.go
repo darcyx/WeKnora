@@ -114,7 +114,7 @@ func TestApplyPerRequestSkillScope_NoneIgnores(t *testing.T) {
 	assert.Empty(t, cfg.PinnedSkillNames)
 }
 
-func TestConfigureSkillsFromAgentDoesNotLoadHostPreloadedDir(t *testing.T) {
+func TestConfigureSkillsFromAgentFallsBackToHostPreloadedDir(t *testing.T) {
 	svc := &sessionService{}
 	cfg := &types.AgentConfig{}
 	svc.configureSkillsFromAgent(context.Background(), cfg, &types.CustomAgent{
@@ -125,6 +125,10 @@ func TestConfigureSkillsFromAgentDoesNotLoadHostPreloadedDir(t *testing.T) {
 	})
 	assert.True(t, cfg.SkillsEnabled)
 	assert.Equal(t, "cfg-1", cfg.SandboxConfigID)
-	assert.Empty(t, cfg.SkillDirs,
-		"the host skills/preloaded tree is not what the sandbox image carries")
+	// buildAgentConfig fills TenantSkills afterward; skills.Manager gives the
+	// sandbox image priority per skill name over this directory whenever a
+	// tenant skill exists. It is the only source when nothing is installed.
+	assert.NotEmpty(t, cfg.SkillDirs,
+		"SkillsSelectionMode=all falls back to the deployment's skills/preloaded "+
+			"directory so a tenant with nothing installed still sees preloaded skills")
 }

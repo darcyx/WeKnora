@@ -49,8 +49,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
-# Note: Current preloaded skills only use Python stdlib
+# Note: Current preloaded skills only use Python stdlib plus tencentcloud-sdk-python.
 # Add packages here when skills actually need them:
+RUN pip install --no-cache-dir tencentcloud-sdk-python -q
 
 # Create non-root user (UID 1000) for sandbox execution. The account is named
 # "user" because that is the account name E2B templates are expected to expose

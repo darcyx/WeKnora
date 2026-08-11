@@ -326,6 +326,76 @@ func (h *MessageHandler) GetChatHistoryKBStats(c *gin.Context) {
 	})
 }
 
+// SubmitMessageFeedbackRequest is the body for SubmitMessageFeedback.
+// Reasons/ReasonText only apply to a "dislike" vote; ReasonText is required
+// only when Reasons includes "other".
+type SubmitMessageFeedbackRequest struct {
+	Type       string   `json:"type" binding:"required"`
+	Reasons    []string `json:"reasons,omitempty"`
+	ReasonText string   `json:"reason_text,omitempty"`
+}
+
+// SubmitMessageFeedback godoc
+// @Summary      提交消息反馈（点赞/点踩）
+// @Description  对助手消息提交一次性的点赞/点踩投票；点踩需提供原因（多选），选择"其他"时需附文字说明
+// @Tags         消息
+// @Accept       json
+// @Produce      json
+// @Param        session_id  path  string  true  "会话ID"
+// @Param        id          path  string  true  "消息ID"
+// @Param        request     body  SubmitMessageFeedbackRequest  true  "反馈内容"
+// @Success      200  {object}  map[string]interface{}  "反馈已记录"
+// @Failure      400  {object}  errors.AppError  "请求参数错误"
+// @Failure      404  {object}  errors.AppError  "会话或消息不存在"
+// @Failure      409  {object}  errors.AppError  "该消息已提交过反馈"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /messages/{session_id}/{id}/feedback [post]
+func (h *MessageHandler) SubmitMessageFeedback(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	sessionID := secutils.SanitizeForLog(c.Param("session_id"))
+	messageID := secutils.SanitizeForLog(c.Param("id"))
+
+	var request SubmitMessageFeedbackRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.Error(errors.NewBadRequestError("invalid request body"))
+		return
+	}
+
+	message, err := h.MessageService.SubmitMessageFeedback(
+		ctx, sessionID, messageID, request.Type, request.Reasons, request.ReasonText,
+	)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		switch {
+		case stderrors.Is(err, errors.ErrSessionNotFound):
+			// See the note on LoadMessages above — message-service ops surface
+			// ErrSessionNotFound when the caller can't see the owning session.
+			c.Error(errors.NewNotFoundError(err.Error()))
+		case stderrors.Is(err, gorm.ErrRecordNotFound):
+			c.Error(errors.NewNotFoundError("message not found"))
+		case stderrors.Is(err, errors.ErrMessageFeedbackAlreadySubmitted):
+			c.Error(errors.NewConflictError(err.Error()))
+		default:
+			logger.ErrorWithFields(ctx, err, map[string]interface{}{
+				"session_id": sessionID,
+				"message_id": messageID,
+			})
+			c.Error(errors.NewInternalServerError("message feedback operation failed"))
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    message.Feedback,
+	})
+}
+
 // parseMessageBeforeTime parses the `before_time` query used by LoadMessages.
 // Frontend cursors may be RFC3339 (no fractional seconds) or RFC3339Nano.
 func parseMessageBeforeTime(raw string) (time.Time, error) {

@@ -41,6 +41,7 @@ type AgentEngine struct {
 	selectedDocs         []*SelectedDocumentInfo // User-selected documents (via @ mention)
 	pinnedMCPServices    []*PinnedMCPServiceInfo // User @mentioned MCP services for this turn
 	pinnedSkills         []*PinnedSkillInfo      // User @mentioned skills for this turn
+	appInfo              string					 // Compact JSON supplied through this turn's request ext object
 	sessionID            string                  // Session ID for logging and event emission
 	systemPromptTemplate string                  // System prompt template (optional, uses default if empty)
 	memoryPrompt         string                  // Long-term memory envelope appended to the system prompt
@@ -92,6 +93,7 @@ func NewAgentEngine(
 		eventBus:             eventBus,
 		knowledgeBasesInfo:   knowledgeBasesInfo,
 		selectedDocs:         selectedDocs,
+		appInfo:              config.AppInfo,
 		sessionID:            sessionID,
 		systemPromptTemplate: systemPromptTemplate,
 		tokenEstimator:       tokenEst,
@@ -648,7 +650,8 @@ func (e *AgentEngine) runReActIteration(
 	}
 	response = resp
 	e.logContextDrift(ctx, round, currentTokens, response.Usage)
-	if response.Usage.TotalTokens > 0 {
+	if response.Usage.PromptTokens > 0 || response.Usage.CompletionTokens > 0 || response.Usage.TotalTokens > 0 {
+		state.AddUsage(response.Usage)
 		e.lastUsage = response.Usage
 		state.TurnUsage.Accumulate(response.Usage)
 		logger.Infof(ctx, "[Agent][Round-%d] Usage: prompt=%d, completion=%d, total=%d, "+

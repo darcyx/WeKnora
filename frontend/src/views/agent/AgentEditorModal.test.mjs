@@ -123,14 +123,19 @@ test('skills and sandbox share one editor section', () => {
   assert.doesNotMatch(source, /currentSection === 'sandbox' && isAgentMode/)
   assert.match(source, /sandbox: 'skills'/)
   assert.match(source, /formData\.config\.sandbox_config_id/)
-  assert.match(source, /:disabled="!canEnableSkills"/)
+  // "all"/"selected" must stay pickable with no sandbox selected: preloaded
+  // skills run without any tenant sandbox image, so skills no longer force a
+  // sandbox choice the way installed/catalog skills alone used to.
+  assert.doesNotMatch(source, /:disabled="!canEnableSkills"/)
   assert.match(source, /sandbox-option/)
   assert.doesNotMatch(source, /skill-info-box/)
 })
 
 test('agent skill picker uses the catalog and only enables ready installs', () => {
-  assert.match(source, /function autoBindSoleSandbox\(/)
-  assert.match(source, /canEnableSkills/)
+  // Choosing "all"/"selected" must not force-bind the sole sandbox config:
+  // that made "不启用" (no sandbox) impossible to keep once skills were on.
+  assert.doesNotMatch(source, /function autoBindSoleSandbox\(/)
+  assert.doesNotMatch(source, /canEnableSkills/)
   assert.match(source, /catalogSkillRows/)
   assert.match(source, /showCatalogSkillList/)
   assert.match(source, /skillsSelectionMode\.value !== 'none'/)

@@ -361,6 +361,56 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 	return filesvc.NewResourceCatalogFileService(inner, s.resourceCatalog), resolvedProvider, nil
 }
 
+// ResolveResourceFileService resolves a stable resource handle through the
+// backend recorded on the resource. A resource may belong to another tenant
+// when it is rendered through a shared knowledge base, so use the resource
+// owner only to scope the backend lookup rather than the caller tenant.
+func (s *StorageBackendService) ResolveResourceFileService(
+	ctx context.Context,
+	reference, localBaseDir string,
+) (interfaces.FileService, error) {
+	if s.resourceCatalog == nil {
+		return nil, nil
+	}
+	resource, err := s.resourceCatalog.Resolve(ctx, reference)
+	if err != nil {
+		return nil, err
+	}
+	if resource == nil {
+		// Legacy resources without a backend ID continue through the existing
+		// process-wide default service path.
+		return nil, nil
+	}
+	backendID := strings.TrimSpace(resource.StorageBackendID)
+	provider := strings.TrimSpace(resource.Provider)
+	if pathBackendID, innerPath, scoped := types.ParseStorageBackendPath(resource.PhysicalPath); scoped {
+		// Older resource rows may predate the dedicated StorageBackendID column;
+		// recover the scope from the canonical physical path when available.
+		if backendID == "" {
+			backendID = pathBackendID
+		}
+		if provider == "" {
+			provider = types.ParseProviderScheme(innerPath)
+		}
+	}
+	if backendID == "" {
+		return nil, nil
+	}
+
+	owner := &types.Tenant{ID: resource.TenantID}
+	service, _, err := s.ResolveFileService(
+		ctx,
+		owner,
+		backendID,
+		provider,
+		localBaseDir,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return service, nil
+}
+
 func validateStorageBackendEndpoint(backend *types.StorageBackend) error {
 	if backend.Provider == "local" || (backend.Provider == "minio" && backend.Config.Mode == "docker") {
 		return nil
@@ -383,6 +433,7 @@ func validateStorageBackendEndpoint(backend *types.StorageBackend) error {
 }
 
 var (
-	_ interfaces.StorageBackendService  = (*StorageBackendService)(nil)
-	_ interfaces.StorageBackendResolver = (*StorageBackendService)(nil)
+	_ interfaces.StorageBackendService       = (*StorageBackendService)(nil)
+	_ interfaces.StorageBackendResolver      = (*StorageBackendService)(nil)
+	_ interfaces.ResourceFileServiceResolver = (*StorageBackendService)(nil)
 )

@@ -315,6 +315,10 @@ type Message struct {
 	// spot. Persisted rather than only streamed so reopening a conversation
 	// still explains what the answer saw.
 	UsedMemories UsedMemories `json:"used_memories,omitempty" gorm:"type:jsonb;column:used_memories"`
+	// Feedback is the end user's like/dislike vote on this assistant answer.
+	// Nil means no vote has been cast yet. One-shot: set once via
+	// SubmitMessageFeedback and never edited afterwards.
+	Feedback *MessageFeedback `json:"feedback,omitempty" gorm:"type:jsonb;column:feedback"`
 	// Message creation timestamp
 	CreatedAt time.Time `json:"created_at"`
 	// Last update timestamp

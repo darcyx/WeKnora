@@ -500,6 +500,111 @@ export async function resetSystemSetting(key: string): Promise<void> {
   await del(`/api/v1/system/admin/settings/${encodeURIComponent(key)}`)
 }
 
+// ---- External-user token quotas ----
+
+export interface TokenQuotaLimits {
+  daily_token_limit: number
+  monthly_token_limit: number
+}
+
+export interface TokenQuotaOverride {
+  subject_id: string
+  daily_token_limit?: number
+  monthly_token_limit?: number
+  created_at?: string
+  updated_at?: string
+}
+
+export interface TokenQuotaPeriodUsage {
+  subject_id: string
+  period: 'day' | 'month'
+  period_start: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  reserved_tokens: number
+}
+
+export interface TokenQuotaUsageSnapshot {
+  subject_id: string
+  limits: TokenQuotaLimits
+  override?: TokenQuotaOverride
+  daily?: TokenQuotaPeriodUsage
+  monthly?: TokenQuotaPeriodUsage
+}
+
+export interface TokenQuotaUser {
+  external_user_id: string
+  quota: TokenQuotaUsageSnapshot
+}
+
+export interface TokenQuotaUserPage {
+  items: TokenQuotaUser[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface UpdateUserTokenQuotaRequest {
+  // Omit a field to inherit the platform default. Set it to zero to disable
+  // that period's limit explicitly for this external user.
+  daily_token_limit?: number
+  monthly_token_limit?: number
+}
+
+/**
+ * Quota is keyed by workspace + external user ID: external user IDs are chosen
+ * by each workspace and are only unique within it, so the workspace ID must
+ * accompany every lookup and write.
+ */
+function tokenQuotaQuery(tenantId: number | string, externalUserId: string): string {
+  return `tenant_id=${encodeURIComponent(String(tenantId))}&subject_id=${encodeURIComponent(externalUserId)}`
+}
+
+/** List external users that have observed usage or an override in one workspace. */
+export async function listTenantTokenQuotaUsers(
+  tenantId: number | string,
+  page = 1,
+  pageSize = 50,
+): Promise<TokenQuotaUserPage> {
+  const response = await get(
+    `/api/v1/system/admin/token-quotas/users?tenant_id=${encodeURIComponent(String(tenantId))}&page=${page}&page_size=${pageSize}`,
+  )
+  return response as unknown as TokenQuotaUserPage
+}
+
+/** Get one external user's effective token limits and current UTC usage. */
+export async function getUserTokenQuota(
+  tenantId: number | string,
+  externalUserId: string,
+): Promise<TokenQuotaUsageSnapshot> {
+  const response = await get(
+    `/api/v1/system/admin/token-quotas?${tokenQuotaQuery(tenantId, externalUserId)}`,
+  )
+  return response as unknown as TokenQuotaUsageSnapshot
+}
+
+/** Set one external user's token quota override within a workspace. */
+export async function updateUserTokenQuota(
+  tenantId: number | string,
+  externalUserId: string,
+  request: UpdateUserTokenQuotaRequest,
+): Promise<TokenQuotaOverride> {
+  const response = await put(
+    `/api/v1/system/admin/token-quotas?${tokenQuotaQuery(tenantId, externalUserId)}`,
+    request,
+  )
+  return response as unknown as TokenQuotaOverride
+}
+
+/** Remove one user's override so both periods fall back to platform defaults. */
+export async function deleteUserTokenQuota(
+  tenantId: number | string,
+  externalUserId: string,
+): Promise<void> {
+  await del(`/api/v1/system/admin/token-quotas?${tokenQuotaQuery(tenantId, externalUserId)}`)
+}
+
 /**
  * Result of POST /system/admin/tenants/apply-default-storage-quota.
  * `affected` is the count of tenant rows whose storage_quota was

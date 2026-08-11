@@ -155,6 +155,10 @@ type AgentConfig struct {
 	// Per-request @mention pins (runtime only; injected as <must_use> in the user message).
 	PinnedMCPServiceIDs []string `json:"-"`
 	PinnedSkillNames    []string `json:"-"`
+	// AppInfo is compact JSON copied from the current request's ext object and
+	// injected into that turn's <runtime_context>. It is never persisted as
+	// part of an agent configuration or replayed from conversation history.
+	AppInfo string `json:"-"`
 	// SharedAgentReadOnly prevents a shared agent from mutating resources in
 	// its source workspace. It is set from the verified share relation, never
 	// inferred from a client-provided tenant ID.
@@ -415,6 +419,30 @@ type AgentState struct {
 	FinalAnswer   string          `json:"final_answer"`   // The final answer to the query
 	KnowledgeRefs []*SearchResult `json:"knowledge_refs"` // Collected knowledge references
 	TurnUsage     TokenUsage      `json:"turn_usage"`     // LLM token usage accumulated across every round of this turn
+	Usage         TokenUsage      `json:"usage"`          // Cumulative model usage for this agent execution
+}
+
+// AddUsage accumulates model-reported usage for this agent execution.
+// Calls that do not report usage are intentionally ignored.
+func (s *AgentState) AddUsage(usage TokenUsage) {
+	if s == nil || (usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0) {
+		return
+	}
+	s.Usage.PromptTokens += usage.PromptTokens
+	s.Usage.CompletionTokens += usage.CompletionTokens
+	s.Usage.TotalTokens += usage.TotalTokens
+	s.Usage.CachedTokens += usage.CachedTokens
+	s.Usage.CacheReadTokens += usage.CacheReadTokens
+	s.Usage.CacheWriteTokens += usage.CacheWriteTokens
+	s.Usage.CacheMissTokens += usage.CacheMissTokens
+	if usage.CacheReported {
+		s.Usage.CacheReported = true
+		if s.Usage.CacheReadTokens > 0 {
+			s.Usage.CacheStatus = PromptCacheStatusHit
+		} else {
+			s.Usage.CacheStatus = PromptCacheStatusMiss
+		}
+	}
 }
 
 // FunctionDefinition represents a function definition for LLM function calling
