@@ -593,8 +593,18 @@ func escapeXMLAttr(s string) string {
 	return s
 }
 
+// escapeXMLText escapes data placed between XML-ish tags. Quotes remain
+// untouched so a JSON payload stays readable and valid inside <app_info>.
+func escapeXMLText(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
 // buildRuntimeContextBlock builds a metadata block with current time, session
-// info, and the *active retrieval scope for this turn only*. It is injected
+// info, app info supplied in the request ext object, and the
+// *active retrieval scope for this turn only*. It is injected
 // into the current user message for the LLM call and is not persisted into
 // conversation history — replayed user turns keep bare Content so stale scope
 // snapshots do not steer follow-up questions.
@@ -609,6 +619,7 @@ func buildRuntimeContextBlock(
 	origin *QuestionOriginInfo,
 	page *PageContextInfo,
 	assistantName string,
+	appInfo string,
 ) string {
 	var sb strings.Builder
 	sb.WriteString("<runtime_context scope=\"this_turn\">\n")
@@ -618,6 +629,10 @@ func buildRuntimeContextBlock(
 		// The workspace renamed the assistant; it is a label, not an instruction.
 		fmt.Fprintf(&sb, "  <assistant_name note=\"what this workspace calls you; use it when you refer to yourself\">"+
 			"%s</assistant_name>\n", escapeXMLAttr(assistantName))
+	}
+
+	if appInfo != "" {
+		fmt.Fprintf(&sb, "  <app_info>%s</app_info>\n", escapeXMLText(appInfo))
 	}
 
 	if len(kbs) > 0 {
@@ -936,7 +951,7 @@ func commonStringPrefix(a, b string) string {
 func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	e.registerRuntimeReferences()
 	runtimeCtx := buildRuntimeContextBlock(
-		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName)
+		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName,e.appInfo)
 	runtimeCtx = e.modelContext.EncodeKnownIssues(e.modelContext.CompactKnownText(runtimeCtx))
 	mustUse := buildMustUseBlock(e.pinnedMCPServices, e.pinnedSkills)
 	return composeUserTurnContent(runtimeCtx, mustUse, query)

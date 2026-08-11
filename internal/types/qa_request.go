@@ -214,6 +214,7 @@ type QARequest struct {
 	Interactive bool
 	// Resume, when set, continues a suspended run instead of starting one.
 	Resume *AgentResume
+	AppInfo       string // Compact JSON copied from the request ext object for this turn's agent runtime context
 }
 
 // AgentResume is what a resumed run continues from.
