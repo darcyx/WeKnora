@@ -106,7 +106,7 @@ Now generate the final answer:`, query, imageRequirement)
 			if chunk.ResponseType == types.ResponseTypeThinking {
 				return
 			}
-			if chunk.Content != "" {
+			if chunk.Content != "" || chunk.Done {
 				logger.Debugf(ctx, "[Agent][FinalAnswer] Emitting answer chunk: %d chars", len(chunk.Content))
 				e.eventBus.Emit(ctx, event.Event{
 					ID:        answerID,
@@ -130,6 +130,9 @@ Now generate the final answer:`, query, imageRequirement)
 			"error":      err.Error(),
 		})
 		return err
+	}
+	if llmResult.Usage != nil {
+		state.AddUsage(*llmResult.Usage)
 	}
 
 	if !answerDoneEmitted {

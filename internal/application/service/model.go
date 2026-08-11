@@ -31,6 +31,7 @@ type modelService struct {
 	ollamaService *ollama.OllamaService
 	pooler        embedding.EmbedderPooler
 	tenantService interfaces.TenantService
+	tokenQuota    interfaces.TokenQuotaService
 }
 
 // NewModelService creates a new model service instance
@@ -40,6 +41,7 @@ func NewModelService(repo interfaces.ModelRepository,
 	ollamaService *ollama.OllamaService,
 	pooler embedding.EmbedderPooler,
 	tenantService interfaces.TenantService,
+	tokenQuota interfaces.TokenQuotaService,
 ) interfaces.ModelService {
 	return &modelService{
 		repo:          repo,
@@ -48,6 +50,7 @@ func NewModelService(repo interfaces.ModelRepository,
 		ollamaService: ollamaService,
 		pooler:        pooler,
 		tenantService: tenantService,
+		tokenQuota:    tokenQuota,
 	}
 }
 
@@ -574,7 +577,7 @@ func (s *modelService) GetChatModel(ctx context.Context, modelId string) (chat.C
 		return nil, err
 	}
 
-	return chatModel, nil
+	return newQuotaChat(chatModel, s.tokenQuota), nil
 }
 
 // GetVLMModel retrieves and initializes a vision language model instance.

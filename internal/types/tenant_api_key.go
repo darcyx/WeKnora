@@ -154,14 +154,16 @@ const (
 	// tenant-scoped integration settings exposed under /tenants, such as API
 	// principal mode, request headers, and tenant KV. It does not include API
 	// key management, member management, tenant deletion, or ownership transfer.
-	APIKeyCapabilityManageTenantSettings APIKeyCapability = "manage_tenant_settings"
-	APIKeyCapabilitySystemTenantsRead    APIKeyCapability = "system_tenants_read"
-	APIKeyCapabilitySystemTenantsManage  APIKeyCapability = "system_tenants_manage"
-	APIKeyCapabilitySystemSettingsRead   APIKeyCapability = "system_settings_read"
-	APIKeyCapabilitySystemSettingsManage APIKeyCapability = "system_settings_manage"
-	APIKeyCapabilitySystemRuntimeRead    APIKeyCapability = "system_runtime_read"
-	APIKeyCapabilitySystemRuntimeManage  APIKeyCapability = "system_runtime_manage"
-	APIKeyCapabilitySystemAuditRead      APIKeyCapability = "system_audit_read"
+	APIKeyCapabilityManageTenantSettings   APIKeyCapability = "manage_tenant_settings"
+	APIKeyCapabilitySystemTenantsRead      APIKeyCapability = "system_tenants_read"
+	APIKeyCapabilitySystemTenantsManage    APIKeyCapability = "system_tenants_manage"
+	APIKeyCapabilitySystemSettingsRead     APIKeyCapability = "system_settings_read"
+	APIKeyCapabilitySystemSettingsManage   APIKeyCapability = "system_settings_manage"
+	APIKeyCapabilitySystemRuntimeRead      APIKeyCapability = "system_runtime_read"
+	APIKeyCapabilitySystemRuntimeManage    APIKeyCapability = "system_runtime_manage"
+	APIKeyCapabilitySystemAuditRead        APIKeyCapability = "system_audit_read"
+	APIKeyCapabilitySystemTokenQuotaRead   APIKeyCapability = "system_token_quota_read"
+	APIKeyCapabilitySystemTokenQuotaManage APIKeyCapability = "system_token_quota_manage"
 )
 
 // NormalizeAPIKeyCapability maps an input capability string to a known
@@ -218,6 +220,10 @@ func NormalizeAPIKeyCapability(c APIKeyCapability) APIKeyCapability {
 		return APIKeyCapabilitySystemRuntimeManage
 	case APIKeyCapabilitySystemAuditRead:
 		return APIKeyCapabilitySystemAuditRead
+	case APIKeyCapabilitySystemTokenQuotaRead:
+		return APIKeyCapabilitySystemTokenQuotaRead
+	case APIKeyCapabilitySystemTokenQuotaManage:
+		return APIKeyCapabilitySystemTokenQuotaManage
 	default:
 		return ""
 	}

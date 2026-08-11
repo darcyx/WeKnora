@@ -557,7 +557,8 @@ func (e *AgentEngine) runReActIteration(
 		return iterOutcomeBreak, nil
 	}
 	response = resp
-	if response.Usage.TotalTokens > 0 {
+	if response.Usage.PromptTokens > 0 || response.Usage.CompletionTokens > 0 || response.Usage.TotalTokens > 0 {
+		state.AddUsage(response.Usage)
 		e.lastUsage = response.Usage
 		logger.Debugf(ctx, "[Agent][Round-%d] Usage: prompt=%d, completion=%d, total=%d",
 			round, response.Usage.PromptTokens,

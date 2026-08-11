@@ -270,7 +270,7 @@ curl "$BASE/api/v1/knowledge-bases/kb-1/knowledge?page=1&parse_status=completed"
 
 ### GET /api/v1/knowledge-bases/:id/knowledge/folders
 
-用途：获取知识库的文件夹目录树。整目录上传时目录结构会被保留（migration `000079` 起存在 `knowledges.folder_path` 列，早期把路径塞在 `file_name` 里的数据已回填）。权限：Viewer+ + KBAccessRead。
+用途：获取知识库的文件夹目录树。整目录上传时目录结构会被保留（migration `000081` 起存在 `knowledges.folder_path` 列，早期把路径塞在 `file_name` 里的数据已回填）。权限：Viewer+ + KBAccessRead。
 
 响应：200 `{"success":true,"data":[{FolderNode}]}`
 

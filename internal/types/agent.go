@@ -256,6 +256,30 @@ type AgentState struct {
 	IsComplete    bool            `json:"is_complete"`    // Whether agent has finished
 	FinalAnswer   string          `json:"final_answer"`   // The final answer to the query
 	KnowledgeRefs []*SearchResult `json:"knowledge_refs"` // Collected knowledge references
+	Usage         TokenUsage      `json:"usage"`          // Cumulative model usage for this agent execution
+}
+
+// AddUsage accumulates model-reported usage for this agent execution.
+// Calls that do not report usage are intentionally ignored.
+func (s *AgentState) AddUsage(usage TokenUsage) {
+	if s == nil || (usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0) {
+		return
+	}
+	s.Usage.PromptTokens += usage.PromptTokens
+	s.Usage.CompletionTokens += usage.CompletionTokens
+	s.Usage.TotalTokens += usage.TotalTokens
+	s.Usage.CachedTokens += usage.CachedTokens
+	s.Usage.CacheReadTokens += usage.CacheReadTokens
+	s.Usage.CacheWriteTokens += usage.CacheWriteTokens
+	s.Usage.CacheMissTokens += usage.CacheMissTokens
+	if usage.CacheReported {
+		s.Usage.CacheReported = true
+		if s.Usage.CacheReadTokens > 0 {
+			s.Usage.CacheStatus = PromptCacheStatusHit
+		} else {
+			s.Usage.CacheStatus = PromptCacheStatusMiss
+		}
+	}
 }
 
 // FunctionDefinition represents a function definition for LLM function calling

@@ -37,7 +37,9 @@ export default {
       settingsManage: '플랫폼 설정을 변경합니다.',
       runtimeRead: '작업 큐와 상세 정보를 조회합니다.',
       runtimeManage: '작업을 재시도, 실행, 취소 또는 삭제합니다.',
-      auditRead: '플랫폼 감사 로그를 조회합니다.'
+      auditRead: '플랫폼 감사 로그를 조회합니다.',
+      tokenQuotaRead: '지정한 워크스페이스의 외부 사용자 Token 할당량과 사용량을 조회합니다.',
+      tokenQuotaManage: '지정한 워크스페이스의 외부 사용자 Token 할당량을 설정하거나 기본값으로 복원합니다.'
     },
     capabilities: {
       tenantsRead: '워크스페이스 조회',
@@ -46,8 +48,24 @@ export default {
       settingsManage: '시스템 설정 관리',
       runtimeRead: '런타임 조회',
       runtimeManage: '런타임 관리',
-      auditRead: '시스템 감사 조회'
+      auditRead: '시스템 감사 조회',
+      tokenQuotaRead: '외부 사용자 Token 할당량 조회',
+      tokenQuotaManage: '외부 사용자 Token 할당량 관리'
     }
+  },
+  tokenQuotaSettings: {
+    title: '외부 사용자 Token 할당량',
+    description: '사용량을 조회하고 워크스페이스 내 외부 사용자의 기본 Token 할당량을 재정의합니다.',
+    identityHint: '할당량은 워크스페이스 ID와 API 요청 헤더 X-External-User-ID의 외부 사용자 ID 조합으로 구분됩니다.',
+    tenantId: '워크스페이스 ID', tenantIdPlaceholder: '워크스페이스 ID 입력', tenantIdRequired: '워크스페이스 ID를 입력하세요', tenantIdInvalid: '워크스페이스 ID는 숫자여야 합니다',
+    subjectId: '외부 사용자 ID', subjectIdPlaceholder: 'X-External-User-ID 값 입력', subjectIdRequired: '외부 사용자 ID를 입력하세요', query: '조회', listUsers: '사용자 목록', usersTitle: '확인된 외부 사용자', usersDescription: '사용 기록 또는 할당량 재정의가 있는 사용자만 표시됩니다. 사용자를 선택해 할당량을 수정하세요.', previousPage: '이전', nextPage: '다음', pageInfo: '{page}페이지, 사용자 {total}명',
+    dailyUsage: '오늘 사용량', monthlyUsage: '이번 달 사용량', reservedTokens: '진행 중 예약', reservedHint: '실행 중인 요청이 일시적으로 할당량을 사용합니다',
+    unlimited: '무제한', limitValue: '한도: {value}', overrideTitle: '사용자별 할당량 재정의', overrideDescription: '비워 둔 기간은 플랫폼 기본값을 사용합니다.',
+    overridden: '재정의됨', inheriting: '플랫폼 기본값 사용', dailyLimit: '일일 Token 한도', monthlyLimit: '월간 Token 한도',
+    inheritPlaceholder: '비워 두면 플랫폼 기본값 사용', limitHint: '0을 입력하면 해당 기간의 한도를 해제합니다.', reset: '기본값으로 복원',
+    resetConfirm: '이 사용자의 할당량 재정의를 제거하고 플랫폼 기본값으로 복원할까요?', save: '할당량 저장', noData: '할당량 사용 기록이 없습니다.',
+    loadFailed: 'Token 할당량을 불러오지 못했습니다', overrideRequired: '기간 한도를 하나 이상 입력하세요', saveSuccess: 'Token 할당량이 저장되었습니다',
+    saveFailed: 'Token 할당량을 저장하지 못했습니다', resetSuccess: '플랫폼 기본 할당량으로 복원되었습니다', resetFailed: '플랫폼 기본 할당량으로 복원하지 못했습니다'
   },
   tenantInvitation: {
     inboxTooltip: '대기 중인 초대 보기',
@@ -2775,6 +2793,11 @@ export default {
         model: {
           max_concurrency: '백그라운드 작업(문서 색인/보강)이 단일 모델에 대해 갖는 기본 동시 호출 상한이며, 모델 ID 기준으로 모든 복제본이 공유합니다. 매 호출마다 실시간으로 읽고 재시작 없이 즉시 적용됩니다. 0 또는 음수는 기본 상한을 해제합니다(각 모델은 모델 관리에서 설정한 자체 상한을 계속 준수함). 백그라운드 작업에만 영향을 주며 대화형 채팅에는 영향을 주지 않습니다.'
         },
+        token_quota: {
+          default_daily_limit: '같은 워크스페이스의 외부 사용자별 일일 기본 Token 한도입니다. 0은 무제한이며 사용자별 재정의로 변경할 수 있습니다.',
+          default_monthly_limit: '같은 워크스페이스의 외부 사용자별 월간 기본 Token 한도입니다. 0은 무제한이며 사용자별 재정의로 변경할 수 있습니다.',
+          max_completion_tokens: '호출에서 최대 출력 Token을 지정하지 않았을 때의 기본 예약 상한입니다. 남은 할당량에 맞춰 자동으로 낮아집니다.'
+        },
         asynq: {
           core_concurrency: '문서 및 수동 파싱의 프로세스별 보장 동시성입니다. 공유 탄력 풀도 사용할 수 있습니다. 최소 1, 서비스 재시작이 필요합니다.',
           postprocess_concurrency: '파싱 마무리 및 보강 작업 분배 전용 프로세스별 동시성입니다. 최소 1, 서비스 재시작이 필요합니다.',
@@ -2800,6 +2823,11 @@ export default {
       keyLabels: {
         model: {
           max_concurrency: '모델 기본 동시 처리 상한'
+        },
+        token_quota: {
+          default_daily_limit: '외부 사용자 일일 기본 Token 한도',
+          default_monthly_limit: '외부 사용자 월간 기본 Token 한도',
+          max_completion_tokens: '기본 최대 출력 Token 수'
         },
         asynq: {
           core_concurrency: '핵심 파싱 보장 동시성',
@@ -3591,6 +3619,7 @@ export default {
       recommended: '추천',
       recommendedEnabled: '추천 활성화됨',
       recommendedDisabled: '추천 비활성화됨',
+      recommendedEnableSuccess: 'FAQ 항목 추천이 활성화되었습니다',
       recommendedDisableSuccess: 'FAQ 항목 추천이 비활성화되었습니다',
       recommendedUpdateFailed: '추천 상태 업데이트 실패',
       batchUpdateTag: '일괄 태그 설정',
@@ -5073,6 +5102,7 @@ export default {
     mcpService: 'MCP 서비스',
     versionInfo: '버전 정보',
     taskQueue: '작업 큐',
+    tokenQuotas: 'Token 할당량',
     tenantInfo: '워크스페이스 정보',
     workspaceSettings: '워크스페이스 설정',
     system: '시스템 설정',

@@ -282,6 +282,18 @@ func RegisterSystemAdminRoutes(
 		g.apiKeyRoute(adminRoutes, http.MethodDelete, "/settings/:key",
 			apiKeyPlatform(types.APIKeyCapabilitySystemSettingsManage), handler.ResetSystemSetting)
 
+		// External-user token quota is a platform control-plane resource.
+		g.apiKeyRoute(adminRoutes, http.MethodGet, "/token-quotas/users",
+			apiKeyPlatform(types.APIKeyCapabilitySystemTokenQuotaRead, types.APIKeyCapabilitySystemTokenQuotaManage),
+			handler.ListTenantTokenQuotaUsers)
+		g.apiKeyRoute(adminRoutes, http.MethodGet, "/token-quotas",
+			apiKeyPlatform(types.APIKeyCapabilitySystemTokenQuotaRead, types.APIKeyCapabilitySystemTokenQuotaManage),
+			handler.GetUserTokenQuota)
+		g.apiKeyRoute(adminRoutes, http.MethodPut, "/token-quotas",
+			apiKeyPlatform(types.APIKeyCapabilitySystemTokenQuotaManage), handler.UpdateUserTokenQuota)
+		g.apiKeyRoute(adminRoutes, http.MethodDelete, "/token-quotas",
+			apiKeyPlatform(types.APIKeyCapabilitySystemTokenQuotaManage), handler.DeleteUserTokenQuota)
+
 		// Runtime operations: live asynq queue depths, safe task projections,
 		// and state-checked task actions for the SystemAdmin dashboard. Lite
 		// mode returns available=false.

@@ -160,6 +160,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewUserRepository))
 	must(container.Provide(repository.NewAuthTokenRepository))
 	must(container.Provide(repository.NewSystemSettingRepository))
+	must(container.Provide(repository.NewTokenQuotaRepository))
 	must(container.Provide(neo4jRepo.NewNeo4jRepository))
 	must(container.Provide(repository.NewMCPServiceRepository))
 	must(container.Provide(repository.NewMCPToolApprovalRepository))
@@ -217,6 +218,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewEvaluationService))
 	must(container.Provide(service.NewUserService))
 	must(container.Provide(service.NewSystemSettingService))
+	must(container.Provide(func(s interfaces.SystemSettingService) interfaces.TokenQuotaSettingsResolver { return s }))
+	must(container.Provide(service.NewTokenQuotaService))
 	must(container.Provide(func(
 		repo repository.TenantSandboxConfigRepository,
 		agents interfaces.CustomAgentRepository,

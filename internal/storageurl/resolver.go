@@ -65,6 +65,16 @@ func (r *FileServiceResolver) WithContext(ctx context.Context) *FileServiceResol
 // ResolveFileService implements Resolver.
 func (r *FileServiceResolver) ResolveFileService(filePath string) interfaces.FileService {
 	if _, ok := types.ParseResourcePath(filePath); ok {
+		if resourceResolver, ok := r.storageResolver.(interfaces.ResourceFileServiceResolver); ok {
+			svc, err := resourceResolver.ResolveResourceFileService(r.ctx, filePath, LocalStorageBaseDir())
+			if err != nil {
+				logger.Warnf(r.ctx, "resolve resource storage backend failed: reference=%s err=%v", filePath, err)
+				return nil
+			}
+			if svc != nil {
+				return svc
+			}
+		}
 		return r.defaultSvc
 	}
 	backendID, _, _ := types.ParseStorageBackendPath(filePath)

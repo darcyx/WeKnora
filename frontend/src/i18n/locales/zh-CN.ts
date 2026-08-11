@@ -37,7 +37,9 @@ export default {
       settingsManage: '更新和重置平台级运行设置。',
       runtimeRead: '查看任务队列和任务详情。',
       runtimeManage: '重试、立即执行、取消或删除运行时任务。',
-      auditRead: '读取平台级审计日志。'
+      auditRead: '读取平台级审计日志。',
+      tokenQuotaRead: '查看指定空间中外部用户的 Token 配额与用量。',
+      tokenQuotaManage: '设置或恢复指定空间中外部用户的 Token 配额。'
     },
     capabilities: {
       tenantsRead: '查看空间',
@@ -46,8 +48,29 @@ export default {
       settingsManage: '管理系统设置',
       runtimeRead: '查看运行时',
       runtimeManage: '管理运行时',
-      auditRead: '查看系统审计'
+      auditRead: '查看系统审计',
+      tokenQuotaRead: '查看外部用户 Token 配额',
+      tokenQuotaManage: '管理外部用户 Token 配额'
     }
+  },
+  tokenQuotaSettings: {
+    title: '外部用户 Token 配额',
+    description: '查看用量，并为某个空间中的外部用户覆盖平台默认 Token 配额。',
+    identityHint: '配额按空间 ID 和 API 请求头 X-External-User-ID 中的外部用户 ID 共同区分。',
+    tenantId: '空间 ID',
+    tenantIdPlaceholder: '输入空间 ID',
+    tenantIdRequired: '请输入空间 ID',
+    tenantIdInvalid: '空间 ID 必须是数字',
+    subjectId: '外部用户 ID',
+    subjectIdPlaceholder: '输入 X-External-User-ID 的值',
+    subjectIdRequired: '请输入外部用户 ID',
+    query: '查询', listUsers: '列出用户', usersTitle: '已出现的外部用户', usersDescription: '仅列出已有用量记录或配额覆盖的用户；点击用户即可编辑额度。', previousPage: '上一页', nextPage: '下一页', pageInfo: '第 {page} 页，共 {total} 位用户', dailyUsage: '当日已用', monthlyUsage: '当月已用',
+    reservedTokens: '进行中预留', reservedHint: '正在执行的请求暂占额度', unlimited: '不限额', limitValue: '额度：{value}',
+    overrideTitle: '用户额度覆盖', overrideDescription: '留空的周期继承平台默认额度。', overridden: '已覆盖', inheriting: '使用平台默认值',
+    dailyLimit: '每日 Token 上限', monthlyLimit: '每月 Token 上限', inheritPlaceholder: '留空使用平台默认值',
+    limitHint: '输入 0 表示该周期不限额。', reset: '恢复默认值', resetConfirm: '确定移除此用户的额度覆盖并恢复平台默认值吗？',
+    save: '保存额度', noData: '未找到配额用量记录。', loadFailed: '加载 Token 配额失败', overrideRequired: '请至少填写一个周期的额度',
+    saveSuccess: 'Token 配额已保存', saveFailed: '保存 Token 配额失败', resetSuccess: '已恢复平台默认额度', resetFailed: '恢复平台默认额度失败'
   },
   tenantInvitation: {
     inboxTooltip: '查看待接受的邀请',
@@ -2777,6 +2800,11 @@ export default {
         model: {
           max_concurrency: '后台任务（文档入库/富化）对单个模型的默认并发上限，按模型 ID 全副本共享。每次调用实时读取，修改后立即生效、无需重启。0 或负数表示关闭默认限制（各模型仍会尊重自身在模型管理里配置的上限）。仅影响后台任务，不影响交互式对话。'
         },
+        token_quota: {
+          default_daily_limit: '同一空间中每个外部用户的每日默认 Token 上限。0 表示不限额；用户额度覆盖可单独修改此值。',
+          default_monthly_limit: '同一空间中每个外部用户的每月默认 Token 上限。0 表示不限额；用户额度覆盖可单独修改此值。',
+          max_completion_tokens: '调用未指定最大输出 Token 时的默认预留上限。系统会在用户的剩余额度内自动压低该值。'
+        },
         asynq: {
           core_concurrency: '文档解析与手工重解析的每实例保底并发，可额外借用共享弹性池；修改后需重启。',
           postprocess_concurrency: '解析完成后的轻量收尾和富化扇出专用并发；修改后需重启。',
@@ -2802,6 +2830,11 @@ export default {
       keyLabels: {
         model: {
           max_concurrency: '模型默认并发上限'
+        },
+        token_quota: {
+          default_daily_limit: '外部用户每日默认 Token 上限',
+          default_monthly_limit: '外部用户每月默认 Token 上限',
+          max_completion_tokens: '默认最大输出 Token 数'
         },
         asynq: {
           core_concurrency: '核心解析保底并发数',
@@ -3593,6 +3626,7 @@ export default {
       recommended: '推荐',
       recommendedEnabled: '已开启推荐',
       recommendedDisabled: '已关闭推荐',
+      recommendedEnableSuccess: 'FAQ 条目已开启推荐',
       recommendedDisableSuccess: 'FAQ 条目已关闭推荐',
       recommendedUpdateFailed: '更新推荐状态失败',
       batchUpdateTag: '批量设置标签',
@@ -5075,6 +5109,7 @@ export default {
     mcpService: 'MCP服务',
     versionInfo: '版本信息',
     taskQueue: '任务队列',
+    tokenQuotas: 'Token 配额',
     tenantInfo: '空间信息',
     workspaceSettings: '空间设置',
     system: '系统设置',
