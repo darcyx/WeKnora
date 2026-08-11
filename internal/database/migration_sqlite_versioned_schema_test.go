@@ -34,11 +34,17 @@ var versionedSQLiteTables = []string{
 	"tenant_skill_snapshots",
 	"tenant_skill_catalog",
 	"tenant_user_env_vars",
+	"faq_feedbacks", // 999003 (fork-local)
 }
 
 // versionedSQLiteColumns maps each existing table to the columns that the
 // versioned migrations add and the SQLite baseline was missing.
 var versionedSQLiteColumns = map[string][]string{
+	"faq_feedbacks": { // 999003 (fork-local)
+		"tenant_id", "session_id", "user_id", "entry_id", "feedback",
+		"chunk_id", "knowledge_id", "knowledge_base_id", "tag_id", "tag_name",
+		"standard_question", "similar_questions", "negative_questions", "answers", "answer_strategy",
+	},
 	"model_catalog_configs": {"version", "overlay", "history", "updated_by", "updated_at"},        // 000031
 	"memory_subjects":       {"extraction_state"},                                                 // 000094
 	"memory_items":          {"replaces_id"},                                                      // 000094
@@ -67,7 +73,7 @@ var versionedSQLiteColumns = map[string][]string{
 	}, // 000028
 }
 
-const expectedSQLiteMigrationVersion = 31
+const expectedSQLiteMigrationVersion = 999003
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)

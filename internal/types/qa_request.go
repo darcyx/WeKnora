@@ -83,4 +83,5 @@ type QARequest struct {
 	// IM/MCP, which call the QA services directly, do not and leave this
 	// false so the service takes the lease itself.
 	TurnLeaseHeld bool
+	AppInfo   string // Compact JSON copied from the request ext object for this turn's agent runtime context
 }

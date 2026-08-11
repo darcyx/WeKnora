@@ -342,6 +342,7 @@ func (s *sessionService) buildAgentConfig(
 		LLMCallTimeout:              customAgent.Config.LLMCallTimeout,
 		MaxCompletionTokens:         customAgent.Config.MaxCompletionTokens,
 		RetainRetrievalHistory:      customAgent.Config.RetainRetrievalHistory,
+		AppInfo:                     req.AppInfo,
 		SharedAgentReadOnly:         req.SharedAgentReadOnly,
 	}
 	applyRequestReasoningEffort(req.ReasoningEffort, &agentConfig.Thinking, &agentConfig.ReasoningEffort)

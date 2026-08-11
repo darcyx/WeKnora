@@ -157,6 +157,10 @@
           <RuntimeQueues />
         </div>
 
+        <div v-if="currentSection === 'token-quotas'" class="section">
+          <TokenQuotaSettings />
+        </div>
+
         <div v-if="currentSection === 'platform-api-keys'" class="section">
           <PlatformAPIKeys />
         </div>
@@ -221,6 +225,7 @@ import WeKnoraCloudSettings from './WeKnoraCloudSettings.vue'
 import TenantMembers from './TenantMembers.vue'
 import SystemSettings from '@/views/system/SystemSettings.vue'
 import RuntimeQueues from '@/views/system/RuntimeQueues.vue'
+import TokenQuotaSettings from '@/views/system/TokenQuotaSettings.vue'
 import PlatformAPIKeys from '@/views/system/PlatformAPIKeys.vue'
 import SystemAuditLog from '@/views/system/SystemAuditLog.vue'
 import IntegrationSettingsSection from '@/views/integrations/IntegrationSettingsSection.vue'
@@ -352,6 +357,7 @@ const navItems = computed(() => {
     { key: 'system-global', icon: 'server', label: t('settings.system') },
     { key: 'model-catalog', icon: 'control-platform', label: t('modelCatalog.title') },
     { key: 'runtime-queues', icon: 'queue', label: t('settings.taskQueue') },
+    { key: 'token-quotas', icon: 'chart-pie', label: t('settings.tokenQuotas') },
     { key: 'platform-api-keys', icon: 'secured', label: t('platformApiKeys.title') },
     { key: 'system-audit-log', icon: 'history', label: t('system.globalSettings.audit.tabLabel') },
     { key: 'userprofile', icon: 'user', label: t('userProfile.title') },
@@ -412,7 +418,7 @@ const navGroups = computed<NavGroup[]>(() => {
     {
       key: 'system_administration',
       label: t('settings.navGroups.systemAdministration'),
-      items: pickItems(['system-global', 'model-catalog', 'runtime-queues', 'platform-api-keys', 'system-audit-log']),
+      items: pickItems(['system-global', 'model-catalog', 'token-quotas', 'runtime-queues', 'platform-api-keys', 'system-audit-log']),
     },
     {
       key: 'platform',
@@ -472,7 +478,7 @@ const handleClose = () => {
   // 如果当前路由是设置页，返回上一页
   if (route.path === '/platform/settings') {
     const sec = route.query.section
-    if (sec === 'model-catalog' || sec === 'system-global' || sec === 'runtime-queues' || sec === 'platform-api-keys' || sec === 'system-audit-log') {
+    if (sec === 'model-catalog' || sec === 'system-global' || sec === 'runtime-queues' || sec === 'platform-api-keys' || sec === 'token-quotas' || sec === 'system-audit-log') {
       router.push('/platform/knowledge-bases')
     } else {
       router.back()

@@ -70,6 +70,10 @@ type CreateKnowledgeQARequest struct {
 
 	// ReasoningEffort overrides thinking for this request; empty inherits the agent configuration.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// Ext carries the caller's complete app information for external
+	// integrations. The whole object (including nested objects such as
+	// "gameInfo") is serialized into the agent's per-turn <app_info> context.
+	Ext map[string]any `json:"ext,omitempty"`
 }
 
 // AttachmentUpload represents a file attachment upload from the client
