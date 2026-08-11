@@ -63,6 +63,10 @@ type CreateKnowledgeQARequest struct {
 	SuggestionAttribution *types.SuggestionAttribution `json:"suggestion_attribution,omitempty"`
 	// QuestionOrigin is the knowledge source of a picked suggested question.
 	QuestionOrigin *types.QuestionOrigin `json:"question_origin,omitempty"`
+	// Ext carries the caller's complete app information for external
+	// integrations. The whole object (including nested objects such as
+	// "gameInfo") is serialized into the agent's per-turn <app_info> context.
+	Ext map[string]any `json:"ext,omitempty"`
 }
 
 // AttachmentUpload represents a file attachment upload from the client

@@ -29,18 +29,24 @@ var versionedSQLiteTables = []string{
 	"fork_snapshot_leases",
 	"mcp_endpoints",
 	"message_artifacts",
+	"faq_feedbacks", // 999003 (fork-local)
 }
 
 // versionedSQLiteColumns maps each existing table to the columns that the
 // versioned migrations add and the SQLite baseline was missing.
 var versionedSQLiteColumns = map[string][]string{
+	"faq_feedbacks": { // 999003 (fork-local)
+		"tenant_id", "session_id", "user_id", "entry_id", "feedback",
+		"chunk_id", "knowledge_id", "knowledge_base_id", "tag_id", "tag_name",
+		"standard_question", "similar_questions", "negative_questions", "answers", "answer_strategy",
+	},
 	"memory_subjects": {"extraction_state"},                                                 // 000094
 	"memory_items":    {"replaces_id"},                                                      // 000094
 	"tenants":         {"api_principal_config"},                                             // 000064
 	"users":           {"is_system_admin"},                                                  // 000053
 	"knowledges":      {"pending_subtasks_count", "profile"},                                // 000056, 000101
 	"knowledge_bases": {"profile_config", "generated_profile"},                              // 000101
-	"messages":        {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint"}, // 000034/085/097/105
+	"messages":        {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint", "feedback"}, // 000034/085/097/105
 	"sessions": {
 		"parent_session_id", "forked_from_message_id", "fork_bootstrap", // 000097
 		"sandbox_config_tenant_id", // 000108
@@ -52,7 +58,7 @@ var versionedSQLiteColumns = map[string][]string{
 	"message_artifacts":  {"deleted_at"},                     // 000107
 }
 
-const expectedSQLiteMigrationVersion = 27
+const expectedSQLiteMigrationVersion = 999003
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
