@@ -221,6 +221,7 @@ type QARequest struct {
 	// RunNote is appended to the system prompt of this run only: how the
 	// run was started, for runs nobody is watching.
 	RunNote string
+	AppInfo       string // Compact JSON copied from the request ext object for this turn's agent runtime context
 }
 
 // AgentResume is what a resumed run continues from.

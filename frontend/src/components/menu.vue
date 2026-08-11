@@ -94,6 +94,7 @@
                         :class="['menu_item', item.childrenPath && item.childrenPath == currentpath ? 'menu_item_c_active' : isMenuItemActive(item.path) ? 'menu_item_active' : '']">
                         <div class="menu_item-box">
                             <div class="menu_icon" :class="`menu_icon--${item.icon}`">
+                                <t-icon v-if="item.icon === 'feedback'" name="chat-bubble-help" size="20px" />
                                 <img class="icon"
                                     :src="getImgSrc(item.icon == 'zhishiku' ? knowledgeIcon : item.icon == 'agent' ? agentIcon : item.icon == 'artifact' ? artifactIcon : item.icon == 'automation' ? automationIcon : item.icon == 'toolbox' ? toolboxIcon : item.icon == 'organization' ? organizationIcon : item.icon == 'logout' ? logoutIcon : item.icon == 'setting' ? settingIcon : prefixIcon)"
                                     alt="">
@@ -461,6 +462,8 @@ const isMenuItemActive = (itemPath: string): boolean => {
             return currentRoute === 'agentList';
         case 'toolbox':
             return currentRoute === 'toolbox';
+        case 'feedback':
+            return currentRoute === 'feedbackAdmin';
         case 'artifacts':
             return currentRoute === 'artifactLibrary';
         case 'automations':
@@ -493,7 +496,7 @@ const getIconActiveState = (itemPath: string) => {
 };
 
 // 分离上下两部分菜单（使用 visibleMenuArr 以便 lite 模式过滤 logout）
-const TOP_MENU_PATHS = new Set(['creatChat', 'knowledge-bases', 'artifacts', 'agents', 'automations', 'toolbox', 'organizations']);
+const TOP_MENU_PATHS = new Set(['creatChat', 'knowledge-bases', 'artifacts', 'agents', 'automations', 'toolbox', 'organizations', 'feedback']);
 
 const topMenuItems = computed<MenuItem[]>(() => {
     return (visibleMenuArr.value as unknown as MenuItem[]).filter((item: MenuItem) => TOP_MENU_PATHS.has(item.path));
@@ -1186,6 +1189,8 @@ const handleMenuClick = async (path: string) => {
         }
     } else if (path === 'agents') {
         router.push('/platform/agents')
+    } else if (path === 'feedback') {
+        router.push('/platform/feedback')
     } else if (path === 'organizations') {
         // 组织菜单项：跳转到组织列表
         router.push('/platform/organizations')

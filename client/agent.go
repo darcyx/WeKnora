@@ -39,6 +39,7 @@ type AgentQARequest struct {
 	Channel          string            `json:"channel,omitempty"`            // Source channel: "web", "api", "im", etc.
 	QuestionOrigin   *QuestionOrigin   `json:"question_origin,omitempty"`    // Source of a picked suggested question
 	PageContext      *PageContext      `json:"page_context,omitempty"`       // Page the user has open (hint only)
+	Ext              map[string]any    `json:"ext,omitempty"`                // Per-request application context forwarded to the agent
 }
 
 // AgentResponseType defines the type of agent response
@@ -69,6 +70,7 @@ const (
 // AgentStreamResponse agent streaming response
 type AgentStreamResponse struct {
 	ID                  string                 `json:"id"`                   // Unique identifier
+	MessageID           string                 `json:"message_id,omitempty"` // Assistant message ID
 	ResponseType        AgentResponseType      `json:"response_type"`        // Response type
 	Content             string                 `json:"content,omitempty"`    // Current content fragment
 	Done                bool                   `json:"done"`                 // Whether completed
