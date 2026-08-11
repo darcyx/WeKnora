@@ -238,11 +238,25 @@ func (s *agentService) CreateAgentEngine(
 		}
 	}
 
-	// TenantSkills is the sandbox image. SkillDirs is the host
-	// skills/preloaded tree and is no longer filled on the QA path; it
-	// remains so tests (and any caller that still points at a host
-	// directory) can construct a manager. Install mode initializes for
-	// the shell without hanging a skills manager on the engine.
+	// TenantSkills is the sandbox image; SkillDirs is the host
+	// skills/preloaded tree. configureSkillsFromAgent never fills SkillDirs
+	// (it only knows about TenantSkills), so without a fallback here a
+	// skill that is selectable from the /skills picker but was never
+	// installed into a tenant sandbox has no source at all: the <must_use>
+	// block still forces the model to call read_skill for it, but
+	// offerSkills stays false and the tool never gets registered, which
+	// surfaces to the user as "tool not found: read_skill". read_skill only
+	// reads SKILL.md text off disk - no sandbox required - so it is safe to
+	// fall back to the same preloaded directory the picker itself lists
+	// from. When a tenant source is also attached it takes priority per
+	// skill (see Manager.resolveSource), so this fallback never shadows an
+	// installed skill.
+	if config.SkillsEnabled && len(config.SkillDirs) == 0 {
+		config.SkillDirs = []string{getPreloadedSkillsDir()}
+	}
+
+	// Install mode initializes for the shell without hanging a skills
+	// manager on the engine.
 	offerSkills := config.SkillsEnabled &&
 		(len(config.SkillDirs) > 0 || len(config.TenantSkills) > 0)
 	if offerSkills || config.SkillInstallMode() {

@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -86,6 +87,38 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 		return Principal{Type: PrincipalWebUser, ID: uid}, true
 	}
 	return Principal{}, false
+}
+
+// TokenQuotaSubject builds the token-quota accounting key for an API
+// integration's external user.
+//
+// The tenant prefix is part of the key on purpose. External user IDs are
+// chosen by each tenant, and in APIPrincipalModeDirect they arrive unverified
+// in a request header; even in signed-token mode the signature only proves the
+// issuing tenant vouches for the ID. Two tenants that pick the same external
+// user ID are therefore different subjects, and neither can spend — or
+// exhaust — the other's budget.
+func TokenQuotaSubject(tenantID uint64, externalUserID string) string {
+	externalUserID = strings.TrimSpace(externalUserID)
+	if externalUserID == "" {
+		return ""
+	}
+	return strconv.FormatUint(tenantID, 10) + ":" + externalUserID
+}
+
+// TokenQuotaSubjectFromContext returns the tenant-scoped quota subject for an
+// API external-user principal. The principal ID already carries the tenant
+// prefix that TokenQuotaSubject produces, so it is the accounting key as-is.
+func TokenQuotaSubjectFromContext(ctx context.Context) (string, bool) {
+	p, ok := PrincipalFromContext(ctx)
+	if !ok || p.Type != PrincipalAPIExternalUser {
+		return "", false
+	}
+	tenantPrefix, externalUserID, found := strings.Cut(p.ID, ":")
+	if !found || strings.TrimSpace(tenantPrefix) == "" || strings.TrimSpace(externalUserID) == "" {
+		return "", false
+	}
+	return p.ID, true
 }
 
 func WithEmbedVisitorID(ctx context.Context, visitorID string) context.Context {

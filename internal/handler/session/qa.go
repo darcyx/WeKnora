@@ -56,6 +56,7 @@ type qaRequestContext struct {
 	userCreatedAt         time.Time                // Persisted user message timestamp, echoed on agent_query
 	channel               string                   // Source channel: "web", "api", "im", etc.
 	attachments           types.MessageAttachments // Processed base64 file attachments (legacy inline uploads)
+	appInfo               string                   // Compact JSON serialized from the request ext object
 	attachmentIDs         []string                 // Pre-uploaded session-scoped document IDs, resolved after SSE starts
 	attachmentMetas       types.MessageAttachments // Metadata-only view of attachmentIDs for the persisted user message
 	suggestionAttribution *types.SuggestionAttribution
@@ -91,7 +92,22 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 		UserMessageID:       rc.userMessageID,
 		WebSearchEnabled:    rc.webSearchEnabled,
 		Attachments:         rc.attachments,
+		AppInfo:             rc.appInfo,
 	}
+}
+
+// marshalAppInfo preserves the complete extension object as compact JSON for
+// the current agent turn. An empty ext object means there is no <app_info>
+// block to inject.
+func marshalAppInfo(ext map[string]interface{}) (string, error) {
+	if len(ext) == 0 {
+		return "", nil
+	}
+	payload, err := json.Marshal(ext)
+	if err != nil {
+		return "", fmt.Errorf("marshal ext app info: %w", err)
+	}
+	return string(payload), nil
 }
 
 // parseQARequest parses and validates a QA request, returns the request context
@@ -121,6 +137,11 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		logger.Error(ctx, "Query content is empty")
 		return nil, nil, errors.NewBadRequestError("Query content cannot be empty")
 	}
+	appInfo, err := marshalAppInfo(request.Ext)
+	if err != nil {
+		logger.Errorf(ctx, "[%s] Failed to marshal ext app info: %v", logPrefix, err)
+		return nil, nil, errors.NewBadRequestError("ext must be valid JSON")
+	}
 
 	// Resolve the storage-reference representation up front: once the SSE stream
 	// has started an invalid value can no longer be reported as a 400.
@@ -144,7 +165,13 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	}
 
 	// Log request details
-	if requestJSON, err := json.Marshal(request); err == nil {
+	requestForLog := request
+	if len(requestForLog.Ext) > 0 {
+		// ext may contain credentials such as app_secret. It still flows to the
+		// model as requested, but must never be copied into application logs.
+		requestForLog.Ext = map[string]interface{}{"_redacted": true}
+	}
+	if requestJSON, err := json.Marshal(requestForLog); err == nil {
 		logger.Infof(ctx, "[%s] Request: session_id=%s, request=%s",
 			logPrefix, sessionID, secutils.SanitizeForLog(secutils.CompactImageDataURLForLog(string(requestJSON))))
 	}
@@ -382,6 +409,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		images:                request.Images,
 		channel:               request.Channel,
 		attachments:           processedAttachments,
+		appInfo:               appInfo,
 		attachmentIDs:         attachmentIDs,
 		attachmentMetas:       attachmentMetas,
 		suggestionAttribution: request.SuggestionAttribution,

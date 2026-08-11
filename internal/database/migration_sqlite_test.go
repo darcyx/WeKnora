@@ -4,10 +4,31 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestVersionedMigrationsHaveUniqueVersions(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+
+	files, err := filepath.Glob(filepath.Join(repoRoot, "migrations", "versioned", "*.up.sql"))
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+
+	versions := make(map[string]string, len(files))
+	for _, file := range files {
+		name := filepath.Base(file)
+		version, _, ok := strings.Cut(name, "_")
+		require.Truef(t, ok, "migration %q must begin with its numeric version", name)
+
+		previous, duplicate := versions[version]
+		require.Falsef(t, duplicate, "migration version %s is used by both %s and %s", version, previous, name)
+		versions[version] = name
+	}
+}
 
 func TestSQLiteMigrationsIncludeAutoTagConfig(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))

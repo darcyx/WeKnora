@@ -10,9 +10,25 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
+
+type fakePreloadedSkillService struct {
+	skills []*skills.SkillMetadata
+}
+
+func (f *fakePreloadedSkillService) ListPreloadedSkills(context.Context) ([]*skills.SkillMetadata, error) {
+	return f.skills, nil
+}
+
+func (f *fakePreloadedSkillService) GetSkillByName(context.Context, string) (*skills.Skill, error) {
+	return nil, nil
+}
+
+var _ interfaces.SkillService = (*fakePreloadedSkillService)(nil)
 
 type fakeUsableSkillLister struct {
 	tenantID uint64
@@ -43,11 +59,14 @@ func newChatSkillRouter(h *SkillHandler) *gin.Engine {
 	return r
 }
 
-func TestListSkillsHidesThePickerWhenNoSandboxConfigIsSelected(t *testing.T) {
+func TestListSkillsReturnsPreloadedSkillsWithoutSandboxConfig(t *testing.T) {
 	lister := &fakeUsableSkillLister{
 		skills: []*types.TenantSkillEntity{{Name: "ppt-generator", Description: "make ppt"}},
 	}
-	router := newChatSkillRouter(NewSkillHandler(lister))
+	preloaded := &fakePreloadedSkillService{
+		skills: []*skills.SkillMetadata{{Name: "citation-generator", Description: "cite sources"}},
+	}
+	router := newChatSkillRouter(NewSkillHandler(preloaded, lister))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/skills", nil))
@@ -60,8 +79,10 @@ func TestListSkillsHidesThePickerWhenNoSandboxConfigIsSelected(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	require.True(t, body.Success)
-	require.Empty(t, body.Data, "preloaded and unscoped skills must not appear in @")
-	require.False(t, body.SkillsAvailable)
+	require.True(t, body.SkillsAvailable)
+	require.Equal(t, []SkillInfoResponse{
+		{Name: "citation-generator", Description: "cite sources"},
+	}, body.Data)
 	require.Empty(t, lister.configID)
 }
 
@@ -71,7 +92,10 @@ func TestListSkillsReturnsUsableInstalledSkillsForTheSelectedConfig(t *testing.T
 			{Name: "ppt-generator", Description: "make ppt"},
 		},
 	}
-	router := newChatSkillRouter(NewSkillHandler(lister))
+	preloaded := &fakePreloadedSkillService{
+		skills: []*skills.SkillMetadata{{Name: "citation-generator", Description: "cite sources"}},
+	}
+	router := newChatSkillRouter(NewSkillHandler(preloaded, lister))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(
@@ -91,6 +115,7 @@ func TestListSkillsReturnsUsableInstalledSkillsForTheSelectedConfig(t *testing.T
 	require.True(t, body.Success)
 	require.True(t, body.SkillsAvailable)
 	require.Equal(t, []SkillInfoResponse{
+		{Name: "citation-generator", Description: "cite sources"},
 		{Name: "ppt-generator", Description: "make ppt"},
 	}, body.Data)
 }

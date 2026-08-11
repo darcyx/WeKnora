@@ -134,6 +134,60 @@ func TestContinueStream_LargeReferenceLineParses(t *testing.T) {
 	}
 }
 
+func TestAgentQAStreamWithRequest_SerializesExt(t *testing.T) {
+	type capturedRequest struct {
+		body []byte
+		err  error
+	}
+	captured := make(chan capturedRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		captured <- capturedRequest{body: body, err: err}
+		w.Header().Set("Content-Type", "text/event-stream")
+		agentSSEEvent(t, w, AgentStreamResponse{ResponseType: AgentResponseTypeComplete, Done: true})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	err := c.AgentQAStreamWithRequest(context.Background(), "sess",
+		&AgentQARequest{
+			Query:        "q",
+			AgentEnabled: true,
+			Ext: map[string]any{
+				"gameInfo": map[string]any{
+					"app_name":   "GS SDK",
+					"app_id":     "10100327",
+					"app_secret": "secret",
+				},
+			},
+		},
+		func(*AgentStreamResponse) error { return nil })
+	if err != nil {
+		t.Fatalf("agent QA stream failed: %v", err)
+	}
+
+	got := <-captured
+	if got.err != nil {
+		t.Fatalf("read request body: %v", got.err)
+	}
+	var payload struct {
+		Ext map[string]map[string]any `json:"ext"`
+	}
+	if err := json.Unmarshal(got.body, &payload); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	gameInfo := payload.Ext["gameInfo"]
+	if gameInfo["app_name"] != "GS SDK" {
+		t.Errorf("ext.gameInfo.app_name = %v, want GS SDK", gameInfo["app_name"])
+	}
+	if gameInfo["app_id"] != "10100327" {
+		t.Errorf("ext.gameInfo.app_id = %v, want 10100327", gameInfo["app_id"])
+	}
+	if gameInfo["app_secret"] != "secret" {
+		t.Errorf("ext.gameInfo.app_secret = %v, want secret", gameInfo["app_secret"])
+	}
+}
+
 // TestAgentQAStreamWithRequest_DefaultBlanketTimeoutDoesNotCutStream is the
 // regression test for doRequestStream: the client's ordinary default Timeout
 // must NOT apply to SSE streams. Shrink that default to 100ms in-package so the

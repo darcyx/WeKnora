@@ -347,8 +347,18 @@ func escapeXMLAttr(s string) string {
 	return s
 }
 
+// escapeXMLText escapes data placed between XML-ish tags. Quotes remain
+// untouched so a JSON payload stays readable and valid inside <app_info>.
+func escapeXMLText(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
 // buildRuntimeContextBlock builds a metadata block with current time, session
-// info, and the *active retrieval scope for this turn only*. It is injected
+// info, app info supplied in the request ext object, and the
+// *active retrieval scope for this turn only*. It is injected
 // into the current user message for the LLM call and is not persisted into
 // conversation history — replayed user turns keep bare Content so stale scope
 // snapshots do not steer follow-up questions.
@@ -364,11 +374,16 @@ func buildRuntimeContextBlock(
 	sessionID string,
 	kbs []*KnowledgeBaseInfo,
 	docs []*SelectedDocumentInfo,
+	appInfo string,
 ) string {
 	var sb strings.Builder
 	sb.WriteString("<runtime_context scope=\"this_turn\">\n")
 	fmt.Fprintf(&sb, "  <current_time>%s</current_time>\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(&sb, "  <session>%s</session>\n", escapeXMLAttr(sessionID))
+
+	if appInfo != "" {
+		fmt.Fprintf(&sb, "  <app_info>%s</app_info>\n", escapeXMLText(appInfo))
+	}
 
 	if len(kbs) > 0 {
 		// Render the full bound-KB detail (capabilities + recent docs) so the
@@ -506,7 +521,7 @@ func commonStringPrefix(a, b string) string {
 // not written to rendered_content / history.
 func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	e.registerRuntimeReferences()
-	runtimeCtx := buildRuntimeContextBlock(sessionID, e.knowledgeBasesInfo, e.selectedDocs)
+	runtimeCtx := buildRuntimeContextBlock(sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.appInfo)
 	runtimeCtx = e.modelContext.CompactKnownText(runtimeCtx)
 	mustUse := buildMustUseBlock(e.pinnedMCPServices, e.pinnedSkills)
 	return composeUserTurnContent(runtimeCtx, mustUse, query)

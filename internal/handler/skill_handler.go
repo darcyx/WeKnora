@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
 )
 
@@ -17,13 +20,18 @@ type usableSkillLister interface {
 
 // SkillHandler handles skill-related HTTP requests
 type SkillHandler struct {
-	usableSkills usableSkillLister
+	preloadedSkills interfaces.SkillService
+	usableSkills    usableSkillLister
 }
 
 // NewSkillHandler creates a new skill handler
-func NewSkillHandler(usableSkills usableSkillLister) *SkillHandler {
+func NewSkillHandler(
+	preloadedSkills interfaces.SkillService,
+	usableSkills usableSkillLister,
+) *SkillHandler {
 	return &SkillHandler{
-		usableSkills: usableSkills,
+		preloadedSkills: preloadedSkills,
+		usableSkills:    usableSkills,
 	}
 }
 
@@ -46,27 +54,55 @@ type SkillInfoResponse struct {
 // @Router       /skills [get]
 func (h *SkillHandler) ListSkills(c *gin.Context) {
 	configID := c.Query("sandbox_config_id")
-	if configID == "" || h.usableSkills == nil {
+	response := make([]SkillInfoResponse, 0)
+	indexByName := make(map[string]int)
+
+	if h.preloadedSkills != nil {
+		metadata, err := h.preloadedSkills.ListPreloadedSkills(c.Request.Context())
+		if err != nil {
+			logger.ErrorWithFields(c.Request.Context(), err, nil)
+			c.Error(apperrors.NewInternalServerError("failed to list preloaded skills: " + err.Error()))
+			return
+		}
+		for _, meta := range metadata {
+			if meta == nil || meta.Name == "" {
+				continue
+			}
+			indexByName[meta.Name] = len(response)
+			response = append(response, SkillInfoResponse{
+				Name:        meta.Name,
+				Description: meta.Description,
+			})
+		}
+	}
+
+	if configID != "" && h.usableSkills != nil {
+		rows := h.usableSkills.ListUsableSkills(
+			c.Request.Context(), sandboxConfigTenantID(c), configID,
+		)
+		for _, row := range rows {
+			if row == nil || row.Name == "" {
+				continue
+			}
+			item := SkillInfoResponse{Name: row.Name, Description: row.Description}
+			if index, ok := indexByName[row.Name]; ok {
+				// Keep runtime behaviour consistent: an installed tenant Skill
+				// shadows a preloaded Skill with the same name.
+				response[index] = item
+				continue
+			}
+			indexByName[row.Name] = len(response)
+			response = append(response, item)
+		}
+	}
+
+	if len(response) == 0 {
 		c.JSON(http.StatusOK, gin.H{
 			"success":          true,
-			"data":             []SkillInfoResponse{},
+			"data":             response,
 			"skills_available": false,
 		})
 		return
-	}
-
-	rows := h.usableSkills.ListUsableSkills(
-		c.Request.Context(), sandboxConfigTenantID(c), configID,
-	)
-	response := make([]SkillInfoResponse, 0, len(rows))
-	for _, row := range rows {
-		if row == nil {
-			continue
-		}
-		response = append(response, SkillInfoResponse{
-			Name:        row.Name,
-			Description: row.Description,
-		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{

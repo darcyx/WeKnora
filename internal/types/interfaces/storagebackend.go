@@ -29,3 +29,11 @@ type StorageBackendResolver interface {
 	ResolveFileService(ctx context.Context, tenant *types.Tenant, backendID, provider, localBaseDir string) (FileService, string, error)
 	ResolveBackend(ctx context.Context, tenant *types.Tenant, backendID, provider string) (*types.StorageBackend, error)
 }
+
+// ResourceFileServiceResolver is an optional extension for resolving a stable
+// resource:// handle through the storage backend recorded on that resource.
+// It is kept separate from StorageBackendResolver so focused implementations
+// that only resolve provider paths do not need to know about the resource catalog.
+type ResourceFileServiceResolver interface {
+	ResolveResourceFileService(ctx context.Context, reference, localBaseDir string) (FileService, error)
+}

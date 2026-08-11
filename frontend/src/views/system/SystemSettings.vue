@@ -636,6 +636,9 @@ const SETTINGS_SECTION_KEYS: Record<Exclude<SettingsSection, 'other'>, readonly 
     'asynq.shared_concurrency',
     'asynq.wiki_concurrency',
     'model.max_concurrency',
+    'token_quota.default_daily_limit',
+    'token_quota.default_monthly_limit',
+    'token_quota.max_completion_tokens',
   ],
   security: ['ssrf.whitelist'],
 }

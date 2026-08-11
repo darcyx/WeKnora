@@ -4,7 +4,7 @@
 
 | 方法 | 路径      | 描述               |
 | ---- | --------- | ------------------ |
-| GET  | `/skills` | 获取预装 Skills 列表 |
+| GET  | `/skills` | 获取服务端预装 Skills；传入沙盒配置 ID 时合并该配置可执行的租户 Skills |
 | POST | `/sandbox-configs/{id}/skills` | 安装技能（zip 上传或托管平台 source） |
 | POST | `/sandbox-configs/{id}/skills/{skillId}/reinstall` | 用已保存的安装包重试安装 |
 | GET  | `/sandbox-configs/{id}/skills/{skillId}/files` | 列出已安装技能的文件 |
@@ -18,12 +18,12 @@
 
 ## GET `/skills` - 获取预装 Skills 列表
 
-获取系统中所有预装的智能体技能列表。
+获取系统中服务端预装的智能体技能列表。传入 `sandbox_config_id` 后，会在预装列表后合并该沙盒中状态为 `ready` 且已启用的租户 Skills；同名租户 Skill 覆盖预装 Skill。
 
 **请求**:
 
 ```curl
-curl --location 'http://localhost:8080/api/v1/skills' \
+curl --location 'http://localhost:8080/api/v1/skills?sandbox_config_id=<sandbox-config-id>' \
 --header 'X-API-Key: sk-xxxxx' \
 --header 'Content-Type: application/json'
 ```
@@ -51,7 +51,7 @@ curl --location 'http://localhost:8080/api/v1/skills' \
 }
 ```
 
-当系统未配置 Skills 时，`skills_available` 返回 `false`，`data` 为空数组：
+当系统没有预装 Skills，且指定沙盒中也没有可执行的租户 Skills 时，`skills_available` 返回 `false`，`data` 为空数组：
 
 ```json
 {

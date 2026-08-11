@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,63 @@ type fakeAgentKnowledgeService struct {
 type fakeAgentChatModel struct {
 	lastToolNames []string
 }
+
+// readSkillCallingChatModel reproduces the real failure mode: the per-turn
+// @Skill hint tells the model to call read_skill even when the function schema
+// was not registered. The second call lets the test inspect the tool result
+// that the agent fed back to the model.
+type readSkillCallingChatModel struct {
+	callCount      int
+	firstToolNames []string
+	calls          [][]chat.Message
+}
+
+func (*readSkillCallingChatModel) Chat(
+	context.Context, []chat.Message, *chat.ChatOptions,
+) (*types.ChatResponse, error) {
+	return &types.ChatResponse{}, nil
+}
+
+func (m *readSkillCallingChatModel) ChatStream(
+	_ context.Context, messages []chat.Message, opts *chat.ChatOptions,
+) (<-chan types.StreamResponse, error) {
+	m.calls = append(m.calls, append([]chat.Message(nil), messages...))
+	if m.callCount == 0 && opts != nil {
+		for _, tool := range opts.Tools {
+			m.firstToolNames = append(m.firstToolNames, tool.Function.Name)
+		}
+	}
+
+	ch := make(chan types.StreamResponse, 1)
+	if m.callCount == 0 {
+		ch <- types.StreamResponse{
+			ResponseType: types.ResponseTypeAnswer,
+			ToolCalls: []types.LLMToolCall{{
+				ID:   "call-read-skill",
+				Type: "function",
+				Function: types.FunctionCall{
+					Name:      tools.ToolReadSkill,
+					Arguments: `{"skill_name":"sdk-troubleshooting"}`,
+				},
+			}},
+			Done:         true,
+			FinishReason: "tool_calls",
+		}
+	} else {
+		ch <- types.StreamResponse{
+			ResponseType: types.ResponseTypeAnswer,
+			Content:      "done",
+			Done:         true,
+			FinishReason: "stop",
+		}
+	}
+	m.callCount++
+	close(ch)
+	return ch, nil
+}
+
+func (*readSkillCallingChatModel) GetModelName() string { return "read-skill-caller" }
+func (*readSkillCallingChatModel) GetModelID() string   { return "read-skill-caller-id" }
 
 func (*fakeAgentChatModel) Chat(context.Context, []chat.Message, *chat.ChatOptions) (*types.ChatResponse, error) {
 	return &types.ChatResponse{}, nil
@@ -290,6 +348,54 @@ func TestCreateAgentEngineOpensSandboxToolsOnlyForInstallMode(t *testing.T) {
 		}
 		require.Equal(t, []string{"pdf-tools"}, names)
 	})
+}
+
+func TestPreloadedSkillMentionCanReadSkillWithoutInstalledTenantSkills(t *testing.T) {
+	const instructionsMarker = "PRELOADED_SDK_TROUBLESHOOTING_INSTRUCTIONS"
+
+	preloadedDir := t.TempDir()
+	skillDir := filepath.Join(preloadedDir, "sdk-troubleshooting")
+	require.NoError(t, os.MkdirAll(skillDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: sdk-troubleshooting\ndescription: diagnose SDK failures\n---\n"+
+			instructionsMarker+"\n"),
+		0o644,
+	))
+	t.Setenv("WEKNORA_SKILLS_DIR", preloadedDir)
+
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	config := &types.AgentConfig{MaxIterations: 3}
+	(&sessionService{}).configureSkillsFromAgent(ctx, config, &types.CustomAgent{
+		Config: types.CustomAgentConfig{
+			SandboxConfigID:     "cfg-remote",
+			SkillsSelectionMode: "selected",
+			SelectedSkills:      []string{"sdk-troubleshooting"},
+		},
+	})
+	applyPerRequestSkillScope(ctx, config, "selected", []string{"sdk-troubleshooting"})
+
+	model := &readSkillCallingChatModel{}
+	svc := &agentService{
+		sandboxResolver: stubSandboxResolver{
+			mgr: &capableManager{typ: sandbox.SandboxTypeCube, shell: &stubShellExecutor{}},
+		},
+	}
+	engine, err := svc.CreateAgentEngine(ctx, config, model, nil, nil, "sess-1", "msg-1")
+	require.NoError(t, err)
+
+	_, err = engine.Execute(ctx, "sess-1", "msg-1", "SDK initialization fails", nil)
+	require.NoError(t, err)
+	require.Len(t, model.calls, 2)
+
+	var secondCall strings.Builder
+	for _, message := range model.calls[1] {
+		secondCall.WriteString(message.Content)
+		secondCall.WriteByte('\n')
+	}
+	require.NotContains(t, secondCall.String(), "tool not found: read_skill")
+	require.Contains(t, secondCall.String(), instructionsMarker)
+	require.True(t, toolOffered(model.firstToolNames, tools.ToolReadSkill))
 }
 
 func TestSkillToolsFollowSkillsEnabled(t *testing.T) {

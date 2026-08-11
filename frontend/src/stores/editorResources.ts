@@ -118,12 +118,6 @@ export const useEditorResourcesStore = defineStore('editorResources', () => {
     }
     return runOnce('skills', force, async () => {
       skillsConfigId.value = configId
-      if (!configId) {
-        skillsAvailable.value = false
-        skills.value = []
-        loadedAt.value.skills = Date.now()
-        return
-      }
       try {
         const skillsRes = await listSkills(configId)
         skillsAvailable.value = skillsRes.skills_available !== false

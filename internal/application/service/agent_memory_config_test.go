@@ -45,4 +45,26 @@ func TestAgentConfigCarriesTheMemoryPreference(t *testing.T) {
 	}
 }
 
+func TestAgentConfigCarriesPerTurnAppInfo(t *testing.T) {
+	svc := &sessionService{
+		cfg:                   &config.Config{},
+		webSearchProviderRepo: &sharedAgentWebSearchRepo{},
+	}
+	const appInfo = `{"gameInfo":{"app_name":"GS SDK","app_id":"10100327"}}`
+	req := &types.QARequest{
+		Session: &types.Session{ID: "session-1", TenantID: 1},
+		CustomAgent: &types.CustomAgent{
+			TenantID: 1,
+			Config: types.CustomAgentConfig{
+				MaxIterations: 5,
+			},
+		},
+		AppInfo: appInfo,
+	}
+
+	agentConfig, err := svc.buildAgentConfig(t.Context(), req, &types.Tenant{ID: 1}, 1)
+	require.NoError(t, err)
+	require.Equal(t, appInfo, agentConfig.AppInfo)
+}
+
 func boolPtr(v bool) *bool { return &v }

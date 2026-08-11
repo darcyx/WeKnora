@@ -244,6 +244,19 @@ func withCitationsEnabled(enabled bool) testEngineOption {
 	}
 }
 
+func withAppInfo(appInfo string) testEngineOption {
+	return func(cfg *types.AgentConfig) {
+		cfg.AppInfo = appInfo
+	}
+}
+
+func TestNewAgentEngineCarriesRuntimeAppInfo(t *testing.T) {
+	const appInfo = `{"gameInfo":{"app_id":"10100327"}}`
+	engine := newTestEngine(t, &mockChat{}, withAppInfo(appInfo))
+
+	assert.Equal(t, appInfo, engine.appInfo)
+}
+
 func TestBuildSystemPromptUsesInternalCitationSetting(t *testing.T) {
 	model := &mockChat{}
 	enabledEngine := newTestEngine(t, model)

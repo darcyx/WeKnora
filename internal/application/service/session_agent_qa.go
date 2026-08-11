@@ -294,6 +294,7 @@ func (s *sessionService) buildAgentConfig(
 		RetrieveKBOnlyWhenMentioned: customAgent.Config.RetrieveKBOnlyWhenMentioned,
 		LLMCallTimeout:              customAgent.Config.LLMCallTimeout,
 		RetainRetrievalHistory:      customAgent.Config.RetainRetrievalHistory,
+		AppInfo:                     req.AppInfo,
 		SharedAgentReadOnly:         req.SharedAgentReadOnly,
 	}
 
@@ -567,9 +568,12 @@ func dedupPreservingOrder(values []string) []string {
 }
 
 // configureSkillsFromAgent turns the agent's skill picker into runtime flags.
-// The skills themselves come from the sandbox image (TenantSkills), not from
-// the deployment's skills/preloaded directory — that host copy is not what
-// execute_skill_script would find inside the sandbox.
+// It only sets AllowedSkills/SkillsEnabled here; it does not resolve where a
+// selected skill's content actually comes from. CreateAgentEngine resolves
+// that per skill at engine-creation time: TenantSkills (the sandbox image)
+// take priority when installed, falling back to the deployment's
+// skills/preloaded directory for a skill that is selectable from the /skills
+// picker without being installed into any tenant sandbox.
 func (s *sessionService) configureSkillsFromAgent(
 	ctx context.Context,
 	agentConfig *types.AgentConfig,
