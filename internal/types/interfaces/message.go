@@ -76,10 +76,27 @@ type MessageService interface {
 	DeleteSessionArtifact(
 		ctx context.Context, req *types.ArtifactDeleteRequest,
 	) (*types.ArtifactDeleteResult, error)
+
+	// SubmitMessageFeedback records a like/dislike vote on an assistant
+	// message. reasons/reasonText only apply to a dislike vote; a like vote
+	// ignores them. One-shot: returns apperrors.ErrMessageFeedbackAlreadySubmitted
+	// if the message already carries a vote.
+	SubmitMessageFeedback(
+		ctx context.Context,
+		sessionID string,
+		messageID string,
+		feedbackType string,
+		reasons []string,
+		reasonText string,
+	) (*types.Message, error)
 }
 
 // MessageRepository defines the message repository interface
 type MessageRepository interface {
+	// GetAssistantMessageByRequestID resolves an assistant reply within a session.
+	GetAssistantMessageByRequestID(ctx context.Context, sessionID, requestID string) (*types.Message, error)
+	// CreateFAQFeedback records one vote per tenant, session and FAQ entry.
+	CreateFAQFeedback(ctx context.Context, feedback *types.FAQFeedback) error
 	// CreateMessage creates a message
 	CreateMessage(ctx context.Context, message *types.Message) (*types.Message, error)
 	// GetMessage gets a message
@@ -198,4 +215,9 @@ type MessageRepository interface {
 	// CommittedAt. Used after a forked sandbox boots so a later fork-of-fork
 	// compares against the live handle rather than the parent's sandbox.
 	RewriteSandboxCheckpoints(ctx context.Context, sessionID, oldSandboxID, newSandboxID string) error
+	// UpdateMessageFeedback records a like/dislike vote, but only if the
+	// message doesn't already carry one. Returns gorm.ErrRecordNotFound if
+	// the message doesn't exist under sessionID, or
+	// apperrors.ErrMessageFeedbackAlreadySubmitted if it already has a vote.
+	UpdateMessageFeedback(ctx context.Context, sessionID, requestID string, feedback types.MessageFeedback) error
 }

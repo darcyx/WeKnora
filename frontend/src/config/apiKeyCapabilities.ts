@@ -25,6 +25,7 @@ export const SYSTEM_API_KEY_CAPABILITIES: TenantAPIKeyCapability[] = [
   'system_tenants_read', 'system_tenants_manage',
   'system_settings_read', 'system_settings_manage',
   'system_runtime_read', 'system_runtime_manage', 'system_audit_read',
+  'system_token_quota_read', 'system_token_quota_manage',
 ]
 
 export const DEFAULT_TENANT_API_KEY_CAPABILITIES = new Set<TenantAPIKeyCapability>([
@@ -91,6 +92,8 @@ export const SYSTEM_API_KEY_CAPABILITY_GROUP: ApiKeyCapabilityGroup = {
     { value: 'system_runtime_read', labelKey: 'platformApiKeys.capabilities.runtimeRead', hintKey: 'platformApiKeys.capabilityHints.runtimeRead' },
     { value: 'system_runtime_manage', labelKey: 'platformApiKeys.capabilities.runtimeManage', hintKey: 'platformApiKeys.capabilityHints.runtimeManage' },
     { value: 'system_audit_read', labelKey: 'platformApiKeys.capabilities.auditRead', hintKey: 'platformApiKeys.capabilityHints.auditRead' },
+    { value: 'system_token_quota_read', labelKey: 'platformApiKeys.capabilities.tokenQuotaRead', hintKey: 'platformApiKeys.capabilityHints.tokenQuotaRead' },
+    { value: 'system_token_quota_manage', labelKey: 'platformApiKeys.capabilities.tokenQuotaManage', hintKey: 'platformApiKeys.capabilityHints.tokenQuotaManage' },
   ],
 }
 

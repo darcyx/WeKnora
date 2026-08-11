@@ -1,4 +1,6 @@
+import { feedbackAdminEN } from '../feedbackAdminMessages'
 export default {
+  feedbackAdmin: feedbackAdminEN,
   modelCatalog: {
     "title": "Model catalog",
     "description": "The model catalog defines which models are offered when adding a model, along with defaults such as context window and reasoning support. Changes here apply to all workspaces immediately.",
@@ -1982,6 +1984,7 @@ export default {
     mcpService: 'MCP Service',
     versionInfo: 'Version Info',
     taskQueue: 'Task Queues',
+    tokenQuotas: 'Token Quotas',
     tenantInfo: 'Workspace Info',
     workspaceSettings: 'Workspace Settings',
     navGroups: {
@@ -3750,6 +3753,7 @@ export default {
       recommended: 'Recommend',
       recommendedEnabled: 'Recommendation enabled',
       recommendedDisabled: 'Recommendation disabled',
+      recommendedEnableSuccess: 'FAQ entry recommendation enabled',
       recommendedDisableSuccess: 'FAQ entry recommendation disabled',
       recommendedUpdateFailed: 'Failed to update recommendation status',
       batchUpdateTag: 'Batch Set Tags',
@@ -4656,6 +4660,11 @@ export default {
         },
         model: {
           max_concurrency: 'Default per-model concurrency limit'
+        },
+        token_quota: {
+          default_daily_limit: 'Default daily Token limit for an external user',
+          default_monthly_limit: 'Default monthly Token limit for an external user',
+          max_completion_tokens: 'Default maximum output Tokens'
         }
       },
       keyDescriptions: {
@@ -4687,6 +4696,11 @@ export default {
         },
         model: {
           max_concurrency: 'Default cap on concurrent background (ingestion/enrichment) calls to a single model, keyed by model ID and shared across replicas. Read on every call and applied immediately with no restart. 0 or a negative value disables the default cap (each model still honours its own limit configured in model management). Affects background tasks only, not interactive chat.'
+        },
+        token_quota: {
+          default_daily_limit: 'Default daily Token limit for each external user within a workspace. 0 means unlimited; an individual user override can replace it.',
+          default_monthly_limit: 'Default monthly Token limit for each external user within a workspace. 0 means unlimited; an individual user override can replace it.',
+          max_completion_tokens: 'Default output reservation ceiling when a call does not specify a maximum. It is automatically reduced to fit the user\'s remaining quota.'
         }
       },
       enumLabels: {
@@ -7791,7 +7805,9 @@ export default {
       settingsManage: 'Manage system settings',
       runtimeRead: 'Read runtime',
       runtimeManage: 'Manage runtime',
-      auditRead: 'Read system audit'
+      auditRead: 'Read system audit',
+      tokenQuotaRead: 'Read external-user Token quotas',
+      tokenQuotaManage: 'Manage external-user Token quotas'
     },
     capabilityHints: {
       tenantsRead: 'List, search, and inspect every workspace.',
@@ -7800,7 +7816,9 @@ export default {
       settingsManage: 'Update and reset platform runtime settings.',
       runtimeRead: 'Inspect task queues and task details.',
       runtimeManage: 'Retry, run, cancel, or delete runtime tasks.',
-      auditRead: 'Read platform audit events.'
+      auditRead: 'Read platform audit events.',
+      tokenQuotaRead: 'Read Token quotas and usage for an external user in a specified workspace.',
+      tokenQuotaManage: 'Set or reset Token quotas for an external user in a specified workspace.'
     },
     createdTitle: 'Platform API key created',
     createdDescription: 'Copy and store this key now. The full value will not be shown again.',
@@ -7842,5 +7860,48 @@ export default {
         'false': { label: 'No', description: 'a photo, drawing, icon or decoration' }
       }
     }
+  },
+  tokenQuotaSettings: {
+    title: 'External-user Token Quotas',
+    description: 'View usage and override the platform-default Token quota for an external user within a workspace.',
+    identityHint: 'A quota is identified by the workspace ID and the external user ID sent in the API X-External-User-ID header.',
+    tenantId: 'Workspace ID',
+    tenantIdPlaceholder: 'Enter a workspace ID',
+    tenantIdRequired: 'Enter a workspace ID',
+    tenantIdInvalid: 'Workspace ID must be numeric',
+    subjectId: 'External user ID',
+    subjectIdPlaceholder: 'Enter the X-External-User-ID value',
+    subjectIdRequired: 'Enter an external user ID',
+    query: 'Query',
+    listUsers: 'List users',
+    usersTitle: 'Observed external users',
+    usersDescription: 'Only users with recorded usage or a quota override are listed. Select a user to edit the quota.',
+    previousPage: 'Previous',
+    nextPage: 'Next',
+    pageInfo: 'Page {page}, {total} users',
+    dailyUsage: 'Daily usage',
+    monthlyUsage: 'Monthly usage',
+    reservedTokens: 'In-flight reservation',
+    reservedHint: 'Requests in progress temporarily consume quota',
+    unlimited: 'Unlimited',
+    limitValue: 'Limit: {value}',
+    overrideTitle: 'User quota override',
+    overrideDescription: 'A blank period inherits the platform default.',
+    overridden: 'Overridden',
+    inheriting: 'Using platform default',
+    dailyLimit: 'Daily Token limit',
+    monthlyLimit: 'Monthly Token limit',
+    inheritPlaceholder: 'Leave blank for platform default',
+    limitHint: 'Enter 0 for no limit in that period.',
+    reset: 'Restore default',
+    resetConfirm: 'Remove this user quota override and restore the platform default?',
+    save: 'Save quota',
+    noData: 'No quota usage record found.',
+    loadFailed: 'Failed to load Token quota',
+    overrideRequired: 'Enter a limit for at least one period',
+    saveSuccess: 'Token quota saved',
+    saveFailed: 'Failed to save Token quota',
+    resetSuccess: 'Platform default quota restored',
+    resetFailed: 'Failed to restore platform default quota'
   }
 }

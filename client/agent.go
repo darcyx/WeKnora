@@ -38,6 +38,7 @@ type AgentQARequest struct {
 	Images           []ImageAttachment `json:"images,omitempty"`             // Attached images for multimodal chat
 	Channel          string            `json:"channel,omitempty"`            // Source channel: "web", "api", "im", etc.
 	QuestionOrigin   *QuestionOrigin   `json:"question_origin,omitempty"`    // Source of a picked suggested question
+	Ext              map[string]any    `json:"ext,omitempty"`                // Per-request application context forwarded to the agent
 }
 
 // AgentResponseType defines the type of agent response
