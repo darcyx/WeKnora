@@ -60,6 +60,10 @@ type CreateKnowledgeQARequest struct {
 	AttachmentIDs         []string                     `json:"attachment_ids,omitempty"`              // Pre-uploaded session-scoped document IDs
 	Channel               string                       `json:"channel"`                               // Source channel: "web", "api", "im", etc.
 	SuggestionAttribution *types.SuggestionAttribution `json:"suggestion_attribution,omitempty"`
+	// Ext carries the caller's complete app information for external
+	// integrations. The whole object (including nested objects such as
+	// "gameInfo") is serialized into the agent's per-turn <app_info> context.
+	Ext map[string]any `json:"ext,omitempty"`
 }
 
 // AttachmentUpload represents a file attachment upload from the client

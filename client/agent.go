@@ -37,6 +37,7 @@ type AgentQARequest struct {
 	MCPServiceIDs    []string          `json:"mcp_service_ids,omitempty"`    // Optional MCP service allow list (deprecated)
 	Images           []ImageAttachment `json:"images,omitempty"`             // Attached images for multimodal chat
 	Channel          string            `json:"channel,omitempty"`            // Source channel: "web", "api", "im", etc.
+	Ext              map[string]any    `json:"ext,omitempty"`                // Per-request application context forwarded to the agent
 }
 
 // AgentResponseType defines the type of agent response

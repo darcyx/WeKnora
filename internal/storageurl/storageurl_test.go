@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +50,42 @@ type fixedResolver struct{ svc interfaces.FileService }
 
 func (r fixedResolver) ResolveFileService(string) interfaces.FileService { return r.svc }
 
+// scopedResourceResolver models the production storage-backend resolver for a
+// resource whose physical path starts with storage://<backend-id>/. The
+// default service deliberately returns the malformed URL seen when that
+// prefix is handed to a raw COS driver.
+type scopedResourceResolver struct {
+	defaultSvc  interfaces.FileService
+	resourceSvc interfaces.FileService
+}
+
+func (r scopedResourceResolver) ResolveFileService(
+	context.Context,
+	*types.Tenant,
+	string,
+	string,
+	string,
+) (interfaces.FileService, string, error) {
+	return nil, "", nil
+}
+
+func (r scopedResourceResolver) ResolveBackend(
+	context.Context,
+	*types.Tenant,
+	string,
+	string,
+) (*types.StorageBackend, error) {
+	return nil, nil
+}
+
+func (r scopedResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	return r.resourceSvc, nil
+}
+
 func stubResolver(url string) Resolver {
 	return fixedResolver{svc: &stubFileService{
 		getFileURL: func(context.Context, string) (string, error) { return url, nil },
@@ -72,6 +109,33 @@ func TestRewriter_RewritesEveryReferenceForm(t *testing.T) {
 	assert.NotContains(t, out, "minio://")
 	assert.NotContains(t, out, "storage://")
 	assert.Equal(t, 3, svc.calls)
+}
+
+func TestResourceHandleUsesBackendScopedFileService(t *testing.T) {
+	const resourceRef = "resource://xifDo7NTSL300Lp1goVutw"
+	const malformedURL = "https://bucket.cos.ap-shanghai.myqcloud.com/storage%3A//backend-a/cos%3A//bucket/ap-shanghai/object.png"
+	const scopedURL = "https://bucket.cos.ap-shanghai.myqcloud.com/object.png"
+
+	defaultSvc := &stubFileService{
+		getFileURL: func(context.Context, string) (string, error) {
+			return malformedURL, nil
+		},
+	}
+	resourceSvc := &stubFileService{
+		getFileURL: func(context.Context, string) (string, error) {
+			return scopedURL, nil
+		},
+	}
+	resolver := scopedResourceResolver{
+		defaultSvc:  defaultSvc,
+		resourceSvc: resourceSvc,
+	}
+
+	w := NewRequestRewriter(context.Background(), ModePublic, defaultSvc, resolver)
+	got := w.String(context.Background(), "![img]("+resourceRef+")")
+
+	assert.Equal(t, "![img]("+scopedURL+")", got)
+	assert.Equal(t, 0, defaultSvc.calls, "resource handles must not use the raw default COS service")
 }
 
 // An already-public URL in the answer must be left alone.

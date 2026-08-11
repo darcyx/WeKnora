@@ -298,6 +298,30 @@ var registry = map[string]settingSpec{
 			"每次调用实时读取，修改后立即生效、无需重启。0 或负数表示关闭默认限制" +
 			"（各模型仍会尊重自身在模型管理里配置的上限）。仅影响后台任务，不影响交互式对话。",
 	},
+	"token_quota.default_daily_limit": {
+		Type:     "int",
+		EnvName:  "WEKNORA_TOKEN_QUOTA_DEFAULT_DAILY_LIMIT",
+		Default:  defaultTokenQuotaDailyLimit,
+		Category: "token_quota",
+		Description: "API 集成外部用户的默认每日 token 上限（UTC 自然日）。0 表示不限制。" +
+			"用户覆盖值优先于此平台默认值，修改后立即生效。",
+	},
+	"token_quota.default_monthly_limit": {
+		Type:     "int",
+		EnvName:  "WEKNORA_TOKEN_QUOTA_DEFAULT_MONTHLY_LIMIT",
+		Default:  defaultTokenQuotaMonthlyLimit,
+		Category: "token_quota",
+		Description: "API 集成外部用户的默认每月 token 上限（UTC 自然月）。0 表示不限制。" +
+			"用户覆盖值优先于此平台默认值，修改后立即生效。",
+	},
+	"token_quota.max_completion_tokens": {
+		Type:     "int",
+		EnvName:  "WEKNORA_TOKEN_QUOTA_MAX_COMPLETION_TOKENS",
+		Default:  int64(defaultTokenQuotaMaxCompletionTokens),
+		Category: "token_quota",
+		Description: "未显式指定 max_tokens 时，额度预占和模型调用使用的最大输出 token 数。" +
+			"必须为正整数；较小的值可减少单次预占，但也会限制回答长度。",
+	},
 }
 
 // systemSettingService wires the repository, audit log, and (P2)
@@ -1320,6 +1344,22 @@ func validateRegistryEntry(key string, rawValue any) error {
 		}
 		if n < 1 {
 			return errors.New("concurrency must be at least 1")
+		}
+	case "token_quota.default_daily_limit", "token_quota.default_monthly_limit":
+		n, err := coerceToPositiveInt64(rawValue)
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return errors.New("token quota limit cannot be negative")
+		}
+	case "token_quota.max_completion_tokens":
+		n, err := coerceToPositiveInt64(rawValue)
+		if err != nil {
+			return err
+		}
+		if n < 1 {
+			return errors.New("max completion tokens must be at least 1")
 		}
 	case "ssrf.whitelist":
 		// Coerce into the same shape encodeForType produced. We don't

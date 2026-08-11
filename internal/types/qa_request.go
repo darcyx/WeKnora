@@ -65,4 +65,5 @@ type QARequest struct {
 	// persists accepted ones through this sink. A structural interface so
 	// neither package imports the other; handler-owned, nil for IM/embed.
 	SteerSink SteerSink
+	AppInfo             string             // Compact JSON copied from the request ext object for this turn's agent runtime context
 }

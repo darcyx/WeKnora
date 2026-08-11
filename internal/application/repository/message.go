@@ -7,6 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -384,4 +385,37 @@ func (r *messageRepository) GetSessionAttachments(
 		result = append(result, row.Attachments...)
 	}
 	return result, nil
+}
+
+// UpdateMessageFeedback records a like/dislike vote, but only when the
+// message doesn't already carry one — feedback is one-shot. The conditional
+// WHERE makes the "already voted" check atomic with the write instead of a
+// separate read-then-write that a concurrent request could race.
+func (r *messageRepository) UpdateMessageFeedback(
+	ctx context.Context, sessionID, messageID string, feedback types.MessageFeedback,
+) error {
+	result := r.db.WithContext(ctx).
+		Model(&types.Message{}).
+		Where("id = ? AND session_id = ? AND feedback IS NULL", messageID, sessionID).
+		Update("feedback", &feedback)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	// No row updated: either the message doesn't exist under this session, or
+	// it already has a vote. Distinguish the two so the handler can return
+	// 404 vs 409.
+	var exists int64
+	if err := r.db.WithContext(ctx).
+		Model(&types.Message{}).
+		Where("id = ? AND session_id = ?", messageID, sessionID).
+		Count(&exists).Error; err != nil {
+		return err
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return apperrors.ErrMessageFeedbackAlreadySubmitted
 }

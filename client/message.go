@@ -220,3 +220,67 @@ func (c *Client) DeleteMessage(ctx context.Context, sessionID string, messageID 
 
 	return parseResponse(resp, &response)
 }
+
+// MessageFeedbackType is a like/dislike vote on an assistant answer. It
+// mirrors the server enum in internal/types/message_feedback.go.
+type MessageFeedbackType string
+
+const (
+	// MessageFeedbackLike is a positive vote; it carries no reasons.
+	MessageFeedbackLike MessageFeedbackType = "like"
+	// MessageFeedbackDislike is a negative vote; it requires at least one reason.
+	MessageFeedbackDislike MessageFeedbackType = "dislike"
+)
+
+// Dislike reason codes, matching the fixed option set the server accepts.
+// MessageFeedbackReasonOther is itself a selectable reason; selecting it
+// requires a non-empty ReasonText in SubmitMessageFeedbackRequest.
+const (
+	MessageFeedbackReasonInaccurate = "inaccurate" // 回答不准确
+	MessageFeedbackReasonIncomplete = "incomplete" // 回答不完整
+	MessageFeedbackReasonOffTopic   = "off_topic"  // 答非所问
+	MessageFeedbackReasonOther      = "other"      // 其他
+)
+
+// MessageFeedback is the vote recorded against a message, returned by
+// SubmitMessageFeedback.
+type MessageFeedback struct {
+	Type       MessageFeedbackType `json:"type"`
+	Reasons    []string            `json:"reasons,omitempty"`
+	ReasonText string              `json:"reason_text,omitempty"`
+	CreatedAt  time.Time           `json:"created_at"`
+}
+
+// SubmitMessageFeedbackRequest is the body for SubmitMessageFeedback.
+// Reasons/ReasonText only apply to a Dislike vote; ReasonText is required
+// only when Reasons includes MessageFeedbackReasonOther.
+type SubmitMessageFeedbackRequest struct {
+	Type       MessageFeedbackType `json:"type"`
+	Reasons    []string            `json:"reasons,omitempty"`
+	ReasonText string              `json:"reason_text,omitempty"`
+}
+
+// SubmitMessageFeedback records a one-shot like/dislike vote on an assistant
+// message. Resubmitting on a message that already has a vote fails with the
+// server's 409 (see errors.ErrMessageFeedbackAlreadySubmitted).
+func (c *Client) SubmitMessageFeedback(
+	ctx context.Context,
+	sessionID string,
+	messageID string,
+	req *SubmitMessageFeedbackRequest,
+) (*MessageFeedback, error) {
+	path := fmt.Sprintf("/api/v1/messages/%s/%s/feedback", sessionID, messageID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, req, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response struct {
+		Success bool             `json:"success"`
+		Data    *MessageFeedback `json:"data"`
+	}
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+	return response.Data, nil
+}
