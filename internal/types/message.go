@@ -410,6 +410,10 @@ type Message struct {
 	// failed checkpoint must never block the reply). A message without a
 	// checkpoint cannot serve as a fork point with sandbox state.
 	SandboxCheckpoint *SandboxCheckpoint `json:"sandbox_checkpoint,omitempty" gorm:"type:jsonb"`
+	// Feedback is the end user's like/dislike vote on this assistant answer.
+	// Nil means no vote has been cast yet. One-shot: set once via
+	// SubmitMessageFeedback and never edited afterwards.
+	Feedback *MessageFeedback `json:"feedback,omitempty" gorm:"type:jsonb;column:feedback"`
 	// Message creation timestamp
 	CreatedAt time.Time `json:"created_at"`
 	// Last update timestamp

@@ -44,6 +44,7 @@ type SystemHandler struct {
 	tenantSvc        interfaces.TenantService
 	userSvc          interfaces.UserService
 	systemSettingSvc interfaces.SystemSettingService
+	tokenQuotaSvc    interfaces.TokenQuotaService
 	apiKeySvc        interfaces.TenantAPIKeyService
 	// auditSvc is optional — when nil, emitAdminAudit no-ops so unit
 	// tests that wire a partial container still compile. In production
@@ -75,6 +76,7 @@ func NewSystemHandler(cfg *config.Config,
 	tenantSvc interfaces.TenantService,
 	userSvc interfaces.UserService,
 	systemSettingSvc interfaces.SystemSettingService,
+	tokenQuotaSvc interfaces.TokenQuotaService,
 	apiKeySvc interfaces.TenantAPIKeyService,
 	auditSvc interfaces.AuditLogService,
 	taskInspector interfaces.TaskInspector,
@@ -89,6 +91,7 @@ func NewSystemHandler(cfg *config.Config,
 		tenantSvc:          tenantSvc,
 		userSvc:            userSvc,
 		systemSettingSvc:   systemSettingSvc,
+		tokenQuotaSvc:      tokenQuotaSvc,
 		apiKeySvc:          apiKeySvc,
 		auditSvc:           auditSvc,
 		taskInspector:      taskInspector,
@@ -2299,6 +2302,198 @@ func (h *SystemHandler) UpdateSystemSetting(c *gin.Context) {
 	}
 	h.enrichSettingsModifiedBy(ctx, []*types.SystemSetting{row})
 	c.JSON(http.StatusOK, row)
+}
+
+// UpdateUserTokenQuotaRequest is a subject-specific override. A nil field
+// leaves that period on the platform default; zero explicitly disables that
+// period's cap for this external user.
+type UpdateUserTokenQuotaRequest struct {
+	DailyTokenLimit   *int64 `json:"daily_token_limit"`
+	MonthlyTokenLimit *int64 `json:"monthly_token_limit"`
+}
+
+// maxTokenQuotaExternalUserIDLen mirrors the middleware's accepted external
+// user ID length, so an admin cannot create an override for a subject the
+// auth layer would never mint.
+const maxTokenQuotaExternalUserIDLen = 128
+const (
+	defaultTokenQuotaUserPageSize = 50
+	maxTokenQuotaUserPageSize     = 100
+)
+
+func tokenQuotaTenantID(c *gin.Context) (uint64, error) {
+	rawTenantID := strings.TrimSpace(c.Query("tenant_id"))
+	if rawTenantID == "" {
+		return 0, errors.New("tenant_id is required")
+	}
+	tenantID, err := strconv.ParseUint(rawTenantID, 10, 64)
+	if err != nil {
+		return 0, errors.New("tenant_id must be a non-negative integer")
+	}
+	return tenantID, nil
+}
+
+// tokenQuotaSubjectID resolves the tenant-scoped accounting key from the
+// `tenant_id` and `subject_id` query parameters. Quota is keyed per workspace
+// because external user IDs are namespaced by the workspace that issues them
+// — see types.TokenQuotaSubject.
+func tokenQuotaSubjectID(c *gin.Context) (string, error) {
+	tenantID, err := tokenQuotaTenantID(c)
+	if err != nil {
+		return "", err
+	}
+	externalUserID := strings.TrimSpace(c.Query("subject_id"))
+	if externalUserID == "" {
+		return "", errors.New("subject_id is required")
+	}
+	if len(externalUserID) > maxTokenQuotaExternalUserIDLen {
+		return "", fmt.Errorf("subject_id too long (max %d)", maxTokenQuotaExternalUserIDLen)
+	}
+	return types.TokenQuotaSubject(tenantID, externalUserID), nil
+}
+
+func tokenQuotaUserPage(c *gin.Context) (int, int, error) {
+	page, pageSize := 1, defaultTokenQuotaUserPageSize
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return 0, 0, errors.New("page must be a positive integer")
+		}
+		page = parsed
+	}
+	if raw := strings.TrimSpace(c.Query("page_size")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxTokenQuotaUserPageSize {
+			return 0, 0, fmt.Errorf("page_size must be between 1 and %d", maxTokenQuotaUserPageSize)
+		}
+		pageSize = parsed
+	}
+	if page-1 > int(^uint(0)>>1)/pageSize {
+		return 0, 0, errors.New("page is too large")
+	}
+	return page, pageSize, nil
+}
+
+// ListTenantTokenQuotaUsers lists external users that have either consumed
+// quota or received an explicit quota override in the requested workspace.
+// @Summary List observed external users with token quotas
+// @Tags System Admin
+// @Produce json
+// @Param tenant_id query string true "Workspace ID"
+// @Param page query int false "One-based page number"
+// @Param page_size query int false "Page size, 1-100"
+// @Success 200 {object} types.TokenQuotaUserPage
+// @Router /system/admin/token-quotas/users [get]
+func (h *SystemHandler) ListTenantTokenQuotaUsers(c *gin.Context) {
+	if h.tokenQuotaSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Token quota service is unavailable"})
+		return
+	}
+	tenantID, err := tokenQuotaTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	page, pageSize, err := tokenQuotaUserPage(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	users, err := h.tokenQuotaSvc.ListTenantUsers(logger.CloneContext(c.Request.Context()), tenantID, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+// GetUserTokenQuota returns effective limits and current UTC day/month usage.
+// @Summary Get an external user's token quota
+// @Tags System Admin
+// @Produce json
+// @Param tenant_id query string true "Workspace ID that issued the external user ID"
+// @Param subject_id query string true "External user ID"
+// @Success 200 {object} types.TokenQuotaUsageSnapshot
+// @Router /system/admin/token-quotas [get]
+func (h *SystemHandler) GetUserTokenQuota(c *gin.Context) {
+	if h.tokenQuotaSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Token quota service is unavailable"})
+		return
+	}
+	subjectID, err := tokenQuotaSubjectID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	snapshot, err := h.tokenQuotaSvc.GetUserQuota(logger.CloneContext(c.Request.Context()), subjectID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, snapshot)
+}
+
+// UpdateUserTokenQuota writes an override keyed by workspace + external user
+// ID. It intentionally does not look up a local users row.
+// @Summary Update an external user's token quota override
+// @Tags System Admin
+// @Accept json
+// @Produce json
+// @Param tenant_id query string true "Workspace ID that issued the external user ID"
+// @Param subject_id query string true "External user ID"
+// @Param request body UpdateUserTokenQuotaRequest true "Override limits"
+// @Success 200 {object} types.TokenQuotaOverride
+// @Router /system/admin/token-quotas [put]
+func (h *SystemHandler) UpdateUserTokenQuota(c *gin.Context) {
+	if h.tokenQuotaSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Token quota service is unavailable"})
+		return
+	}
+	subjectID, err := tokenQuotaSubjectID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req UpdateUserTokenQuotaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+	override := &types.TokenQuotaOverride{
+		SubjectID:         subjectID,
+		DailyTokenLimit:   req.DailyTokenLimit,
+		MonthlyTokenLimit: req.MonthlyTokenLimit,
+	}
+	if err := h.tokenQuotaSvc.UpsertUserOverride(logger.CloneContext(c.Request.Context()), override); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, override)
+}
+
+// DeleteUserTokenQuota removes the user override and returns the subject to
+// platform default limits. It is idempotent.
+// @Summary Remove an external user's token quota override
+// @Tags System Admin
+// @Param tenant_id query string true "Workspace ID that issued the external user ID"
+// @Param subject_id query string true "External user ID"
+// @Success 204
+// @Router /system/admin/token-quotas [delete]
+func (h *SystemHandler) DeleteUserTokenQuota(c *gin.Context) {
+	if h.tokenQuotaSvc == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Token quota service is unavailable"})
+		return
+	}
+	subjectID, err := tokenQuotaSubjectID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.tokenQuotaSvc.DeleteUserOverride(logger.CloneContext(c.Request.Context()), subjectID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // ApplyDefaultStorageQuotaToAllTenants godoc

@@ -63,7 +63,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			if chunk.ResponseType == types.ResponseTypeThinking {
 				return
 			}
-			if chunk.Content != "" {
+			if chunk.Content != "" || chunk.Done {
 				logger.Debugf(ctx, "[Agent][FinalAnswer] Emitting answer chunk: %d chars", len(chunk.Content))
 				e.eventBus.Emit(ctx, event.Event{
 					ID:        answerID,
@@ -87,6 +87,9 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			"error":      err.Error(),
 		})
 		return err
+	}
+	if llmResult.Usage != nil {
+		state.AddUsage(*llmResult.Usage)
 	}
 
 	if !answerDoneEmitted {
