@@ -83,6 +83,14 @@ jobs:
             base="$BASE_SHA"
             if [ -z "$base" ] || [[ "$base" =~ ^0+$ ]]; then
               base=$(git rev-parse HEAD^)
+            elif ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              # A force-push can leave event.before unreachable from the
+              # checked-out refs. Try to recover it, then fall back to the
+              # current commit's parent if the old object was pruned.
+              git fetch --no-tags --depth=1 origin "$base" 2>/dev/null || true
+              if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+                base=$(git rev-parse HEAD^)
+              fi
             fi
             diff_range="$base..$GITHUB_SHA"
           fi
