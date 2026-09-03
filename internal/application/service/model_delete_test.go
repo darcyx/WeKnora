@@ -217,7 +217,7 @@ func TestGetModelUsageDetails_NormalizesEmptyCollections(t *testing.T) {
 		&stubModelRepoForDelete{},
 		&stubKBRepoForModelDelete{},
 		&stubAgentRepoForModelDelete{},
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 
 	details, err := svc.(*modelService).getModelUsageDetails(context.Background(), 1, "unused-model")
@@ -245,7 +245,7 @@ func TestDeleteModel_DoesNotDeleteWhenUsageLookupFails(t *testing.T) {
 		},
 		&stubKBRepoForModelDelete{usageErr: wantErr},
 		&stubAgentRepoForModelDelete{},
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 
 	err := svc.DeleteModel(ctx, modelID)
@@ -274,7 +274,7 @@ func TestDeleteModel_ReportsUntruncatedTotalsWhenListsAreCapped(t *testing.T) {
 				{ID: "agent-1", Name: "Support", Bindings: []types.ModelUsageBinding{types.ModelUsageBindingChatModel}},
 			},
 		},
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 
 	err := svc.DeleteModel(ctx, modelID)
@@ -408,6 +408,7 @@ func TestDeleteModel_ReportsAllMemoryBindings(t *testing.T) {
 				},
 			},
 		},
+		nil,
 	)
 
 	err := svc.DeleteModel(ctx, modelID)
