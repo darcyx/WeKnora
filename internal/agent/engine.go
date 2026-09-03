@@ -41,7 +41,7 @@ type AgentEngine struct {
 	selectedDocs         []*SelectedDocumentInfo // User-selected documents (via @ mention)
 	pinnedMCPServices    []*PinnedMCPServiceInfo // User @mentioned MCP services for this turn
 	pinnedSkills         []*PinnedSkillInfo      // User @mentioned skills for this turn
-	appInfo              string					 // Compact JSON supplied through this turn's request ext object
+	appInfo              string                  // Compact JSON supplied through this turn's request ext object
 	sessionID            string                  // Session ID for logging and event emission
 	systemPromptTemplate string                  // System prompt template (optional, uses default if empty)
 	memoryPrompt         string                  // Long-term memory envelope appended to the system prompt
