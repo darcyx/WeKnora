@@ -1436,8 +1436,8 @@ func (s *knowledgeService) DeleteFAQEntries(ctx context.Context,
 }
 
 // ExportFAQEntries exports all FAQ entries for a knowledge base as CSV data.
-// The CSV format matches the import example format with 8 columns:
-// 分类(必填), 问题(必填), 相似问题(选填-多个用##分隔), 反例问题(选填-多个用##分隔),
+// The CSV format matches the import example format with an additional FAQ ID column:
+// ID, 分类(必填), 问题(必填), 相似问题(选填-多个用##分隔), 反例问题(选填-多个用##分隔),
 // 机器人回答(必填-多个用##分隔), 是否全部回复(选填-默认FALSE), 是否停用(选填-默认FALSE),
 // 是否禁止被推荐(选填-默认False 可被推荐)
 func (s *knowledgeService) ExportFAQEntries(ctx context.Context, kbID string) ([]byte, error) {
@@ -1560,6 +1560,7 @@ func (s *knowledgeService) buildFAQCSV(chunks []*types.Chunk, tagMap map[string]
 
 	// Write CSV header (matching import example format)
 	headers := []string{
+		"ID",
 		"分类(必填)",
 		"问题(必填)",
 		"相似问题(选填-多个用##分隔)",
@@ -1589,6 +1590,7 @@ func (s *knowledgeService) buildFAQCSV(chunks []*types.Chunk, tagMap map[string]
 
 		// Build row
 		row := []string{
+			fmt.Sprintf("%d", chunk.SeqID),
 			escapeCSVField(tagName),
 			escapeCSVField(meta.StandardQuestion),
 			escapeCSVField(strings.Join(meta.SimilarQuestions, "##")),
