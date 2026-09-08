@@ -396,7 +396,7 @@ func (r *messageRepository) UpdateMessageFeedback(
 ) error {
 	result := r.db.WithContext(ctx).
 		Model(&types.Message{}).
-		Where("id = ? AND session_id = ? AND feedback IS NULL", messageID, sessionID).
+		Where("request_id = ? AND session_id = ? and role='assistant' AND feedback IS NULL", messageID, sessionID).
 		Update("feedback", &feedback)
 	if result.Error != nil {
 		return result.Error
@@ -410,7 +410,7 @@ func (r *messageRepository) UpdateMessageFeedback(
 	var exists int64
 	if err := r.db.WithContext(ctx).
 		Model(&types.Message{}).
-		Where("id = ? AND session_id = ?", messageID, sessionID).
+		Where("request_id = ? AND session_id = ? and role='assistant'", messageID, sessionID).
 		Count(&exists).Error; err != nil {
 		return err
 	}

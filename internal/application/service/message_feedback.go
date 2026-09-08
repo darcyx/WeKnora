@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,10 +11,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// SubmitMessageFeedback records a like/dislike vote on an assistant message.
-// GetMessage both authorizes the caller (session ownership) and fetches the
-// message the vote applies to, so a non-owner or wrong-tenant call surfaces
-// the same ErrSessionNotFound every other message endpoint uses.
+// SubmitMessageFeedback records a vote on a FAQ (numeric ID) or assistant message.
+// FAQ votes validate the session owner and tenant before resolving the entry.
+// Other IDs retain the existing GetMessage lookup and feedback behavior.
 func (s *messageService) SubmitMessageFeedback(
 	ctx context.Context,
 	sessionID string,
@@ -22,6 +22,54 @@ func (s *messageService) SubmitMessageFeedback(
 	reasons []string,
 	reasonText string,
 ) (*types.Message, error) {
+	if isFAQFeedbackID(messageID) {
+		entryID, err := strconv.ParseInt(messageID, 10, 64)
+		if err != nil || entryID <= 0 {
+			return nil, apperrors.NewBadRequestError("invalid FAQ entry ID")
+		}
+		tenantID := types.MustTenantIDFromContext(ctx)
+		userID := types.SessionOwnerIDFromContext(ctx)
+		if userID == "" {
+			return nil, apperrors.NewForbiddenError("feedback requires a user identity")
+		}
+		if _, err := s.sessionRepo.Get(ctx, tenantID, userID, sessionID); err != nil {
+			return nil, err
+		}
+		chunk, err := s.chunkRepo.GetChunkBySeqID(ctx, tenantID, entryID)
+		if err != nil {
+			return nil, err
+		}
+		if chunk == nil || chunk.TenantID != tenantID || chunk.ChunkType != types.ChunkTypeFAQ {
+			return nil, apperrors.NewNotFoundError("FAQ entry not found")
+		}
+		entry, err := s.knowService.GetFAQEntry(ctx, chunk.KnowledgeBaseID, entryID)
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, apperrors.NewNotFoundError("FAQ entry not found")
+		}
+		feedback, err := buildMessageFeedback(feedbackType, reasons, reasonText)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.messageRepo.CreateFAQFeedback(ctx, &types.FAQFeedback{
+			TenantID: tenantID, SessionID: sessionID, UserID: userID, EntryID: entryID, Feedback: feedback,
+			ChunkID:           entry.ChunkID,
+			KnowledgeID:       entry.KnowledgeID,
+			KnowledgeBaseID:   entry.KnowledgeBaseID,
+			TagID:             entry.TagID,
+			TagName:           entry.TagName,
+			StandardQuestion:  entry.StandardQuestion,
+			SimilarQuestions:  entry.SimilarQuestions,
+			NegativeQuestions: entry.NegativeQuestions,
+			Answers:           entry.Answers,
+			AnswerStrategy:    entry.AnswerStrategy,
+		}); err != nil {
+			return nil, err
+		}
+		return &types.Message{Feedback: feedback}, nil
+	}
 	message, err := s.GetMessage(ctx, sessionID, messageID)
 	if err != nil {
 		return nil, err
@@ -105,4 +153,17 @@ func normalizeFeedbackReasonText(reasons []string, reasonText string) (string, e
 		return "", apperrors.NewBadRequestError("reason_text exceeds the maximum length")
 	}
 	return text, nil
+}
+
+// Only ASCII decimal digits select FAQ feedback. Overflow remains a FAQ error.
+func isFAQFeedbackID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -64,8 +64,9 @@ type MessageService interface {
 	// to clean up storage blobs on session deletion.
 	GetSessionArtifacts(ctx context.Context, sessionID string) (types.MessageArtifacts, error)
 
-	// SubmitMessageFeedback records a like/dislike vote on an assistant
-	// message. reasons/reasonText only apply to a dislike vote; a like vote
+	// SubmitMessageFeedback records a session-scoped vote on a FAQ entry
+	// for digit-only messageID values, or an assistant message otherwise.
+	// reasons/reasonText only apply to a dislike vote; a like vote
 	// ignores them. One-shot: returns apperrors.ErrMessageFeedbackAlreadySubmitted
 	// if the message already carries a vote.
 	SubmitMessageFeedback(
@@ -80,6 +81,8 @@ type MessageService interface {
 
 // MessageRepository defines the message repository interface
 type MessageRepository interface {
+	// CreateFAQFeedback records one vote per tenant, session and FAQ entry.
+	CreateFAQFeedback(ctx context.Context, feedback *types.FAQFeedback) error
 	// CreateMessage creates a message
 	CreateMessage(ctx context.Context, message *types.Message) (*types.Message, error)
 	// GetMessage gets a message

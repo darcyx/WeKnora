@@ -260,8 +260,9 @@ type SubmitMessageFeedbackRequest struct {
 	ReasonText string              `json:"reason_text,omitempty"`
 }
 
-// SubmitMessageFeedback records a one-shot like/dislike vote on an assistant
-// message. Resubmitting on a message that already has a vote fails with the
+// SubmitMessageFeedback records a session-scoped one-shot like/dislike vote.
+// A digit-only messageID selects a FAQ entry (seq_id); other IDs select an
+// assistant message. sessionID is required in both cases. Resubmitting on a message that already has a vote fails with the
 // server's 409 (see errors.ErrMessageFeedbackAlreadySubmitted).
 func (c *Client) SubmitMessageFeedback(
 	ctx context.Context,

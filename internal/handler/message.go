@@ -336,13 +336,13 @@ type SubmitMessageFeedbackRequest struct {
 }
 
 // SubmitMessageFeedback godoc
-// @Summary      提交消息反馈（点赞/点踩）
-// @Description  对助手消息提交一次性的点赞/点踩投票；点踩需提供原因（多选），选择"其他"时需附文字说明
+// @Summary      提交消息或FAQ反馈（点赞/点踩）
+// @Description  id 为纯数字时记录会话级 FAQ 反馈，否则按 session_id + id 记录助手消息反馈；同一会话同一对象仅可提交一次，点踩需提供原因（多选），选择"其他"时需附文字说明
 // @Tags         消息
 // @Accept       json
 // @Produce      json
 // @Param        session_id  path  string  true  "会话ID"
-// @Param        id          path  string  true  "消息ID"
+// @Param        id          path  string  true  "消息ID或FAQ条目数字ID（seq_id）"
 // @Param        request     body  SubmitMessageFeedbackRequest  true  "反馈内容"
 // @Success      200  {object}  map[string]interface{}  "反馈已记录"
 // @Failure      400  {object}  errors.AppError  "请求参数错误"
@@ -377,7 +377,7 @@ func (h *MessageHandler) SubmitMessageFeedback(c *gin.Context) {
 			// ErrSessionNotFound when the caller can't see the owning session.
 			c.Error(errors.NewNotFoundError(err.Error()))
 		case stderrors.Is(err, gorm.ErrRecordNotFound):
-			c.Error(errors.NewNotFoundError("message not found"))
+			c.Error(errors.NewNotFoundError("message or FAQ entry not found"))
 		case stderrors.Is(err, errors.ErrMessageFeedbackAlreadySubmitted):
 			c.Error(errors.NewConflictError(err.Error()))
 		default:

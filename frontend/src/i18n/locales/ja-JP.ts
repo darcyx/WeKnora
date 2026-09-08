@@ -1534,6 +1534,7 @@ export default {
     mcpService: 'MCPサービス',
     versionInfo: 'バージョン情報',
     taskQueue: 'タスクキュー',
+    tokenQuotas: 'トークンクォータ',
     tenantInfo: 'ワークスペース情報',
     workspaceSettings: 'ワークスペース設定',
     navGroups: {
@@ -3177,6 +3178,7 @@ export default {
       recommended: 'おすすめ',
       recommendedEnabled: 'おすすめ有効',
       recommendedDisabled: 'おすすめ無効',
+      recommendedEnableSuccess: 'FAQエントリのおすすめを有効にしました',
       recommendedDisableSuccess: 'FAQエントリのおすすめを無効にしました',
       recommendedUpdateFailed: 'おすすめ設定の更新に失敗しました',
       batchUpdateTag: 'タグを一括設定',
@@ -4016,6 +4018,11 @@ export default {
         },
         model: {
           max_concurrency: 'モデルごとのデフォルトの並列実行上限'
+        },
+        token_quota: {
+          default_daily_limit: '外部ユーザの1日あたりのデフォルトのトークン上限',
+          default_monthly_limit: '外部ユーザの1か月あたりのデフォルトのトークン上限',
+          max_completion_tokens: 'デフォルトの最大出力トークン数'
         }
       },
       keyDescriptions: {
@@ -4047,6 +4054,11 @@ export default {
         },
         model: {
           max_concurrency: '単一モデルへのバックグラウンド（取り込み・エンリッチメント）呼び出しのデフォルトの並列実行上限です。モデルIDごとに管理され、すべてのレプリカで共有されます。呼び出しのたびに参照され、再起動なしですぐに適用されます。0または負の値の場合はデフォルトの上限が無効になります（各モデルはモデル管理で設定した独自の上限に従います）。対象はバックグラウンドタスクのみで、対話型のチャットには影響しません。'
+        },
+        token_quota: {
+          default_daily_limit: 'ワークスペース内の外部ユーザごとの1日あたりのデフォルトのトークン上限です。0は無制限を意味し、ユーザごとに上書きできます。',
+          default_monthly_limit: 'ワークスペース内の外部ユーザごとの1か月あたりのデフォルトのトークン上限です。0は無制限を意味し、ユーザごとに上書きできます。',
+          max_completion_tokens: '呼び出し時に最大値が指定されていない場合の、出力トークンのデフォルトの予約上限です。ユーザの残りクォータに収まるよう自動的に引き下げられます。'
         }
       },
       enumLabels: {
@@ -6959,7 +6971,9 @@ export default {
       settingsManage: 'システム設定の管理',
       runtimeRead: 'ランタイムの読み取り',
       runtimeManage: 'ランタイムの管理',
-      auditRead: 'システム監査の読み取り'
+      auditRead: 'システム監査の読み取り',
+      tokenQuotaRead: '外部ユーザのトークンクォータの読み取り',
+      tokenQuotaManage: '外部ユーザのトークンクォータの管理'
     },
     capabilityHints: {
       tenantsRead: 'すべてのワークスペースの一覧表示、検索、詳細確認を行います。',
@@ -6968,7 +6982,9 @@ export default {
       settingsManage: 'プラットフォームのランタイム設定を更新・リセットします。',
       runtimeRead: 'タスクキューとタスクの詳細を確認します。',
       runtimeManage: 'ランタイムタスクの再試行、実行、キャンセル、削除を行います。',
-      auditRead: 'プラットフォームの監査イベントを読み取ります。'
+      auditRead: 'プラットフォームの監査イベントを読み取ります。',
+      tokenQuotaRead: '指定したワークスペース内の外部ユーザのトークンクォータと使用量を読み取ります。',
+      tokenQuotaManage: '指定したワークスペース内の外部ユーザのトークンクォータを設定・リセットします。'
     },
     createdTitle: 'プラットフォームAPIキーを作成しました',
     createdDescription: 'このキーを今すぐコピーして保管してください。完全な値は再表示されません。',
@@ -6981,5 +6997,48 @@ export default {
     capabilityRequired: '権限を1つ以上選択してください',
     loadFailed: 'プラットフォームAPIキーの読み込みに失敗しました',
     createFailed: 'プラットフォームAPIキーの作成に失敗しました'
+  },
+  tokenQuotaSettings: {
+    title: '外部ユーザのトークンクォータ',
+    description: 'ワークスペース内の外部ユーザの使用量を確認し、プラットフォームのデフォルトのトークンクォータを上書きします。',
+    identityHint: 'クォータは、ワークスペースIDとAPIのX-External-User-IDヘッダで送信される外部ユーザIDで識別されます。',
+    tenantId: 'ワークスペースID',
+    tenantIdPlaceholder: 'ワークスペースIDを入力してください',
+    tenantIdRequired: 'ワークスペースIDを入力してください',
+    tenantIdInvalid: 'ワークスペースIDは数値で指定してください',
+    subjectId: '外部ユーザID',
+    subjectIdPlaceholder: 'X-External-User-IDの値を入力してください',
+    subjectIdRequired: '外部ユーザIDを入力してください',
+    query: '検索',
+    listUsers: 'ユーザ一覧',
+    usersTitle: '記録のある外部ユーザ',
+    usersDescription: '使用量の記録またはクォータの上書き設定があるユーザのみ表示されます。ユーザを選択するとクォータを編集できます。',
+    previousPage: '前へ',
+    nextPage: '次へ',
+    pageInfo: '{page}ページ、ユーザ{total}人',
+    dailyUsage: '本日の使用量',
+    monthlyUsage: '今月の使用量',
+    reservedTokens: '処理中の予約トークン数',
+    reservedHint: '処理中のリクエストは一時的にクォータを消費します',
+    unlimited: '無制限',
+    limitValue: '上限：{value}',
+    overrideTitle: 'ユーザのクォータ上書き設定',
+    overrideDescription: '期間の上限を空欄にすると、プラットフォームのデフォルト値が適用されます。',
+    overridden: '上書き設定あり',
+    inheriting: 'プラットフォームのデフォルト値を使用',
+    dailyLimit: '1日あたりのトークン上限',
+    monthlyLimit: '1か月あたりのトークン上限',
+    inheritPlaceholder: '空欄の場合はプラットフォームのデフォルト値を使用',
+    limitHint: '0を入力すると、その期間の上限は無制限になります。',
+    reset: 'デフォルトに戻す',
+    resetConfirm: 'このユーザのクォータ上書き設定を削除し、プラットフォームのデフォルト値に戻しますか？',
+    save: 'クォータを保存',
+    noData: 'クォータの使用記録が見つかりません。',
+    loadFailed: 'トークンクォータの読み込みに失敗しました',
+    overrideRequired: '少なくとも1つの期間の上限を入力してください',
+    saveSuccess: 'トークンクォータを保存しました',
+    saveFailed: 'トークンクォータの保存に失敗しました',
+    resetSuccess: 'プラットフォームのデフォルトクォータに戻しました',
+    resetFailed: 'プラットフォームのデフォルトクォータへの復元に失敗しました'
   }
 }

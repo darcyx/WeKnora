@@ -6,6 +6,7 @@
 | ------ | ---------------------------- | ------------------------ |
 | GET    | `/messages/:session_id/load` | 获取最近的会话消息列表   |
 | DELETE | `/messages/:session_id/:id`  | 删除消息                 |
+| POST   | `/messages/:session_id/:id/feedback` | 提交消息或 FAQ 的会话级反馈 |
 | POST   | `/messages/search`           | 搜索历史对话             |
 | GET    | `/messages/chat-history-stats` | 获取聊天历史知识库统计 |
 
@@ -264,4 +265,39 @@ curl --location 'http://localhost:8080/api/v1/messages/chat-history-stats' \
     },
     "success": true
 }
+```
+
+## POST `/messages/:session_id/:id/feedback` - 提交会话级反馈
+
+`session_id` 必填，FAQ 反馈也需要会话，并校验会话归属。根据 `id` 分流：
+
+- 纯 ASCII 数字（例如 `123`）：作为 FAQ 条目的 `seq_id`，必须是正的 int64，记录当前租户、用户、会话及 FAQ 条目的反馈。
+- 其他字符串：沿用现有的 `session_id + message_id` 助手消息反馈逻辑。
+
+FAQ 反馈以租户、会话、FAQ 条目唯一；同一 FAQ 在不同会话可分别反馈，同一会话同一 FAQ 重复提交返回 `409`。
+
+请求示例（对会话 `session-1` 中直接展示的 FAQ 123 点踩）：
+
+```http
+POST /api/v1/messages/session-1/123/feedback
+Content-Type: application/json
+
+{"type":"dislike","reasons":["inaccurate","other"],"reason_text":"答案中的办理时间已过期"}
+```
+
+`type` 为 `like` 或 `dislike`。点赞忽略原因；点踩至少选择一个原因：`inaccurate`、`incomplete`、`off_topic`、`other`。选择 `other` 必须提供 `reason_text`（最多 500 字符）。
+
+成功返回 `200`，`data` 包含 `type`、`created_at` 及适用的 `reasons`、`reason_text`。无效参数返回 `400`，会话或目标不存在返回 `404`，重复反馈返回 `409`。
+
+FAQ 内容直接冗余到 `faq_feedbacks` 表的独立列：`chunk_id`、`knowledge_id`、`knowledge_base_id`、`tag_id`、`tag_name`、`standard_question`、`similar_questions`、`negative_questions`、`answers`、`answer_strategy`。数组列使用 JSON 存储，其余字段可直接查询。内容取自提交反馈时的 FAQ，后续修改 FAQ 不影响已记录的数据。接口请求及返回结构不变。
+
+无需关联 FAQ 表即可分析：
+
+```sql
+SELECT session_id, user_id, entry_id, knowledge_base_id, tag_name,
+       standard_question, answers,
+       feedback->>'type' AS vote,
+       feedback->'reasons' AS reasons,
+       feedback->>'reason_text' AS reason_text
+FROM faq_feedbacks;
 ```

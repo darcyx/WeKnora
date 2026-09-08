@@ -22,6 +22,7 @@ var regThinkIndex = regexp.MustCompile(`(?s)<think>.*?</think>`)
 // It reads the chat history knowledge base configuration from the tenant's ChatHistoryConfig,
 // which is managed via the settings UI.
 type messageService struct {
+	chunkRepo      interfaces.ChunkRepository
 	messageRepo    interfaces.MessageRepository    // Repository for message storage operations
 	sessionRepo    interfaces.SessionRepository    // Repository for session validation
 	tenantService  interfaces.TenantService        // Service for tenant operations (read ChatHistoryConfig)
@@ -39,8 +40,10 @@ func NewMessageService(messageRepo interfaces.MessageRepository,
 	knowService interfaces.KnowledgeService,
 	modelService interfaces.ModelService,
 	suggestionRepo interfaces.MessageSuggestionRepository,
+	chunkRepo interfaces.ChunkRepository,
 ) interfaces.MessageService {
 	return &messageService{
+		chunkRepo:      chunkRepo,
 		messageRepo:    messageRepo,
 		sessionRepo:    sessionRepo,
 		tenantService:  tenantService,

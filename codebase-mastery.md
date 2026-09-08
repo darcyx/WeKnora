@@ -1,13 +1,13 @@
 # WeKnora 心智模型 — 当前实现
 
-> 基于当前工作树（HEAD `7c7d5da3`）整理，更新于 2026-08-25。
+> 基于当前工作树（HEAD `174d20a1`）整理，更新于 2026-09-08；本次重点核对 Skills 配置、安装和执行链路。
 > 本文是代码导航和修改边界说明，不替代部署文档、API 文档或配置参考。
 
 ## 一句话定位
 
 WeKnora 是一个多租户 RAG/Agent 平台：Go 主服务负责 API、权限、知识库编排、文档分块、索引、检索、问答和异步任务；解析器、向量库、对象存储、模型、Neo4j、MCP 和沙箱都通过基础设施接口接入。
 
-## 先记住这 6 件事
+## 先记住这 7 件事
 
 1. 根目录是 Go 服务；`cli/` 和 `client/` 是独立的 Go module，不能假设根目录的 `go test ./...` 会覆盖它们。
 2. HTTP 入口是 Gin 路由，但“路由注册成功”不等于业务链路正确：DI、handler、service、repository 和运行时资源要一起追踪。
@@ -15,6 +15,7 @@ WeKnora 是一个多租户 RAG/Agent 平台：Go 主服务负责 API、权限、
 4. `Knowledge` 的“可检索”与“处理完成”不是同一时刻：文本索引完成后可以先启用，摘要、问题、图谱、Wiki 和多模态任务完成后才结束整个处理尝试。
 5. 有 Redis 时使用 Asynq 多 worker pool；没有 `REDIS_ADDR` 时使用 `SyncTaskExecutor` 的 Lite 模式。业务代码依赖 `TaskEnqueuer` 接口，不应直接假设一定存在 Redis。
 6. GraphRAG 在本项目中是“LLM 抽取 + Neo4j 一跳实体关系补召回”，不是带社区报告的全局 GraphRAG，也不是任意 N-hop 图遍历。
+7. 生产对话的 Skills 来自当前沙箱配置的已安装技能；目录登记、安装完成、Agent 允许使用是不同层次。`@Skill` 只增加本轮优先使用提示，不收窄原有白名单。
 
 ## 总体架构
 
@@ -77,7 +78,7 @@ main
 | `Session` / `Message` | 会话、消息、流式回答、引用、附件、建议和 Agent 产物 |
 | `DataSource` / `WikiPage` | 外部连接器同步和 Wiki 页面版本化内容，最终可进入现有 Knowledge/Chunk/检索链 |
 | `CustomAgent` / `MCPService` | Agent 提示词、检索策略、工具、MCP OAuth/审批、Skills 选择和沙箱策略 |
-| `TenantSkill` / `SandboxConfig` | 工作空间沙箱中安装、启用并随镜像提供给 Agent 的技能 |
+| `TenantSkillCatalogEntity` / `TenantSkillEntity` / `TenantSandboxConfig` | 分别保存空间技能定义、某份沙箱配置的安装记录、后端参数与当前技能镜像指针 |
 | `MemorySubject` / `MemoryItem` | 按租户和用户主体隔离的长期记忆、主题、向量、确认/拒绝和清理状态 |
 
 `Knowledge.ParseStatus` 的关键状态是 `pending → processing → finalizing → completed`，也可能进入 `failed`、`cancelled` 或 `deleting`；`SummaryStatus` 单独表示摘要任务状态，不能用它替代整体解析状态。
@@ -211,18 +212,110 @@ RAG：LOAD_HISTORY? → MEMORY_RECALL → QUERY_UNDERSTAND
 ## Agent、MCP、数据源和长期记忆
 
 - `AgentService` 是独立于 `KnowledgeQA` 的 Agent 执行路径，组合知识检索、Web Search、Wiki、DuckDB、MCP tools、工具审批、tenant sandbox、skills 和 artifact collector；`AgentEngine` 每轮由 session 传入上下文，不应假设引擎自身持久化整段会话。
-- MCP 有 service registry、OAuth token、tool approval gate 和 manager；涉及工具执行的接口必须同时考虑租户、会话、审批和 sandbox trust boundary。
-- Skills 的“哪些生效”在 WeKnora 的 `CustomAgent.Config` 中配置，不是仓库根目录的 `AGENTS.md`：前端 [`AgentEditorModal.vue`](frontend/src/views/agent/AgentEditorModal.vue) 的 Agent 模式 Skills 区域维护 `skills_selection_mode` 和 `selected_skills`，API 字段定义见 [`frontend/src/api/agent/index.ts`](frontend/src/api/agent/index.ts)，后端模型见 [`internal/types/custom_agent.go`](internal/types/custom_agent.go)。
-- `skills_selection_mode` 有三个值：`all` 启用全部可用 Skills，`selected` 只允许 `selected_skills` 中的名称，`none` 或空值关闭 Skills；该配置只对 `smart-reasoning` Agent 有效。`selected` 但列表为空、未知模式都会按关闭处理。
-- 一次 Agent 会话由 [`session_agent_qa.go`](internal/application/service/session_agent_qa.go) 把上述配置转换为运行时 `AgentConfig.SkillsEnabled`、`SkillDirs` 和 `AllowedSkills`。因此修改 API/数据库字段时，要同时检查这段转换，不要只改前端 checkbox。
-- Skill 有两类来源：服务端 [`skills/preloaded/`](skills/preloaded/)（可由 `WEKNORA_SKILLS_DIR` 覆盖）是内置 Skill 目录；工作空间沙盒则提供上传到镜像中的租户 Skill。后者由 `sandbox_config_id` 决定运行在哪个沙盒，且只有镜像有效、状态为 `ready`、开关为 `enabled` 时才会注入本次会话。
-- [`GET /api/v1/skills?sandbox_config_id=...`](docs/api/skill.md) 返回服务端 `skills/preloaded/` 的内置 Skill；传入沙盒配置时再合并该沙盒中可执行的租户 Skill，同名租户 Skill 覆盖内置 Skill。前端的 Skill 选择列表通过 [`editorResources.ts`](frontend/src/stores/editorResources.ts) 调这个接口，即使未选择沙盒也能看到内置 Skill。
-- 本地沙盒不会显示“上传 Skill”步骤，这是前端 [`SandboxConfigEditorDrawer.vue`](frontend/src/components/SandboxConfigEditorDrawer.vue) 的明确分支：Skill 镜像安装只对远程沙盒开放。使用内置 Skill 时，把目录放在 `skills/preloaded/`，或设置 `WEKNORA_SKILLS_DIR` 指向该目录；为避免工作目录/二进制目录不同导致找不到，部署时优先显式设置这个环境变量。
-- 本地内置 Skill 的最小 Agent 配置是：`agent_mode=smart-reasoning`、选择本地 `sandbox_config_id`（需要执行 Skill 脚本时）、`skills_selection_mode=all`。若用 `selected`，`selected_skills` 填的是每个 `SKILL.md` frontmatter 的 `name`，不是目录名；例如当前内置目录中的 `数据处理器`、`引用生成器`。
-- 配置层和运行时来源是两道门：内置 Skill 由 `SkillDirs`/`AllowedSkills` 控制，租户 Skill 还必须存在于当前会话实际启动的沙盒镜像；对话中的 `@Skill` / `skill_names` 会在本轮把已允许的白名单进一步收窄，不能越过 Agent 配置的限制。相关 scope 逻辑在 `applyPerRequestSkillScope`。
+- MCP 有 service registry、OAuth token、tool approval gate 和 manager；当前通过 `discover_mcp_tools` 按需列举服务、工具和 schema，再用 `call_mcp_tool` 执行返回的 `tool_ref`。涉及工具执行的接口必须同时考虑租户、会话、审批和 sandbox trust boundary。
 - `DataSourceService` 通过 `ConnectorRegistry` 校验凭据和资源，`Scheduler` 触发 `datasource:sync`，同步结果回到 Knowledge/Chunk 处理链；连接器不是另一套检索存储。
 - Wiki 以页面/版本为源，经过 `wiki:ingest` 和 `wiki:finalize` 接入现有 chunk/search 体系，并有 Wiki-specific boost/上下文逻辑。
 - `memory` service 管理用户主体级长期记忆：抽取任务异步化，检索结合 lexical/vector/topic 组织，支持确认、拒绝、清理和定期 consolidation。它与租户级聊天历史、KnowledgeBase 文档不是同一个数据源。
+
+## Skills：从目录登记到本轮执行
+
+### 三层对象和唯一生产来源
+
+| 层次 | 职责 | 不代表什么 |
+|---|---|---|
+| 技能目录 `TenantSkillCatalogEntity` | 工作空间内登记技能名称、描述、来源和归档包，可分发到多份沙箱配置 | 目录里有记录不代表任何沙箱已经安装 |
+| 安装记录 `TenantSkillEntity` | 绑定 `sandbox_config_id`，记录安装状态、启用开关、包版本、环境变量声明和快照信息 | `ready` 还需结合当前配置的镜像有效性判断 |
+| Agent / 本轮 `AgentConfig` | 配置允许的名称集合，并注入本轮沙箱提供的 `TenantSkills` | 选择某个名称不会下载或自动安装技能 |
+
+生产 QA 的 `configureSkillsFromAgent` 已不再填充 `SkillDirs`，也没有 `skills/preloaded/` 或 `WEKNORA_SKILLS_DIR` 回退。技能必须先安装到工作空间的具名沙箱配置（Docker、Cube 或 E2B），再由智能体选择该配置。`SkillDirs`、文件系统 `Loader` 和宿主资源 staging 仍保留给测试或显式构造运行时配置的调用者，不能把这些底层能力当成部署默认来源。仓库 `AGENTS.md` 约束开发助手，与产品内 Agent 的 Skills 选择无关。
+
+### 配置、可用列表与本轮优先使用
+
+配置入口是 [`AgentEditorModal.vue`](frontend/src/views/agent/AgentEditorModal.vue)，持久化字段在 [`CustomAgentConfig`](internal/types/custom_agent.go)。Skills 用于 `smart-reasoning` 模式：
+
+| `skills_selection_mode` | 运行时结果 |
+|---|---|
+| `all` | `SkillsEnabled=true`，`AllowedSkills` 为空，允许本轮来源中的全部技能 |
+| `selected` 且列表非空 | `SkillsEnabled=true`，`AllowedSkills=selected_skills`，按技能名称过滤 |
+| `selected` 且列表为空 | 关闭 Skills |
+| `none`、空值或未知模式 | 关闭 Skills |
+
+前端只有已选沙箱，或空间里恰好有一份可选的具名沙箱配置时，才允许选 `all` / `selected`；后一种情况在启用 Skills 时自动绑定唯一配置。多份配置且未选定时需要先选沙箱。后端的模式转换本身不验证安装完成，实际可用性由下一层决定。
+
+[`GET /api/v1/skills?sandbox_config_id=...`](docs/api/skill.md) 只返回该配置可用的安装技能，不再合并内置目录。不传配置时返回空数组和 `skills_available=false`；传入配置后的 `skills_available=true` 也不表示结果非空，应检查 `data`。前端 [`editorResources.ts`](frontend/src/stores/editorResources.ts) 使用此接口，技能目录管理和可执行技能列表是不同入口。
+
+[`session_agent_qa.go`](internal/application/service/session_agent_qa.go) 组装本轮配置的关键链路：
+
+```text
+CustomAgent.Config
+  ├─ configureSkillsFromAgent → SkillsEnabled / AllowedSkills / SandboxConfigID
+  ├─ skillsForRun
+  │    ├─ 优先采用会话现有沙箱绑定的配置，否则采用 Agent 选择
+  │    └─ effectiveTenantSkills → 镜像有效 + ready + enabled → TenantSkills
+  └─ applyPerRequestSkillScope(skill_names) → PinnedSkillNames
+       保留请求顺序、去重、过滤白名单外的名称；不修改 AllowedSkills
+```
+
+[`tenant_skill_effective.go`](internal/application/service/tenant_skill_effective.go) 复用 `sandbox.SkillImageActive` 判断技能镜像是否可用；缺少配置、镜像不可用、读取失败或没有 `ready && enabled` 的记录时不提供技能。这里按调用上下文的工作空间读取，不直接使用共享 Agent 的所有者租户。已有沙箱的配置 pin 读取失败时，也不能猜测使用 Agent 当前配置。
+
+`@Skill` / 请求 `skill_names` 现在是**本轮优先使用提示**：在原本允许的范围内设置 `PinnedSkillNames`，最终由 `resolvePinnedSkillInfos` 解析实际存在的技能并生成 `<must_use>` 提示。它既不撤销其他已允许技能，也不能越权启用被关闭或白名单外的技能。例如 Agent 允许 `[pdf, spreadsheet]`，本轮提及 `pdf` 后仍可使用两者，只优先提示 `pdf`。不要因函数名含 `Scope` 就把它描述成集合收窄。
+
+### 登记、安装、卸载与镜像更新
+
+包解析以 [`skill.go`](internal/agent/skills/skill.go) 为准：安装名称优先使用合法 `name`，否则采用合法 `slug`，再尝试从标题生成名称；允许 Unicode 字母、数字、连字符和下划线，名称最多 64 字符、描述最多 1024 字符。`skill_frontmatter.go` 可修复部分第三方 YAML 格式并记录修复标记，不改写原始 `SKILL.md`。因此 `selected_skills` 应使用接口返回的规范化名称。
+
+[`tenant_skill_catalog.go`](internal/application/service/tenant_skill_catalog.go) 接收 ZIP 或公开来源，规范化包后写入目录；`InstallCatalogToConfigs` 再逐配置调用 `InstallSkill`，返回每个配置的安装 ID 或错误，允许部分受理成功。登记同名新包不会让旧安装自动升级。
+
+[`tenant_skill_install.go`](internal/application/service/tenant_skill_install.go) 的主要流程如下：
+
+```text
+受理安装 → 安装记录 installing → 按 sandbox config 加锁
+  → 从当前有效镜像启动维护沙箱
+  → 清理目标技能目录、由服务端写入包文件
+  → builtin-skill-installer 安装依赖
+  → verifySkill 检查，可修复失败反馈给安装 Agent 再尝试
+  → 写 manifest / 环境变量声明、清理临时工作区
+  → 先记快照账本，再创建快照
+  → 校验后端归属指纹并切换 SkillImage 指针
+  → 安装记录 ready、处理旧快照与现有会话更新
+```
+
+安装 Agent 负责准备依赖，不负责从提示词重建包文件；其自然语言回复不构成安装成功，验证与镜像指针切换才是关键边界。安装模式通过专用运行时开关开放 `shell_exec`、`write_skill_file` / `edit_skill_file`，普通自定义 Agent 不能仅靠配置字段进入该模式。安装进度和对话记录分别由 `tenant_skill_progress.go`、`tenant_skill_transcript.go` 提供；前端 `SandboxSkillsPanel.vue` 用 SSE 跟踪进度并以轮询刷新状态。
+
+卸载走 [`tenant_skill_remove.go`](internal/application/service/tenant_skill_remove.go)：`removing → removed`，删除镜像中的技能文件并生成新快照；失败记录为 `failed`。安装和卸载共用配置锁，避免两个操作分别从旧镜像派生、覆盖彼此结果。启用开关只控制后续可用列表，不等同于卸载。停止、失败恢复和孤儿快照回收分别见 `tenant_skill_stop.go`、`tenant_skill_reaper.go`。
+
+镜像发布策略由 `TenantSandboxConfig.skill_rollout` 决定：默认 `next_turn` 将已有 binding 标记 stale，在后续轮次首次解析时重建沙箱，避免同一轮中途切换；`new_session` 保留已有沙箱，只让新沙箱使用新镜像。标记 stale 是镜像切换后的最佳努力操作。因此配置当前镜像、技能记录和某个已运行沙箱的实际内容仍需分别检查，不能承诺 `ready` 后所有活会话立即更新；重建还涉及会话工作区生命周期。
+
+### 渐进披露、资源读取与执行环境
+
+[`agent_service.go`](internal/application/service/agent_service.go) 仅在 `SkillsEnabled` 且存在 `TenantSkills` 或显式 `SkillDirs` 时初始化 `skills.Manager`；Manager 按 `AllowedSkills` 过滤来源，向提示词提供名称和描述。渐进披露指给模型的内容按需展开，不应解释为所有实现都只在磁盘读取 frontmatter。
+
+| 步骤 | 工具与职责 |
+|---|---|
+| 发现 | System Prompt 中的可用技能元数据，配合本轮优先使用提示 |
+| 读说明 | `read_file(path="skill://pdf/SKILL.md")`，返回指令、资源和执行方式 |
+| 读附加资源 | `read_file(path="skill://pdf/references/forms.md")`，支持分页和输出预算 |
+| 执行 | `shell_exec(skill_name="pdf", command=...)`，准备对应技能环境后在会话沙箱中运行 |
+
+租户来源 [`tenant_source.go`](internal/agent/skills/tenant_source.go) 从安装记录和归档包提供技能资源，无需为了阅读启动沙箱；执行副本则在沙箱镜像里。`loadInstalledSkillBundle` 优先读安装记录的 `BundleRef`，旧记录回退目录包时检查 `BundleSHA256`，避免目录已更新却把新文档配给旧镜像执行。`skill://` 是资源地址，不能作为 Shell 路径。
+
+```json
+{
+  "skill_name": "pdf",
+  "command": "python3 \"$WEKNORA_SKILL_DIR/scripts/extract.py\" /workspace/input/report.pdf"
+}
+```
+
+`shell_exec` 的技能环境只作用于本次调用；工作目录默认 `/workspace`，输入附件在 `/workspace/input`，产物放在 `/workspace/output`。普通 Shell 的注册取决于 `SkillsEnabled` 和后端 Shell 能力，不要求已经存在 ready 技能；Skills 关闭时，文件工具仍可按沙箱能力注册，用于附件和产物操作。独立的 `read_skill`、`read_sandbox_file`、`execute_skill_script` 已退出当前工具注册链，旧名称只用于历史记录兼容。
+
+凭据由 [`user_env_resolver.go`](internal/application/service/user_env_resolver.go) 按顺序覆盖：管理员的技能共享值 → 当前调用者的配置级变量 → 当前调用者的技能级变量。调用者身份使用上下文 `Principal`，不能用同一工作空间的公共 IM 账号代替；读取个人变量失败会返回错误，不静默降级使用管理员凭据。缺依赖时可在会话内补装，修改随该会话沙箱销毁，不会更新其他会话的基础镜像；要长期生效仍需重新安装技能。
+
+### 修改与排查顺序
+
+1. 先区分目录定义、某配置的安装记录和运行中会话；检查 `sandbox_config_id`、会话 pin、镜像有效性、安装状态和开关。
+2. 再检查 Agent 模式、`skills_selection_mode` / `selected_skills`、本轮 `PinnedSkillNames`；名称以解析后的安装名称为准，不按展示标题或目录名猜测。
+3. 读失败追踪 Manager 白名单、包引用与摘要校验、资源路径；执行失败追踪 Shell 能力、技能环境、调用者变量和实际镜像版本。
+4. 安装失败查看安装 transcript、验证结果、快照账本及镜像指针；HTTP 已受理、SSE 已结束和镜像已发布不能混用。
 
 ## 文件与资源存储
 
@@ -241,7 +334,7 @@ RAG：LOAD_HISTORY? → MEMORY_RECALL → QUERY_UNDERSTAND
 | 新文件存储 provider | `FileService`、provider 实现、factory、`storageallowlist`、配置/脱敏/安全测试 |
 | 新聊天阶段 | `EventType`、plugin 的 `ActivationEvents/OnEvent`、pipeline builder、`BuildContainer` 注册和阶段测试 |
 | 新数据源 | connector registry、config 校验、scheduler、sync task、Knowledge 幂等更新 |
-| 新增或调整 Agent Skill | `skills/preloaded/` 或沙盒技能安装链 → `SkillHandler`/`TenantSkillService` → `CustomAgentConfig` 的 `skills_selection_mode`/`selected_skills` → `configureSkillsFromAgent` → 本轮 `@Skill` scope |
+| 新增或调整 Agent Skill | 目录/安装/镜像链 → `effectiveTenantSkills` / 会话 pin → `configureSkillsFromAgent` → Manager 白名单 → 本轮 pin 提示 → `read_file` / `shell_exec` |
 
 ## 不要破坏的架构约束
 
@@ -262,12 +355,13 @@ RAG：LOAD_HISTORY? → MEMORY_RECALL → QUERY_UNDERSTAND
 - 解析：[`internal/infrastructure/docparser/`](internal/infrastructure/docparser)、[`docreader/main.py`](docreader/main.py)、[`docreader/parser/`](docreader/parser)
 - 检索：[`internal/application/service/knowledgebase_search.go`](internal/application/service/knowledgebase_search.go)、[`internal/application/service/retriever/`](internal/application/service/retriever)、[`internal/container/engine_factory.go`](internal/container/engine_factory.go)
 - 聊天：[`internal/application/service/session_knowledge_qa.go`](internal/application/service/session_knowledge_qa.go)、[`internal/application/service/chat_pipeline/`](internal/application/service/chat_pipeline)
-- Agent/Skills：[`internal/application/service/session_agent_qa.go`](internal/application/service/session_agent_qa.go)、[`internal/application/service/skill_service.go`](internal/application/service/skill_service.go)、[`internal/application/service/tenant_skill_admin.go`](internal/application/service/tenant_skill_admin.go)、[`internal/handler/skill_handler.go`](internal/handler/skill_handler.go)、[`docs/agent-skills.md`](docs/agent-skills.md)、[`docs/api/agent.md`](docs/api/agent.md)、[`docs/api/skill.md`](docs/api/skill.md)
+- Agent/Skills：[`internal/application/service/session_agent_qa.go`](internal/application/service/session_agent_qa.go)、[`internal/application/service/tenant_skill_effective.go`](internal/application/service/tenant_skill_effective.go)、[`internal/application/service/tenant_skill_catalog.go`](internal/application/service/tenant_skill_catalog.go)、[`internal/application/service/tenant_skill_install.go`](internal/application/service/tenant_skill_install.go)、[`internal/agent/skills/manager.go`](internal/agent/skills/manager.go)、[`internal/application/service/tenant_skill_admin.go`](internal/application/service/tenant_skill_admin.go)、[`internal/handler/skill_handler.go`](internal/handler/skill_handler.go)、[`docs/agent-skills.md`](docs/agent-skills.md)、[`docs/api/agent.md`](docs/api/agent.md)、[`docs/api/skill.md`](docs/api/skill.md)
 - 资源与扩展：[`internal/application/service/file/`](internal/application/service/file)、[`datasource_service.go`](internal/application/service/datasource_service.go)、[`wiki_ingest.go`](internal/application/service/wiki_ingest.go)、[`agent_service.go`](internal/application/service/agent_service.go)、[`memory/`](internal/application/service/memory)
 - 客户端：[`frontend/`](frontend)、[`cli/`](cli)、[`client/`](client)、[`mcp-server/`](mcp-server)、[`miniprogram/`](miniprogram)
 
 ## 验证入口
 
+- Skills 重点回归入口：`session_agent_qa_scope_test.go`（模式与本轮 pin）、`tenant_skill_effective_test.go`（可用来源）、`tenant_skill_install_test.go` / `tenant_skill_remove_test.go`（镜像变更）、`agent_service_skill_bundle_test.go`（资源版本）、`user_env_resolver_test.go`（凭据覆盖）、`internal/agent/skills/` 与 `internal/agent/tools/` 的相关测试。
 - 根 Go 服务：在仓库根目录运行针对改动包的 `go test`；必要时为受限环境指定任务专用 `GOCACHE/GOMODCACHE`。
 - CLI：在 [`cli/`](cli) 内运行 `go test ./...`；不要从根 module 推断 CLI 已验证。
 - SDK：在 [`client/`](client) 内运行 `go test ./...`。
