@@ -84,7 +84,8 @@
                         :class="['menu_item', item.childrenPath && item.childrenPath == currentpath ? 'menu_item_c_active' : isMenuItemActive(item.path) ? 'menu_item_active' : '']">
                         <div class="menu_item-box">
                             <div class="menu_icon">
-                                <img class="icon"
+                                <t-icon v-if="item.icon === 'feedback'" name="chat-bubble-help" size="20px" />
+                                <img v-else class="icon"
                                     :src="getImgSrc(item.icon == 'zhishiku' ? knowledgeIcon : item.icon == 'agent' ? agentIcon : item.icon == 'organization' ? organizationIcon : item.icon == 'logout' ? logoutIcon : item.icon == 'setting' ? settingIcon : prefixIcon)"
                                     alt="">
                             </div>
@@ -410,6 +411,8 @@ const isMenuItemActive = (itemPath: string): boolean => {
                 currentRoute === 'knowledgeBaseSettings';
         case 'agents':
             return currentRoute === 'agentList';
+        case 'feedback':
+            return currentRoute === 'feedbackAdmin';
         case 'organizations':
             return currentRoute === 'organizationList';
         case 'creatChat':
@@ -440,13 +443,13 @@ const getIconActiveState = (itemPath: string) => {
 // 分离上下两部分菜单（使用 visibleMenuArr 以便 lite 模式过滤 logout）
 const topMenuItems = computed<MenuItem[]>(() => {
     return (visibleMenuArr.value as unknown as MenuItem[]).filter((item: MenuItem) =>
-        item.path === 'knowledge-bases' || item.path === 'agents' || item.path === 'organizations' || item.path === 'creatChat'
+        item.path === 'knowledge-bases' || item.path === 'agents' || item.path === 'organizations' || item.path === 'feedback' || item.path === 'creatChat'
     );
 });
 
 const bottomMenuItems = computed<MenuItem[]>(() => {
     return (visibleMenuArr.value as unknown as MenuItem[]).filter((item: MenuItem) => {
-        if (item.path === 'knowledge-bases' || item.path === 'agents' || item.path === 'organizations' || item.path === 'creatChat') {
+        if (item.path === 'knowledge-bases' || item.path === 'agents' || item.path === 'organizations' || item.path === 'feedback' || item.path === 'creatChat') {
             return false;
         }
         return true;
@@ -1082,6 +1085,8 @@ const handleMenuClick = async (path: string) => {
         }
     } else if (path === 'agents') {
         router.push('/platform/agents')
+    } else if (path === 'feedback') {
+        router.push('/platform/feedback')
     } else if (path === 'organizations') {
         // 组织菜单项：跳转到组织列表
         router.push('/platform/organizations')

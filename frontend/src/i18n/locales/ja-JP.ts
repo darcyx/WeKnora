@@ -1,4 +1,6 @@
+import { feedbackAdminEN } from '../feedbackAdminMessages'
 export default {
+  feedbackAdmin: feedbackAdminEN,
   menu: {
     sessionInProgress: '会話中',
     knowledgeBase: 'ナレッジベース',

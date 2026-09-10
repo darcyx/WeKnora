@@ -81,6 +81,8 @@ type MessageService interface {
 
 // MessageRepository defines the message repository interface
 type MessageRepository interface {
+	// GetAssistantMessageByRequestID resolves an assistant reply within a session.
+	GetAssistantMessageByRequestID(ctx context.Context, sessionID, requestID string) (*types.Message, error)
 	// CreateFAQFeedback records one vote per tenant, session and FAQ entry.
 	CreateFAQFeedback(ctx context.Context, feedback *types.FAQFeedback) error
 	// CreateMessage creates a message
@@ -136,9 +138,10 @@ type MessageRepository interface {
 	// GetSessionAttachments returns every user-uploaded attachment recorded in
 	// the session. Implementations should project only the attachments column.
 	GetSessionAttachments(ctx context.Context, sessionID string) (types.MessageAttachments, error)
-	// UpdateMessageFeedback records a like/dislike vote, but only if the
+	// UpdateMessageFeedback locates the assistant by sessionID + requestID
+	// and records a like/dislike vote, but only if the
 	// message doesn't already carry one. Returns gorm.ErrRecordNotFound if
 	// the message doesn't exist under sessionID, or
 	// apperrors.ErrMessageFeedbackAlreadySubmitted if it already has a vote.
-	UpdateMessageFeedback(ctx context.Context, sessionID, messageID string, feedback types.MessageFeedback) error
+	UpdateMessageFeedback(ctx context.Context, sessionID, requestID string, feedback types.MessageFeedback) error
 }

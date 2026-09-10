@@ -52,7 +52,7 @@ func (r *faqFeedbackMessages) CreateFAQFeedback(_ context.Context, f *types.FAQF
 	r.saved = f
 	return nil
 }
-func (r *faqFeedbackMessages) GetMessage(_ context.Context, session, id string) (*types.Message, error) {
+func (r *faqFeedbackMessages) GetAssistantMessageByRequestID(_ context.Context, session, id string) (*types.Message, error) {
 	r.session, r.id = session, id
 	return &types.Message{Role: "assistant"}, nil
 }
@@ -116,4 +116,16 @@ func TestSubmitFAQFeedbackRejectsInvalidTargets(t *testing.T) {
 			require.Nil(t, messages.saved)
 		})
 	}
+}
+
+func TestMessageFeedbackRequestLookupRequiresOwnedSession(t *testing.T) {
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
+	ctx = context.WithValue(ctx, types.UserIDContextKey, "alice")
+	messages := &faqFeedbackMessages{}
+	sessions := &faqFeedbackSessions{err: apperrors.ErrSessionNotFound}
+	s := &messageService{messageRepo: messages, sessionRepo: sessions}
+	_, err := s.SubmitMessageFeedback(ctx, "someone-elses-session", "request-1", "like", nil, "")
+	require.ErrorIs(t, err, apperrors.ErrSessionNotFound)
+	require.Empty(t, messages.id)
+	require.Equal(t, "alice", sessions.owner)
 }

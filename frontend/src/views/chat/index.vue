@@ -115,7 +115,9 @@
                             </usermsg>
                         </div>
                         <div v-if="session.role == 'assistant' && shouldRenderAssistantMessage(session)"
-                            class="message-row">
+                            class="message-row"
+                            :data-message-id="resolveAssistantMessageId(session) || undefined"
+                            :class="{ 'is-minimap-target': resolveAssistantMessageId(session) === minimapTargetId }">
                             <botmsg :content="session.content" :session="session" :session-id="session_id"
                                 :user-query="getUserQuery(index)" @scroll-bottom="scrollToBottom"
                                 :isFirstEnter="isFirstEnter" :embeddedMode="embeddedMode"
@@ -802,6 +804,28 @@ const getmsgList = (data, isScrollType = false, scrollHeight) => {
         }
     })
 }
+
+// Feedback administration links identify the exact assistant row, including
+// older turns outside the first history page. Reuse normal history paging.
+let focusedFeedbackKey = '';
+watch(() => [route.query.focus_message, historyLoading.value, historyLoadingMore.value, messagesList.length], async () => {
+    const target = typeof route.query.focus_message === 'string' ? route.query.focus_message : '';
+    const key = `${session_id.value}:${target}`;
+    if (!target || focusedFeedbackKey === key || historyLoading.value || historyLoadingMore.value) return;
+    await nextTick();
+    if (historyLoading.value || historyLoadingMore.value || key !== `${session_id.value}:${route.query.focus_message}`) return;
+    const element = scrollContainer.value?.querySelector(`[data-message-id="${CSS.escape(target)}"]`);
+    if (element) {
+        focusedFeedbackKey = key;
+        jumpToQuestion(target);
+    } else if (hasMoreHistory.value && created_at.value && scrollContainer.value) {
+        getmsgList({ session_id: session_id.value, created_at: created_at.value, limit: limit.value }, true, scrollContainer.value.scrollHeight);
+    } else {
+        focusedFeedbackKey = key;
+        MessagePlugin.warning(t('feedbackAdmin.unavailable'));
+    }
+}, { flush: 'post' });
+
 
 // 发送消息
 // 处理停止生成事件 - 立即清除 loading 状态

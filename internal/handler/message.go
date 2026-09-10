@@ -337,12 +337,12 @@ type SubmitMessageFeedbackRequest struct {
 
 // SubmitMessageFeedback godoc
 // @Summary      提交消息或FAQ反馈（点赞/点踩）
-// @Description  id 为纯数字时记录会话级 FAQ 反馈，否则按 session_id + id 记录助手消息反馈；同一会话同一对象仅可提交一次，点踩需提供原因（多选），选择"其他"时需附文字说明
+// @Description  id 为纯数字时记录会话级 FAQ 反馈，否则将 id 作为 request_id，按 session_id + request_id 记录助手消息反馈；同一会话同一对象仅可提交一次，点踩需提供原因（多选），选择"其他"时需附文字说明
 // @Tags         消息
 // @Accept       json
 // @Produce      json
 // @Param        session_id  path  string  true  "会话ID"
-// @Param        id          path  string  true  "消息ID或FAQ条目数字ID（seq_id）"
+// @Param        id          path  string  true  "请求ID（request_id）或FAQ条目数字ID（seq_id）"
 // @Param        request     body  SubmitMessageFeedbackRequest  true  "反馈内容"
 // @Success      200  {object}  map[string]interface{}  "反馈已记录"
 // @Failure      400  {object}  errors.AppError  "请求参数错误"

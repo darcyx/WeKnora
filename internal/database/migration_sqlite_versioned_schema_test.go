@@ -19,11 +19,17 @@ var versionedSQLiteTables = []string{
 	"system_settings",
 	"knowledge_processing_spans",
 	"knowledge_tag_relations",
+	"faq_feedbacks", // 999003 (fork-local)
 }
 
 // versionedSQLiteColumns maps each existing table to the columns that the
 // versioned migrations add and the SQLite baseline was missing.
 var versionedSQLiteColumns = map[string][]string{
+	"faq_feedbacks": { // 999003 (fork-local)
+		"tenant_id", "session_id", "user_id", "entry_id", "feedback",
+		"chunk_id", "knowledge_id", "knowledge_base_id", "tag_id", "tag_name",
+		"standard_question", "similar_questions", "negative_questions", "answers", "answer_strategy",
+	},
 	"tenants":            {"api_principal_config"},             // 000064
 	"users":              {"is_system_admin"},                  // 000053
 	"knowledges":         {"pending_subtasks_count"},           // 000056
@@ -34,11 +40,11 @@ var versionedSQLiteColumns = map[string][]string{
 	"mcp_tool_approvals": {"enabled"},                          // 000091
 }
 
-// 999001/999002 are fork-local migrations (not upstreamed) numbered out of
+// 999001–999003 are fork-local migrations (not upstreamed) numbered out of
 // the upstream sequence to avoid colliding with Tencent/WeKnora's own
 // numbering; see migrations/sqlite/999001_message_feedback.up.sql and
-// migrations/sqlite/999002_token_quota.up.sql.
-const expectedSQLiteMigrationVersion = 999002
+// migrations/sqlite/999002_token_quota.up.sql and 999003_faq_feedback.up.sql.
+const expectedSQLiteMigrationVersion = 999003
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)

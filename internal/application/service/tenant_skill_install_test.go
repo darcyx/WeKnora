@@ -740,6 +740,13 @@ func TestInstallSkillRecoversFromNameConflict(t *testing.T) {
 	fx := newInstallFixture(t)
 	fx.skillRepo.getByNameMisses = 1
 	fx.skillRepo.createErr = errors.New("UNIQUE constraint failed: tenant_skills.sandbox_config_id")
+	// Observe the accepted row at a defined point in the async run, rather
+	// than racing its transition to ready after InstallSkill returns.
+	atExecute := make(chan *types.TenantSkillEntity, 1)
+	fx.beforeExecute = func() {
+		skill, _ := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
+		atExecute <- skill
+	}
 	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
 
 	id, err := fx.svc.InstallSkill(context.Background(), 7, "cfg-1", archive)
@@ -747,9 +754,18 @@ func TestInstallSkillRecoversFromNameConflict(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "sk-1", id,
 		"the upload that lost the unique index must reuse the row that won")
-	skill, getErr := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
-	require.NoError(t, getErr)
-	require.Equal(t, types.SkillStatusInstalling, skill.Status)
+	select {
+	case skill := <-atExecute:
+		require.NotNil(t, skill)
+		require.Equal(t, "sk-1", skill.ID)
+		require.Equal(t, types.SkillStatusInstalling, skill.Status)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the recovered install did not reach the installer engine")
+	}
+	require.Eventually(t, func() bool {
+		skill, err := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
+		return err == nil && skill != nil && skill.Status == types.SkillStatusReady
+	}, 2*time.Second, time.Millisecond, "the recovered row must finish installing")
 }
 
 func TestInstallSkillRefusesWhenBundleCannotBeStored(t *testing.T) {

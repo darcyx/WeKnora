@@ -272,7 +272,7 @@ curl --location 'http://localhost:8080/api/v1/messages/chat-history-stats' \
 `session_id` 必填，FAQ 反馈也需要会话，并校验会话归属。根据 `id` 分流：
 
 - 纯 ASCII 数字（例如 `123`）：作为 FAQ 条目的 `seq_id`，必须是正的 int64，记录当前租户、用户、会话及 FAQ 条目的反馈。
-- 其他字符串：沿用现有的 `session_id + message_id` 助手消息反馈逻辑。
+- 其他字符串：作为 `request_id`，按 `session_id + request_id` 查找助手消息（`role = assistant`），不是消息表的主键 `id`。
 
 FAQ 反馈以租户、会话、FAQ 条目唯一；同一 FAQ 在不同会话可分别反馈，同一会话同一 FAQ 重复提交返回 `409`。
 
