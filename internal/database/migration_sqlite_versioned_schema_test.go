@@ -40,12 +40,12 @@ var versionedSQLiteColumns = map[string][]string{
 		"chunk_id", "knowledge_id", "knowledge_base_id", "tag_id", "tag_name",
 		"standard_question", "similar_questions", "negative_questions", "answers", "answer_strategy",
 	},
-	"memory_subjects": {"extraction_state"},                                                 // 000094
-	"memory_items":    {"replaces_id"},                                                      // 000094
-	"tenants":         {"api_principal_config"},                                             // 000064
-	"users":           {"is_system_admin"},                                                  // 000053
-	"knowledges":      {"pending_subtasks_count", "profile"},                                // 000056, 000101
-	"knowledge_bases": {"profile_config", "generated_profile"},                              // 000101
+	"memory_subjects": {"extraction_state"},                                                             // 000094
+	"memory_items":    {"replaces_id"},                                                                  // 000094
+	"tenants":         {"api_principal_config"},                                                         // 000064
+	"users":           {"is_system_admin"},                                                              // 000053
+	"knowledges":      {"pending_subtasks_count", "profile"},                                            // 000056, 000101
+	"knowledge_bases": {"profile_config", "generated_profile"},                                          // 000101
 	"messages":        {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint", "feedback"}, // 000034/085/097/105
 	"sessions": {
 		"parent_session_id", "forked_from_message_id", "fork_bootstrap", // 000097
