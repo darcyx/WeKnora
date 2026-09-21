@@ -1036,6 +1036,7 @@ const loading = ref(true)
 const loadingMore = ref(false)
 const entries = ref<FAQEntry[]>([])
 const entryStatusLoading = reactive<Record<number, boolean>>({})
+const entryRecommendedLoading = reactive<Record<number, boolean>>({})
 const selectedRowKeys = ref<number[]>([])
 const batchDeleteLoading = ref(false)
 const batchTagLoading = ref(false)
@@ -1460,6 +1461,25 @@ const handleEntryStatusChange = async (entry: FAQEntry, value: boolean) => {
   }
 }
 
+const handleEntryRecommendedChange = async (entry: FAQEntry, value: boolean) => {
+  if (!props.kbId || !canEdit.value || entryRecommendedLoading[entry.id]) return
+  const actualEntry = entries.value.find(item => item.id === entry.id)
+  if (!actualEntry || actualEntry.is_recommended === value) return
+
+  const previous = actualEntry.is_recommended
+  actualEntry.is_recommended = value
+  entryRecommendedLoading[entry.id] = true
+  try {
+    await updateFAQEntryFieldsBatch(props.kbId, { by_id: { [entry.id]: { is_recommended: value } } })
+    MessagePlugin.success(t(value ? 'knowledgeEditor.faq.recommendedEnableSuccess' : 'knowledgeEditor.faq.recommendedDisableSuccess'))
+  } catch (error: any) {
+    actualEntry.is_recommended = previous
+    MessagePlugin.error(error?.message || t('knowledgeEditor.faq.recommendedUpdateFailed'))
+  } finally {
+    delete entryRecommendedLoading[entry.id]
+  }
+}
+
 const editorRules: FormRules<FAQEntryPayload> = {
   standard_question: [
     { required: true, message: t('knowledgeEditor.messages.nameRequired') },
@@ -1483,6 +1503,9 @@ const loadEntries = async (append = false) => {
     selectedRowKeys.value = []
     Object.keys(entryStatusLoading).forEach((key) => {
       delete entryStatusLoading[Number(key)]
+    })
+    Object.keys(entryRecommendedLoading).forEach((key) => {
+      delete entryRecommendedLoading[Number(key)]
     })
   }
 

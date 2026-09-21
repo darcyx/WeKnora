@@ -286,11 +286,16 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	//   - splitter separates inline <think>…</think> reasoning from answer text
 	//     in the plain `content` channel (models that don't use reasoning_content).
 	//   - thinkingOpen tracks whether the thought stream still needs a Done marker.
-	//   - answerStreamed records that user-facing answer text was sent live to
-	//     the final-answer area, so the natural-stop branch only emits Done.
+	//   - answerStreamed records that user-facing answer text was sent to the
+	//     final-answer area, so the natural-stop branch only emits Done.
+	//   - plainAnswerChunks stay buffered until this LLM round finishes: only
+	//     then do we know whether the text is a tool-round preamble (thinking)
+	//     or the answer from a natural stop.
 	splitter := agenttools.NewThinkStreamSplitter()
 	thinkingOpen := false
 	answerStreamed := false
+	roundHasToolCalls := false
+	plainAnswerChunks := make([]string, 0)
 
 	emitThought := func(content string, done bool) {
 		if content == "" && !done {
@@ -308,9 +313,8 @@ func (e *AgentEngine) streamThinkingToEventBus(
 			},
 		})
 	}
-	// closeThinking emits the thought Done marker once, used right before the
-	// first answer chunk so the UI flips the thinking card to "completed"
-	// instead of leaving it spinning while the answer streams.
+	// closeThinking emits the thought Done marker once, right before the first
+	// answer chunk so the UI flips the thinking card to "completed".
 	closeThinking := func() {
 		if thinkingOpen {
 			emitThought("", true)
@@ -344,12 +348,52 @@ func (e *AgentEngine) streamThinkingToEventBus(
 			},
 		})
 	}
+	flushPlainAsThought := func() {
+		started := false
+		for _, content := range plainAnswerChunks {
+			if !started && strings.TrimSpace(content) == "" {
+				continue
+			}
+			started = true
+			if content == "" {
+				continue
+			}
+			thinkingOpen = true
+			emitThought(content, false)
+		}
+		plainAnswerChunks = plainAnswerChunks[:0]
+	}
+	flushPlainAsAnswer := func() {
+		for _, content := range plainAnswerChunks {
+			emitAnswer(content)
+		}
+		plainAnswerChunks = plainAnswerChunks[:0]
+	}
+	flushSplitter := func() {
+		thinkPart, answerPart := splitter.Flush()
+		if thinkPart != "" {
+			thinkingOpen = true
+			emitThought(thinkPart, false)
+		}
+		if answerPart != "" {
+			plainAnswerChunks = append(plainAnswerChunks, answerPart)
+		}
+	}
 
 	llmResult, err := e.streamLLMToEventBus(
 		ctx,
 		messages,
 		opts,
 		func(chunk *types.StreamResponse, fullContent string) {
+			// Once the provider signals a tool call, the round's plain assistant
+			// text is known to be a preamble. Route it to thinking before publishing
+			// the tool event so SSE consumers never receive it as an answer.
+			if chunk.ResponseType == types.ResponseTypeToolCall || len(chunk.ToolCalls) > 0 {
+				roundHasToolCalls = true
+				flushSplitter()
+				flushPlainAsThought()
+			}
+
 			if chunk.ResponseType == types.ResponseTypeToolCall && chunk.Data != nil {
 				toolCallID, _ := chunk.Data["tool_call_id"].(string)
 				toolName, _ := chunk.Data["tool_name"].(string)
@@ -416,41 +460,51 @@ func (e *AgentEngine) streamThinkingToEventBus(
 				if chunk.Content != "" {
 					thinkingOpen = true
 					emitThought(chunk.Content, false)
-				} else if chunk.Done && thinkingOpen {
-					closeThinking()
 				}
 				return
 			}
 
-			// Plain content channel. Streamed live to the answer area
-			// (optimistically rendered as the final answer). If the round turns
-			// out to call tools, this was a preamble; the subsequent tool-call
-			// events let the UI retract it from the answer area and relocate it
-			// into the steps. Split out any inline <think> reasoning so it goes
-			// to the thought area instead.
+			// Plain content is held until the round ends, because it is only an
+			// answer if the model stops without calling a tool. Tool-round prose is
+			// routed to the thought area once the call is known. Inline <think>
+			// blocks can still be routed immediately.
 			if chunk.Content != "" {
 				thinkPart, answerPart := splitter.Feed(chunk.Content)
 				if thinkPart != "" {
 					thinkingOpen = true
 					emitThought(thinkPart, false)
 				}
-				emitAnswer(answerPart)
+				if answerPart != "" {
+					plainAnswerChunks = append(plainAnswerChunks, answerPart)
+				}
 			}
 			if chunk.Done {
-				thinkPart, answerPart := splitter.Flush()
-				if thinkPart != "" {
-					thinkingOpen = true
-					emitThought(thinkPart, false)
-				}
-				emitAnswer(answerPart)
-				closeThinking()
+				flushSplitter()
+			}
+			if roundHasToolCalls {
+				flushPlainAsThought()
 			}
 		},
 	)
 	if err != nil {
+		// An interrupted model response has no final answer classification yet.
+		// Keep any partial plain text out of the answer channel.
+		flushSplitter()
+		flushPlainAsThought()
+		closeThinking()
 		logger.Errorf(ctx, "[Agent][Thinking] Iteration-%d failed: %v", iteration+1, err)
 		return nil, err
 	}
+	flushSplitter()
+	if llmResult != nil && len(llmResult.ToolCalls) > 0 {
+		roundHasToolCalls = true
+	}
+	if roundHasToolCalls {
+		flushPlainAsThought()
+	} else {
+		flushPlainAsAnswer()
+	}
+	closeThinking()
 
 	// Emit diagnostics: helps identify when answer content went to "thought" vs "final_answer" events
 	logger.Infof(ctx, "[Agent][Thinking] Iteration-%d completed: content=%d chars, tool_calls=%d, emitted_events=%v",

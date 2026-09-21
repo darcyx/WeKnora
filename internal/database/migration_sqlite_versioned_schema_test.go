@@ -52,7 +52,7 @@ var versionedSQLiteColumns = map[string][]string{
 	"users":                 {"is_system_admin"},                                                  // 000053
 	"knowledges":            {"pending_subtasks_count", "profile"},                                // 000056, 000101
 	"knowledge_bases":       {"profile_config", "generated_profile"},                              // 000101
-	"messages":              {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint"}, // 000034/085/097/105
+	"messages":              {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint", "feedback"}, // 000034/085/097/105
 	"sessions": {
 		"parent_session_id", "forked_from_message_id", "fork_bootstrap", // 000097
 		"sandbox_config_tenant_id", // 000027
