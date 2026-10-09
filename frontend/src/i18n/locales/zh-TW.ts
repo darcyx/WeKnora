@@ -1,4 +1,6 @@
-export default {
+import zhCN from './zh-CN'
+
+const locale: Record<string, unknown> = {
   modelCatalog: {
     "title": "模型目錄",
     "description": "模型目錄決定新增模型時可選的模型清單，以及脈絡視窗、是否支持思考等預設參數。在這裡修改後，所有空間立即生效。",
@@ -7840,3 +7842,25 @@ export default {
     }
   }
 }
+
+function isLocaleRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function fillMissingLocaleMessages(
+  target: Record<string, unknown>,
+  fallback: Record<string, unknown>,
+): void {
+  for (const [key, fallbackValue] of Object.entries(fallback)) {
+    const targetValue = target[key]
+    if (targetValue === undefined) {
+      target[key] = fallbackValue
+    } else if (isLocaleRecord(targetValue) && isLocaleRecord(fallbackValue)) {
+      fillMissingLocaleMessages(targetValue, fallbackValue)
+    }
+  }
+}
+
+fillMissingLocaleMessages(locale, zhCN as Record<string, unknown>)
+
+export default locale
