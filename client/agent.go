@@ -69,6 +69,7 @@ const (
 // AgentStreamResponse agent streaming response
 type AgentStreamResponse struct {
 	ID                  string                 `json:"id"`                   // Unique identifier
+	MessageID           string                 `json:"message_id,omitempty"` // Assistant message ID
 	ResponseType        AgentResponseType      `json:"response_type"`        // Response type
 	Content             string                 `json:"content,omitempty"`    // Current content fragment
 	Done                bool                   `json:"done"`                 // Whether completed

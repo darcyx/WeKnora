@@ -150,7 +150,7 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 	replay := coalesceReplayEvents(events)
 	logger.Debugf(ctx, "Replaying %d existing events as %d frames", len(events), len(replay))
 	for _, evt := range replay {
-		emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter)
+		emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter, message.ID)
 	}
 
 	// If stream is already completed, send final event and return
@@ -176,7 +176,7 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 			newEvents, newOffset, err := h.streamManager.GetEvents(ctx, sessionID, messageID, currentOffset)
 			if err != nil {
 				logger.Errorf(ctx, "Failed to get new events: %v", err)
-				flushHeldStreamContent(ctx, c, message.RequestID, resourceRewriter)
+				flushHeldStreamContent(ctx, c, message.RequestID, resourceRewriter, message.ID)
 				return
 			}
 
@@ -188,7 +188,7 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 					streamCompletedNow = true
 				}
 
-				emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter)
+				emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter, message.ID)
 			}
 
 			// Update offset
@@ -388,11 +388,12 @@ func (h *Handler) handleAgentEventsForSSE(
 					// before the stop is still the user's content, and in
 					// public resource URL mode part of it may be sitting in
 					// the holdback buffer.
-					flushHeldStreamContent(ctx, c, requestID, resourceRewriter)
+					flushHeldStreamContent(ctx, c, requestID, resourceRewriter, assistantMessageID)
 
 					// Send stop notification to frontend
 					c.SSEvent("message", &types.StreamResponse{
 						ID:           requestID,
+						MessageID:    assistantMessageID,
 						ResponseType: "stop",
 						Content:      "Generation stopped by user",
 						Done:         true,
@@ -420,7 +421,7 @@ func (h *Handler) handleAgentEventsForSSE(
 					return
 				}
 
-				emitStreamEvent(ctx, c, evt, requestID, resourceRewriter)
+				emitStreamEvent(ctx, c, evt, requestID, resourceRewriter, assistantMessageID)
 			}
 
 			// Update offset
@@ -450,7 +451,7 @@ func (h *Handler) handleAgentEventsForSSE(
 							}
 							if len(events) > 0 {
 								for _, evt := range events {
-									emitStreamEvent(ctx, c, evt, requestID, resourceRewriter)
+									emitStreamEvent(ctx, c, evt, requestID, resourceRewriter, assistantMessageID)
 									// If we got the title, we can exit
 									if evt.Type == types.ResponseTypeSessionTitle {
 										log.Infof("Title event received: %s", evt.Content)

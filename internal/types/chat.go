@@ -317,6 +317,7 @@ const StreamEndedEarlyError = "the model's response ended before it finished (co
 
 type StreamResponse struct {
 	ID                  string                 `json:"id"`
+	MessageID           string                 `json:"message_id,omitempty"`
 	ResponseType        ResponseType           `json:"response_type"`
 	Content             string                 `json:"content"`
 	Done                bool                   `json:"done"`
