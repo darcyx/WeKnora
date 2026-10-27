@@ -138,6 +138,63 @@ func TestResourceHandleUsesBackendScopedFileService(t *testing.T) {
 	assert.Equal(t, 0, defaultSvc.calls, "resource handles must not use the raw default COS service")
 }
 
+// countingResourceResolver records how often the backend lookup runs: each
+// resource:// lookup reads the catalog row, so a repeated image must reuse the
+// first answer for the lifetime of one Rewriter.
+type countingResourceResolver struct {
+	scopedResourceResolver
+	calls *int
+}
+
+func (r countingResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	*r.calls++
+	return r.resourceSvc, nil
+}
+
+func TestResourceHandleResolvesOncePerRewriter(t *testing.T) {
+	calls := 0
+	resourceSvc := &stubFileService{}
+	resolver := countingResourceResolver{
+		scopedResourceResolver: scopedResourceResolver{resourceSvc: resourceSvc},
+		calls:                  &calls,
+	}
+	w := NewRequestRewriter(context.Background(), ModePublic, &stubFileService{}, resolver)
+	const ref = "resource://xifDo7NTSL300Lp1goVutw"
+
+	w.String(context.Background(), "![a]("+ref+")")
+	w.String(context.Background(), "![b]("+ref+")")
+
+	assert.Equal(t, 1, calls, "the backend lookup must run once per handle")
+	assert.Equal(t, 1, resourceSvc.calls, "the same handle must be signed once")
+}
+
+// erroringResourceResolver models a backend that exists but failed to load.
+type erroringResourceResolver struct{ scopedResourceResolver }
+
+func (r erroringResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	return nil, errors.New("backend unreachable")
+}
+
+// A failed backend lookup must degrade to the handle, which the client can still
+// fetch through the authenticated /files proxy. Falling back to the raw default
+// service would emit a URL that 404s or belongs to another backend.
+func TestResourceHandleBackendFailureLeavesHandle(t *testing.T) {
+	defaultSvc := &stubFileService{}
+	w := NewRequestRewriter(context.Background(), ModePublic, defaultSvc, erroringResourceResolver{})
+	in := "![img](resource://xifDo7NTSL300Lp1goVutw)"
+
+	assert.Equal(t, in, w.String(context.Background(), in))
+	assert.Zero(t, defaultSvc.calls, "an unreachable backend must not fall back to the raw default service")
+}
+
 // An already-public URL in the answer must be left alone.
 func TestRewriter_LeavesHTTPURLsAlone(t *testing.T) {
 	w := NewRewriter(stubResolver("https://cdn.example.com/x.png"), "TEST")
