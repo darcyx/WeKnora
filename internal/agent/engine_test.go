@@ -337,6 +337,12 @@ func withMaxContextTokens(n int) testEngineOption {
 	}
 }
 
+func withPlanningEnabled(enabled bool) testEngineOption {
+	return func(cfg *types.AgentConfig) {
+		cfg.PlanningEnabled = enabled
+	}
+}
+
 func TestWithinIterationBudgetUnlimited(t *testing.T) {
 	unlimited := newTestEngine(t, &mockChat{}, withMaxIterations(types.UnlimitedMaxIterations))
 	require.True(t, unlimited.withinIterationBudget(0))

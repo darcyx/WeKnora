@@ -279,13 +279,20 @@ func (e *AgentEngine) failTruncatedToolCalls(
 	ctx context.Context, response *types.ChatResponse,
 	step *types.AgentStep, iteration int, sessionID string,
 ) {
+	e.failToolCalls(ctx, response, step, iteration, sessionID, truncatedArgumentsError)
+}
+
+func (e *AgentEngine) failToolCalls(
+	ctx context.Context, response *types.ChatResponse,
+	step *types.AgentStep, iteration int, sessionID, reason string,
+) {
 	for i, tc := range response.ToolCalls {
 		toolCall := types.ToolCall{
 			ID:               agenttools.NormalizeToolCallID(tc.ID, tc.Function.Name, i),
 			Name:             tc.Function.Name,
 			Args:             map[string]any{"_raw": tc.Function.Arguments},
 			ProviderMetadata: tc.ProviderMetadata,
-			Result:           &types.ToolResult{Success: false, Error: truncatedArgumentsError},
+			Result:           &types.ToolResult{Success: false, Error: reason},
 		}
 		step.ToolCalls = append(step.ToolCalls, toolCall)
 		e.emitToolOutcome(ctx, toolCall, iteration, sessionID)

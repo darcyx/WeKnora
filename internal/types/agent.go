@@ -103,12 +103,16 @@ type AgentConfig struct {
 	// MaxIterations caps ReAct rounds. Zero is unset (filled with a default);
 	// a negative value is unlimited — the loop runs until the model stops,
 	// the user cancels, or another guard fires. See UnlimitedMaxIterations.
-	MaxIterations  int      `json:"max_iterations"`
-	AllowedTools   []string `json:"allowed_tools"`           // List of allowed tool names
-	Temperature    float64  `json:"temperature"`             // LLM temperature for agent
-	KnowledgeBases []string `json:"knowledge_bases"`         // Accessible knowledge base IDs
-	KnowledgeIDs   []string `json:"knowledge_ids"`           // Accessible knowledge IDs (individual documents)
-	SystemPrompt   string   `json:"system_prompt,omitempty"` // Unified system prompt (uses web_search_status placeholder for dynamic behavior)
+	MaxIterations int `json:"max_iterations"`
+	// PlanningEnabled turns on the engine-driven plan-and-execute decomposition
+	// before the ReAct loop. Defaults to false (off). When enabled, the planner
+	// decides whether a task needs decomposition.
+	PlanningEnabled bool     `json:"planning_enabled"`
+	AllowedTools    []string `json:"allowed_tools"`           // List of allowed tool names
+	Temperature     float64  `json:"temperature"`             // LLM temperature for agent
+	KnowledgeBases  []string `json:"knowledge_bases"`         // Accessible knowledge base IDs
+	KnowledgeIDs    []string `json:"knowledge_ids"`           // Accessible knowledge IDs (individual documents)
+	SystemPrompt    string   `json:"system_prompt,omitempty"` // Unified system prompt (uses web_search_status placeholder for dynamic behavior)
 	// Deprecated: Use SystemPrompt instead. Kept for backward compatibility during migration.
 	SystemPromptWebEnabled  string        `json:"system_prompt_web_enabled,omitempty"`  // Deprecated: Custom prompt when web search is enabled
 	SystemPromptWebDisabled string        `json:"system_prompt_web_disabled,omitempty"` // Deprecated: Custom prompt when web search is disabled
@@ -573,6 +577,21 @@ func (s *AgentStep) GetObservations() []string {
 	return observations
 }
 
+// ExecutionPlan tracks the current turn's planned work across suspensions.
+type ExecutionPlan struct {
+	Steps         []ExecutionPlanStep `json:"steps"`
+	Current       int                 `json:"current"`
+	Replans       int                 `json:"replans,omitempty"`
+	ReportRetries int                 `json:"report_retries,omitempty"`
+}
+
+type ExecutionPlanStep struct {
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Result      string `json:"result,omitempty"`
+	StartStep   int    `json:"start_step,omitempty"`
+}
+
 // AgentState tracks the execution state of an agent across iterations
 type AgentState struct {
 	PendingSteerMessages []string              `json:"-"`
@@ -583,12 +602,13 @@ type AgentState struct {
 	FinalAnswer          string                `json:"final_answer"`   // The final answer to the query
 	KnowledgeRefs        []*SearchResult       `json:"knowledge_refs"` // Collected knowledge references
 	TurnUsage            TokenUsage            `json:"turn_usage"`     // LLM usage accumulated across this turn
+	Plan                 *ExecutionPlan        `json:"plan,omitempty"`
 	// Suspended is set when the run ended waiting on a user prompt.
 	// SuspendedStep is the interrupted round: its thought and the calls
 	// that finished before the blocked one, kept for display.
 	Suspended     *PromptSuspension `json:"-"`
 	SuspendedStep *AgentStep        `json:"-"`
-	Usage                TokenUsage      `json:"usage"`          // Cumulative model usage for this agent execution
+	Usage         TokenUsage        `json:"usage"` // Cumulative model usage for this agent execution
 }
 
 // AddUsage accumulates model-reported usage for this agent execution.

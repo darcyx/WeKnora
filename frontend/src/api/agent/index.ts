@@ -55,6 +55,7 @@ export interface CustomAgentConfig {
 
   // ===== Agent模式设置 =====
   max_iterations?: number;          // 最大迭代次数；-1 表示不限制
+  planning_enabled?: boolean;       // 复杂查询先拆解成步骤计划再进 ReAct 循环
   llm_call_timeout?: number;        // LLM调用超时时间（秒）
   allowed_tools?: string[] | null;  // 允许的工具；null/未设置 = 后端默认工具，[] = 不使用内置工具
   reflection_enabled?: boolean;     // 是否启用反思

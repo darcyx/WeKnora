@@ -49,6 +49,7 @@ type RunSnapshot struct {
 	KnowledgeRefs  []*types.SearchResult `json:"knowledge_refs,omitempty"`
 	CurrentRound   int                   `json:"current_round"`
 	TurnUsage      types.TokenUsage      `json:"turn_usage"`
+	Plan           *types.ExecutionPlan  `json:"plan,omitempty"`
 
 	PendingRound PendingRound `json:"pending_round"`
 }
@@ -286,6 +287,7 @@ func (e *AgentEngine) snapshot(blocked int) (*RunSnapshot, error) {
 		KnowledgeRefs:           append([]*types.SearchResult(nil), p.state.KnowledgeRefs...),
 		CurrentRound:            p.state.CurrentRound,
 		TurnUsage:               p.state.TurnUsage,
+		Plan:                    p.state.Plan,
 		PendingRound:            PendingRound{Step: step, Calls: calls, BlockedIndex: blocked},
 	}, nil
 }

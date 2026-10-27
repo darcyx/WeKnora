@@ -80,6 +80,22 @@ func TestPatchAgentKeepsFieldsItDoesNotCarry(t *testing.T) {
 	assert.Equal(t, types.AgentModeQuickAnswer, got.Config.AgentMode)
 }
 
+func TestPatchAgentPlanningPreference(t *testing.T) {
+	repo := &agentAvatarRepository{agent: patchTestAgent()}
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"planning_enabled":true}`, true},
+		{`{"name":"Renamed"}`, true},
+		{`{"planning_enabled":false}`, false},
+	} {
+		rec := servePatch(t, repo, tc.body)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.Equal(t, tc.want, repo.agent.Config.PlanningEnabled)
+	}
+}
+
 func TestPatchAgentSelectionLists(t *testing.T) {
 	repo := &agentAvatarRepository{agent: patchTestAgent()}
 	repo.agent.Config.KBSelectionMode = "all"

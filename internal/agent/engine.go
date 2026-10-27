@@ -472,6 +472,14 @@ func (e *AgentEngine) Execute(
 		"tool_count": len(tools),
 		"tools":      toolListStr,
 	})
+	if plan, ok := e.maybePlan(ctx, query, messages, state); ok {
+		state.Plan = plan
+		messages = append(messages, planInstruction(plan))
+		e.emitPlanProgress(ctx, plan, sessionID, state.CurrentRound)
+		common.PipelineInfo(ctx, "Agent", "plan_injected", map[string]interface{}{
+			"session_id": sessionID, "steps": len(plan.Steps),
+		})
+	}
 
 	_, err := e.executeLoop(ctx, state, query, messages, tools, sessionID, messageID)
 	if err != nil {
@@ -580,6 +588,14 @@ type loopGuards struct {
 	failedToolCallSignature    string
 	consecutiveFailedToolCalls int
 	failedToolCallNudged       bool
+	// repeatedToolCallSignature, repeatedToolCallCount and
+	// repeatedToolCallNudged track identical *successful* calls across rounds.
+	// This is the complement of the failed-call guard: a call that keeps
+	// succeeding resets the failure streak, so a model that re-runs the same
+	// search query round after round would otherwise never be nudged.
+	repeatedToolCallSignature string
+	repeatedToolCallCount     int
+	repeatedToolCallNudged    bool
 }
 
 // recordFailedToolCall tracks consecutive failures of the same model-facing
@@ -617,6 +633,47 @@ func (g *loopGuards) resetFailedToolCallStreak() {
 	g.failedToolCallSignature = ""
 	g.consecutiveFailedToolCalls = 0
 	g.failedToolCallNudged = false
+}
+
+// recordRepeatedToolCall tracks identical successful tool calls across rounds.
+// It only follows calls that succeeded, so it never overlaps with the
+// failed-call guard: that one resets on success, this one resets on failure or
+// on a different call. When the same call (name + arguments) succeeds three
+// times in a row it reports the tool name and asks the caller to nudge the
+// model, because re-issuing an identical call returns identical information.
+func (g *loopGuards) recordRepeatedToolCall(call types.ToolCall) (string, int, bool) {
+	if call.Result == nil || !call.Result.Success {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	if call.Name == "" {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	args, err := json.Marshal(call.Args)
+	if err != nil {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	signature := call.Name + "\x00" + string(args)
+	if signature != g.repeatedToolCallSignature {
+		g.repeatedToolCallSignature = signature
+		g.repeatedToolCallCount = 1
+		g.repeatedToolCallNudged = false
+	} else {
+		g.repeatedToolCallCount++
+	}
+	if g.repeatedToolCallCount >= maxRepeatedIdenticalToolCalls && !g.repeatedToolCallNudged {
+		g.repeatedToolCallNudged = true
+		return call.Name, g.repeatedToolCallCount, true
+	}
+	return "", g.repeatedToolCallCount, false
+}
+
+func (g *loopGuards) resetRepeatedToolCallStreak() {
+	g.repeatedToolCallSignature = ""
+	g.repeatedToolCallCount = 0
+	g.repeatedToolCallNudged = false
 }
 
 // closeAnswerStream emits the Done:true marker for an answer that is actually
@@ -771,6 +828,7 @@ func (e *AgentEngine) executeLoop(
 	}
 
 	guards := &loopGuards{}
+
 loop:
 	for e.withinIterationBudget(state.CurrentRound) || e.allowSteerOverrun {
 		e.allowSteerOverrun = false
@@ -826,6 +884,9 @@ loop:
 	// A suspended run has not finished either; it resumes once the user
 	// answers, so no answer is synthesized for it.
 	if !state.IsComplete && ctx.Err() == nil && state.Suspended == nil {
+		if state.Plan != nil {
+			messages = append(messages, planFinalInstruction(state.Plan))
+		}
 		if e.collaboration != nil && e.collaboration.Child == nil && e.collaborationOwnsFailure(ctx) {
 			return state, fmt.Errorf("parent iteration budget exhausted; remaining delegated work was cancelled")
 		}
@@ -947,7 +1008,7 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, err
 		}
 	}
-	if guards.childAnswerRevised {
+	if guards.childAnswerRevised || planInProgress(state) && state.Plan.ReportRetries > 0 {
 		tools = nil
 	}
 	// Background-work context rides the same boundary for the same reasons,
@@ -1137,6 +1198,57 @@ func (e *AgentEngine) runReActIteration(
 		}
 		return iterOutcomeBreak, nil
 	}
+	if planInProgress(state) && state.Plan.ReportRetries > 0 && len(response.ToolCalls) > 0 {
+		e.failToolCalls(ctx, response, &step, state.CurrentRound, sessionID, "Tool calls are not allowed while repairing a step report.")
+		state.RoundSteps = append(state.RoundSteps, step)
+		*messagesPtr = e.appendToolResults(*messagesPtr, step)
+		state.Plan.ReportRetries = 0
+		completePlanStep(state.Plan, `{"status":"blocked","result":"The step report could not be repaired without another tool call."}`)
+		*messagesPtr = append(*messagesPtr, planFinalInstruction(state.Plan))
+		return iterOutcomeNext, nil
+	}
+	if state.Plan != nil && state.Plan.Current < len(state.Plan.Steps) &&
+		(isNaturalStopFinishReason(response.FinishReason) || isLengthFinishReason(response.FinishReason)) &&
+		len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
+		step.IntermediateAnswer = true
+		state.RoundSteps = append(state.RoundSteps, step)
+		*messagesPtr = append(*messagesPtr, chat.Message{Role: "assistant", Content: response.Content,
+			ReasoningContent: response.ReasoningContent, ReasoningSignature: response.ReasoningSignature,
+			ReasoningMetadata: response.ReasoningMetadata})
+		waiting, err := e.waitPlanCollaboration(ctx, state, messagesPtr)
+		if err != nil {
+			return iterOutcomeBreak, err
+		}
+		if !waiting {
+			content := response.Content
+			if isLengthFinishReason(response.FinishReason) {
+				content = `{"status":"blocked","result":"The step response was truncated."}`
+			}
+			if !isLengthFinishReason(response.FinishReason) && !validPlanReport(content) && state.Plan.ReportRetries == 0 {
+				state.Plan.ReportRetries++
+			} else {
+				state.Plan.ReportRetries = 0
+				content = checkPlanToolResults(state, content)
+				completePlanStep(state.Plan, content)
+				if state.Plan.Current < len(state.Plan.Steps) {
+					state.Plan.Steps[state.Plan.Current].StartStep = len(state.RoundSteps)
+				}
+			}
+		}
+		nextRound := state.CurrentRound + 1
+		if e.withinIterationBudget(nextRound) || e.steerOverruns < maxSteerOverruns {
+			injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+			injected += e.injectBackground(ctx, state, messagesPtr, true)
+			if injected > 0 && !e.withinIterationBudget(nextRound) {
+				e.steerOverruns++
+				e.allowSteerOverrun = true
+			}
+		}
+		*messagesPtr = append(*messagesPtr, planInstruction(state.Plan))
+		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound+1)
+		guards.sawPlainRound = false
+		return iterOutcomeNext, nil
+	}
 
 	// A delegated deliverable must not silently become a partial success. Give
 	// it one text-only revision using existing evidence; never re-run tools or
@@ -1184,7 +1296,7 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, nil
 		}
 		buttonsRan = true
-		if toolCallsSucceeded(step.ToolCalls) {
+		if !planInProgress(state) && toolCallsSucceeded(step.ToolCalls) {
 			answer := *response
 			answer.ToolCalls, answer.FinishReason = nil, "stop"
 			analyzed = &answer
@@ -1292,6 +1404,7 @@ func (e *AgentEngine) runReActIteration(
 					KnowledgeRefs:           state.KnowledgeRefs,
 					CurrentRound:            state.CurrentRound + 1,
 					TurnUsage:               state.TurnUsage,
+					Plan:                    state.Plan,
 				}
 				intermediate := verdict.step
 				intermediate.IntermediateAnswer = true
@@ -1366,7 +1479,7 @@ func (e *AgentEngine) runReActIteration(
 	// handler and the client keep text before a page button; retract it the
 	// same way.
 	progress := agenttools.StripThinkBlocks(response.Content)
-	if (buttonsRan || e.collaboration != nil && e.collaboration.Child == nil) && strings.TrimSpace(progress) != "" {
+	if !planInProgress(state) && (buttonsRan || e.collaboration != nil && e.collaboration.Child == nil) && strings.TrimSpace(progress) != "" {
 		step.Progress = progress
 		progressID := response.AnswerEventID
 		if progressID == "" {
@@ -1389,11 +1502,17 @@ func (e *AgentEngine) runReActIteration(
 	var (
 		failedToolName     string
 		failedToolAttempts int
+		repeatedToolName   string
+		repeatedToolCount  int
 	)
 	for _, toolCall := range step.ToolCalls {
 		if name, attempts, shouldNudge := guards.recordFailedToolCall(toolCall); shouldNudge {
 			failedToolName = name
 			failedToolAttempts = attempts
+		}
+		if name, count, shouldNudge := guards.recordRepeatedToolCall(toolCall); shouldNudge {
+			repeatedToolName = name
+			repeatedToolCount = count
 		}
 	}
 
@@ -1408,6 +1527,17 @@ func (e *AgentEngine) runReActIteration(
 				"Do not call it again with those arguments. Switch to a different tool "+
 				"or use another approach to complete the task.",
 			failedToolName, failedToolAttempts,
+		)
+		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: guidance})
+	}
+	if repeatedToolName != "" {
+		logger.Warnf(ctx, "[Agent][Round-%d] Repeated identical successful call to %q (%d times); "+
+			"asking the model to stop re-running it", round, repeatedToolName, repeatedToolCount)
+		guidance := fmt.Sprintf(
+			"The tool %q has been called %d times with identical arguments and returned a result "+
+				"each time. Re-running it will return the same information. Use the results already "+
+				"obtained to answer, or change the query/arguments to gather new evidence.",
+			repeatedToolName, repeatedToolCount,
 		)
 		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: guidance})
 	}

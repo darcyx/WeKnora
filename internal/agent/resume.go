@@ -26,6 +26,9 @@ func (e *AgentEngine) Resume(
 	if err != nil {
 		return nil, err
 	}
+	if snap.Plan != nil && (snap.Plan.Current < 0 || snap.Plan.Current > len(snap.Plan.Steps) || len(snap.Plan.Steps) == 0 || len(snap.Plan.Steps) > 6) {
+		return nil, fmt.Errorf("snapshot plan is inconsistent")
+	}
 	e.bindCollaborationInput(sessionID, messageID)
 	p := snap.PendingRound
 	wait := answered == nil && snap.CollaborationWait && e.collaboration != nil && e.collaboration.Child == nil
@@ -66,6 +69,7 @@ func (e *AgentEngine) Resume(
 		KnowledgeRefs: append([]*types.SearchResult{}, snap.KnowledgeRefs...),
 		CurrentRound:  snap.CurrentRound,
 		TurnUsage:     snap.TurnUsage,
+		Plan:          snap.Plan,
 	}
 	systemPrompt := e.buildSystemPrompt(ctx)
 	e.beginTurn(snap.Query, snap.ImageURLs, state)
@@ -133,6 +137,10 @@ func (e *AgentEngine) Resume(
 		messages = e.appendToolResults(messages, step)
 		messages = e.appendToolImages(ctx, messages, step)
 		state.CurrentRound++
+	}
+	if state.Plan != nil {
+		messages = append(messages, planInstruction(state.Plan))
+		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound)
 	}
 
 	if _, err := e.executeLoop(ctx, state, snap.Query, messages, tools, sessionID, messageID); err != nil {

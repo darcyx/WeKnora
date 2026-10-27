@@ -365,7 +365,8 @@ func (e *AgentEngine) streamThinkingToEventBus(
 		}
 	}
 	emitAnswer := func(content string) {
-		if e.holdCollaborationAnswer {
+		if e.holdCollaborationAnswer || e.progress.state != nil && e.progress.state.Plan != nil &&
+			e.progress.state.Plan.Current < len(e.progress.state.Plan.Steps) {
 			return
 		}
 		if content == "" {
