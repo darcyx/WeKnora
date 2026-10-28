@@ -152,6 +152,8 @@ func TestExecuteRunsPlanBeforeFinalAnswer(t *testing.T) {
 	require.Equal(t, "unverified", state.Plan.Steps[0].Status)
 	require.Equal(t, "blocked", state.Plan.Steps[1].Status)
 	require.Equal(t, "Done", visible)
+	require.True(t, state.RoundSteps[0].PlanReport)
+	require.True(t, state.RoundSteps[1].PlanReport)
 	last := model.calls[3][len(model.calls[3])-1]
 	require.Contains(t, last.Content, "B unavailable")
 }

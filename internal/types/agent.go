@@ -506,6 +506,7 @@ type AgentStep struct {
 	// IntermediateAnswer preserves a plain answer followed by a loop-end steer.
 	// The canonical final answer is still stored in Message.Content.
 	IntermediateAnswer bool `json:"intermediate_answer,omitempty"`
+	PlanReport         bool `json:"plan_report,omitempty"`
 	// ReasoningContent stores the OpenAI-protocol reasoning_content emitted by the
 	// model in this round. Persisted on AgentStep so cross-turn replay can put it
 	// back on the assistant message — required by MiMo / DeepSeek V3.2+ thinking

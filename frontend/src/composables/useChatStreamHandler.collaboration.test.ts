@@ -208,6 +208,20 @@ test('history restores step progress once, independently of reasoning and the fi
   assert.equal(events.filter(e => e.type === 'progress').length, 1)
 })
 
+test('history hides plan reports while retaining ordinary intermediate answers', async () => {
+  const { handler, messagesList } = setup()
+  await handler.handleMsgList([{
+    id: 'a1', request_id: 'r1', role: 'assistant', content: 'Final answer', is_completed: true,
+    agent_steps: [
+      { iteration: 0, thought: '{"status":"completed","result":"internal evidence"}', intermediate_answer: true },
+      { iteration: 1, thought: 'invalid report being repaired', intermediate_answer: true, plan_report: true },
+      { iteration: 2, thought: 'First draft', intermediate_answer: true },
+    ],
+  }])
+  const answers = messagesList[0].agentEventStream.filter((e: any) => e.type === 'answer')
+  assert.deepEqual(Array.from(answers, (e: any) => e.content), ['First draft', 'Final answer'])
+})
+
 test('a result with an unmatched call ID cannot complete another pending call with the same name', () => {
   const { handler, messagesList } = setup()
   handler.processStreamChunk({ response_type: 'agent_query', id: 'r1', assistant_message_id: 'a1' })

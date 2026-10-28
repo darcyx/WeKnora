@@ -1211,6 +1211,7 @@ func (e *AgentEngine) runReActIteration(
 		(isNaturalStopFinishReason(response.FinishReason) || isLengthFinishReason(response.FinishReason)) &&
 		len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
 		step.IntermediateAnswer = true
+		step.PlanReport = true
 		state.RoundSteps = append(state.RoundSteps, step)
 		*messagesPtr = append(*messagesPtr, chat.Message{Role: "assistant", Content: response.Content,
 			ReasoningContent: response.ReasoningContent, ReasoningSignature: response.ReasoningSignature,

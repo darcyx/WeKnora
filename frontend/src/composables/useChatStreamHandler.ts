@@ -514,7 +514,15 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
           events.push({ type: 'progress', event_id: step.progress_event_id || `step-${step.iteration}-progress`,
             content: progressText, done: true, iteration: step.iteration, timestamp: stepTimestamp || undefined })
         }
-        if (!progressText && preambleText && step.intermediate_answer) {
+        let legacyPlanReport = false
+        if (step.intermediate_answer && !step.plan_report && preambleText) {
+          try {
+            const report = JSON.parse(preambleText.replace(/^\s*```(?:json)?\s*\n([\s\S]*?)\n```\s*$/i, '$1'))
+            legacyPlanReport = ['completed', 'blocked', 'replan'].includes(report?.status) &&
+              typeof report?.result === 'string' && !!report.result.trim()
+          } catch { /* ordinary intermediate answer */ }
+        }
+        if (!progressText && preambleText && step.intermediate_answer && !step.plan_report && !legacyPlanReport) {
           events.push({ type: 'answer', event_id: `step-${step.iteration}-answer`,
             content: preambleText, done: true, intermediate_answer: true, timestamp: stepTimestamp || undefined })
         }
