@@ -9,6 +9,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -152,6 +153,22 @@ func TestKeywordsRetrieveQueryFailurePreservesResolvedFunction(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.Empty(t, results[0].Results)
+}
+
+func TestKeywordsRetrieveRetriesUnsupportedShape(t *testing.T) {
+	repo, mock := newKeywordTestRepository(t)
+	mock.ExpectQuery(regexp.QuoteMeta(keywordScoreFunctionSQL)).
+		WillReturnRows(sqlmock.NewRows([]string{"score_function"}).AddRow("paradedb.score"))
+	params := types.RetrieveParams{Query: "发货地址", TopK: 5, KnowledgeBaseIDs: []string{"kb-1"}}
+	mock.ExpectQuery(`SELECT paradedb\.score\(id\) as score,.*FROM "embeddings".*`).
+		WithArgs("kb-1", params.Query, true, 5).
+		WillReturnError(&pgconn.PgError{Code: "XX000", Message: "Unsupported query shape. Please report"})
+	mock.ExpectQuery(`WITH matches AS MATERIALIZED .*SELECT .* FROM matches WHERE.*`).
+		WithArgs(params.Query, "kb-1", true, 5).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "chunk_id", "score"}).AddRow(1, "hit", 0.5))
+	results, err := repo.KeywordsRetrieve(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, "hit", results[0].Results[0].ChunkID)
 }
 
 func TestVectorRetrieveDoesNotRequireKeywordScoreFunction(t *testing.T) {

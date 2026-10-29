@@ -42,6 +42,33 @@ func (f *liveKnowledgeFixture) HybridSearch(_ context.Context, _ string, params 
 	}}, nil
 }
 
+func TestPlannerSimpleQuestionsWithLocalModel(t *testing.T) {
+	name := os.Getenv("WEKNORA_PLAN_LIVE_MODEL")
+	if name == "" {
+		t.Skip("set WEKNORA_PLAN_LIVE_MODEL to run against a local model")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	service, err := ollama.GetOllamaService()
+	require.NoError(t, err)
+	require.NoError(t, service.StartService(ctx))
+	model, err := chat.NewOllamaChat(&chat.ChatConfig{ModelName: name}, service)
+	require.NoError(t, err)
+	engine := newTestEngine(t, model, withPlanningEnabled(true))
+	for _, question := range []string{
+		"支付用的发货地址在哪里配置？", "微信小游戏的隐私协议怎么配置？",
+		"测试账号怎么加入支付白名单？", "SDK 登录失败时应先检查什么？",
+	} {
+		t.Run(question, func(t *testing.T) {
+			plan, planned := engine.maybePlan(ctx, question, []chat.Message{
+				{Role: "system", Content: "Only address the user's requested scope."},
+				{Role: "user", Content: question},
+			}, nil)
+			require.False(t, planned, "single question should use the normal agent loop: %+v", plan)
+		})
+	}
+}
+
 // Run explicitly with WEKNORA_PLAN_LIVE_MODEL set to an installed Ollama model.
 func TestPlannerWithLocalModel(t *testing.T) {
 	name := os.Getenv("WEKNORA_PLAN_LIVE_MODEL")

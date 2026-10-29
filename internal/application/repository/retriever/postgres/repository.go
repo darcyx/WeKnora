@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -293,6 +294,12 @@ func (g *pgRepository) KeywordsRetrieve(ctx context.Context,
 		Limit(int(params.TopK)).
 		Find(&embeddingDBList).Error
 
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "XX000" && strings.HasPrefix(pgErr.Message, "Unsupported query shape.") {
+		logger.GetLogger(ctx).Warnf("[Postgres] Retrying keyword search with materialized score scan")
+		embeddingDBList, err = g.keywordMaterializedFallback(ctx, params, scoreFunction)
+	}
+
 	if err == gorm.ErrRecordNotFound {
 		logger.GetLogger(ctx).Warnf("[Postgres] No records found for keywords query: %s", params.Query)
 		return nil, nil
@@ -326,6 +333,37 @@ func (g *pgRepository) KeywordsRetrieve(ctx context.Context,
 			Error:               nil,
 		},
 	}, nil
+}
+
+// keywordMaterializedFallback keeps filtering before LIMIT while isolating score
+// from predicates unsupported by some pg_search planner versions.
+func (g *pgRepository) keywordMaterializedFallback(ctx context.Context, params types.RetrieveParams, scoreFunction string) ([]pgVectorWithScore, error) {
+	inner := g.db.WithContext(ctx).Table("embeddings").
+		Select(scoreFunction+"(id) AS score, id, content, source_id, source_type, chunk_id, knowledge_id, knowledge_base_id, tag_id, is_enabled").
+		Where("content ||| ?", params.Query)
+	if len(params.KnowledgeBaseIDs) > 0 {
+		inner = inner.Where("knowledge_base_id IN ?", params.KnowledgeBaseIDs)
+	}
+	if len(params.KnowledgeIDs) > 0 {
+		inner = inner.Where("knowledge_id IN ?", params.KnowledgeIDs)
+	}
+	query := "WITH matches AS MATERIALIZED (?) SELECT id, content, source_id, source_type, chunk_id, knowledge_id, knowledge_base_id, tag_id, score FROM matches WHERE (is_enabled IS NULL OR is_enabled = ?)"
+	args := []interface{}{inner, true}
+	if len(params.TagIDs) > 0 {
+		query += " AND tag_id IN ?"
+		args = append(args, params.TagIDs)
+	}
+	if len(params.ExcludeGeneratedQuestionKBIDs) > 0 {
+		query += " AND NOT (knowledge_base_id IN ? AND " + types.GeneratedQuestionRowPredicate("") + ")"
+		args = append(args, params.ExcludeGeneratedQuestionKBIDs)
+	}
+	// shortcut: scores all matches within the requested scope on planner failure;
+	// upgrade pg_search or redesign the index if this fallback is frequently slow.
+	query += " ORDER BY score DESC LIMIT ?"
+	args = append(args, params.TopK)
+	var results []pgVectorWithScore
+	err := g.db.WithContext(ctx).Raw(query, args...).Scan(&results).Error
+	return results, err
 }
 
 // VectorRetrieve performs vector similarity search using pgvector

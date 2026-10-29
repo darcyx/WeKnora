@@ -39,6 +39,15 @@ func TestMaybePlanSkipsSimpleQueryWhenEnabled(t *testing.T) {
 	require.False(t, ok)
 	require.Empty(t, plan)
 	require.Len(t, model.calls, 1)
+	require.Contains(t, model.calls[0][0].Content, "knowledge search")
+	require.Contains(t, model.calls[0][0].Content, "A requested artifact or external operation")
+}
+
+func TestPlanInstructionRequestsConciseEvidence(t *testing.T) {
+	plan := &types.ExecutionPlan{Steps: []types.ExecutionPlanStep{{Description: "Find evidence"}}}
+	instruction := planInstruction(plan).Content
+	require.Contains(t, instruction, "do not draft the final answer")
+	require.Contains(t, instruction, "Preserve material qualifiers, failures, and identifiers")
 }
 
 func TestMaybePlanHandlesShortMultiStepTask(t *testing.T) {
@@ -49,6 +58,8 @@ func TestMaybePlanHandlesShortMultiStepTask(t *testing.T) {
 	require.Len(t, plan.Steps, 3)
 	require.NotNil(t, model.opts[0].Thinking)
 	require.False(t, *model.opts[0].Thinking)
+	require.Greater(t, model.opts[0].Temperature, 0.0)
+	require.LessOrEqual(t, model.opts[0].Temperature, 0.05)
 }
 
 func TestSimpleQuestionFallsBackToNormalExecution(t *testing.T) {
