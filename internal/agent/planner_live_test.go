@@ -94,6 +94,8 @@ func TestPlannerWithLocalModel(t *testing.T) {
 		require.NotContains(t, step.Description, "提交")
 		require.NotContains(t, step.Description, "发送")
 		require.NotContains(t, strings.ToLower(step.Description), "send")
+		require.NotContains(t, strings.ToLower(step.Description), "draft")
+		require.NotContains(t, step.Description, "草稿")
 	}
 	t.Logf("local model plan: %+v", plan.Steps)
 
@@ -134,11 +136,7 @@ func TestPlannerWithLocalModel(t *testing.T) {
 	engine.knowledgeBasesInfo = []*KnowledgeBaseInfo{{ID: "kb-test", Name: "小游戏文档", Capabilities: []string{"chunks"}}}
 	state, err = engine.Execute(ctx, "local-test", "local-test", "根据知识库分别说明微信小游戏隐私协议的配置入口和生效时间，最后整理操作要点。", nil)
 	require.NoError(t, err)
-	require.NotNil(t, state.Plan)
-	for _, step := range state.Plan.Steps {
-		require.NotEqual(t, "blocked", step.Status)
-		require.NotEqual(t, "pending", step.Status)
-	}
+	require.Nil(t, state.Plan, "a single knowledge question should use the normal ReAct loop")
 	require.NotEmpty(t, retriever.queries, "the model must search the fixture knowledge base")
 	for _, query := range retriever.queries {
 		require.NotContains(t, query, "平台服务中心")

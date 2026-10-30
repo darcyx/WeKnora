@@ -18,12 +18,12 @@ import (
 // planPrompt asks for bounded, structured steps; SIMPLE skips planning.
 const planPrompt = `Plan the current task in two to six concrete steps. Reply with JSON only: {"steps":["first step","second step"]}. If the task is a single straightforward question, reply with exactly "SIMPLE". A single question that needs a knowledge search, reading a relevant skill, or a short answer is still SIMPLE; these are normal agent execution, not separate planning steps. A question asking how to perform an action requests an explanation, not execution of that action: never plan the actions described in the answer as work to perform. Use a plan only when the user requests distinct dependent investigations or operations.
 
-Respect the system instructions and the user's stated scope. Include only actions needed for the request; do not add optional actions or expand the deliverable. For example, drafting a message does not imply sending or submitting it. Group closely related lookups into one step and reuse their results. The final response is produced after the plan: never add a separate step to summarize, synthesize, draft, format, or present that response. A requested artifact or external operation is not merely formatting and must remain a step. Use the preceding conversation only to resolve the current task.
+Respect the system instructions and the user's stated scope. Include only actions needed for the request; do not add optional actions or expand the deliverable. For example, drafting a message does not imply sending or submitting it. Group closely related lookups into one step and reuse their results. The final response is produced after the plan: never add a separate step to summarize, synthesize, draft, format, or present content delivered in that response, including an email draft. Creating or saving a requested file, or performing an external operation, is work and must remain a step. Use the preceding conversation only to resolve the current task.
 
 Examples:
 Task: Where is the payment callback address configured? → SIMPLE
 Task: How do I configure the mini-game privacy agreement? → SIMPLE
-Task: Check the refund rules, inspect this account, then draft an appeal email → {"steps":["Check refund rules","Inspect the account","Draft an appeal email"]}
+Task: Check the refund rules, inspect this account, then draft an appeal email → {"steps":["Check refund rules","Inspect the account"]}
 
 Task: %s`
 

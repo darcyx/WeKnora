@@ -40,7 +40,8 @@ func TestMaybePlanSkipsSimpleQueryWhenEnabled(t *testing.T) {
 	require.Empty(t, plan)
 	require.Len(t, model.calls, 1)
 	require.Contains(t, model.calls[0][0].Content, "knowledge search")
-	require.Contains(t, model.calls[0][0].Content, "A requested artifact or external operation")
+	require.Contains(t, model.calls[0][0].Content, "including an email draft")
+	require.Contains(t, model.calls[0][0].Content, "Creating or saving a requested file")
 }
 
 func TestPlanInstructionRequestsConciseEvidence(t *testing.T) {
