@@ -188,7 +188,7 @@ func setSSEHeaders(c *gin.Context) {
 }
 
 // buildStreamResponse constructs a StreamResponse from a StreamEvent
-func buildStreamResponse(evt interfaces.StreamEvent, requestID string) *types.StreamResponse {
+func buildStreamResponse(evt interfaces.StreamEvent, requestID string, messageIDs ...string) *types.StreamResponse {
 	response := &types.StreamResponse{
 		ID:           requestID,
 		ResponseType: evt.Type,
@@ -196,6 +196,9 @@ func buildStreamResponse(evt interfaces.StreamEvent, requestID string) *types.St
 		Done:         evt.Done,
 		Data:         evt.Data,
 		Usage:        evt.Usage,
+	}
+	if len(messageIDs) > 0 {
+		response.MessageID = messageIDs[0]
 	}
 
 	// Extract session_id and assistant_message_id for agent_query events

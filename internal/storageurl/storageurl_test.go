@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +50,42 @@ type fixedResolver struct{ svc interfaces.FileService }
 
 func (r fixedResolver) ResolveFileService(string) interfaces.FileService { return r.svc }
 
+// scopedResourceResolver models the production storage-backend resolver for a
+// resource whose physical path starts with storage://<backend-id>/. The
+// default service deliberately returns the malformed URL seen when that
+// prefix is handed to a raw COS driver.
+type scopedResourceResolver struct {
+	defaultSvc  interfaces.FileService
+	resourceSvc interfaces.FileService
+}
+
+func (r scopedResourceResolver) ResolveFileService(
+	context.Context,
+	*types.Tenant,
+	string,
+	string,
+	string,
+) (interfaces.FileService, string, error) {
+	return nil, "", nil
+}
+
+func (r scopedResourceResolver) ResolveBackend(
+	context.Context,
+	*types.Tenant,
+	string,
+	string,
+) (*types.StorageBackend, error) {
+	return nil, nil
+}
+
+func (r scopedResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	return r.resourceSvc, nil
+}
+
 func stubResolver(url string) Resolver {
 	return fixedResolver{svc: &stubFileService{
 		getFileURL: func(context.Context, string) (string, error) { return url, nil },
@@ -72,6 +109,90 @@ func TestRewriter_RewritesEveryReferenceForm(t *testing.T) {
 	assert.NotContains(t, out, "minio://")
 	assert.NotContains(t, out, "storage://")
 	assert.Equal(t, 3, svc.calls)
+}
+
+func TestResourceHandleUsesBackendScopedFileService(t *testing.T) {
+	const resourceRef = "resource://xifDo7NTSL300Lp1goVutw"
+	const malformedURL = "https://bucket.cos.ap-shanghai.myqcloud.com/storage%3A//backend-a/cos%3A//bucket/ap-shanghai/object.png"
+	const scopedURL = "https://bucket.cos.ap-shanghai.myqcloud.com/object.png"
+
+	defaultSvc := &stubFileService{
+		getFileURL: func(context.Context, string) (string, error) {
+			return malformedURL, nil
+		},
+	}
+	resourceSvc := &stubFileService{
+		getFileURL: func(context.Context, string) (string, error) {
+			return scopedURL, nil
+		},
+	}
+	resolver := scopedResourceResolver{
+		defaultSvc:  defaultSvc,
+		resourceSvc: resourceSvc,
+	}
+
+	w := NewRequestRewriter(context.Background(), ModePublic, defaultSvc, resolver)
+	got := w.String(context.Background(), "![img]("+resourceRef+")")
+
+	assert.Equal(t, "![img]("+scopedURL+")", got)
+	assert.Equal(t, 0, defaultSvc.calls, "resource handles must not use the raw default COS service")
+}
+
+// countingResourceResolver records how often the backend lookup runs: each
+// resource:// lookup reads the catalog row, so a repeated image must reuse the
+// first answer for the lifetime of one Rewriter.
+type countingResourceResolver struct {
+	scopedResourceResolver
+	calls *int
+}
+
+func (r countingResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	*r.calls++
+	return r.resourceSvc, nil
+}
+
+func TestResourceHandleResolvesOncePerRewriter(t *testing.T) {
+	calls := 0
+	resourceSvc := &stubFileService{}
+	resolver := countingResourceResolver{
+		scopedResourceResolver: scopedResourceResolver{resourceSvc: resourceSvc},
+		calls:                  &calls,
+	}
+	w := NewRequestRewriter(context.Background(), ModePublic, &stubFileService{}, resolver)
+	const ref = "resource://xifDo7NTSL300Lp1goVutw"
+
+	w.String(context.Background(), "![a]("+ref+")")
+	w.String(context.Background(), "![b]("+ref+")")
+
+	assert.Equal(t, 1, calls, "the backend lookup must run once per handle")
+	assert.Equal(t, 1, resourceSvc.calls, "the same handle must be signed once")
+}
+
+// erroringResourceResolver models a backend that exists but failed to load.
+type erroringResourceResolver struct{ scopedResourceResolver }
+
+func (r erroringResourceResolver) ResolveResourceFileService(
+	context.Context,
+	string,
+	string,
+) (interfaces.FileService, error) {
+	return nil, errors.New("backend unreachable")
+}
+
+// A failed backend lookup must degrade to the handle, which the client can still
+// fetch through the authenticated /files proxy. Falling back to the raw default
+// service would emit a URL that 404s or belongs to another backend.
+func TestResourceHandleBackendFailureLeavesHandle(t *testing.T) {
+	defaultSvc := &stubFileService{}
+	w := NewRequestRewriter(context.Background(), ModePublic, defaultSvc, erroringResourceResolver{})
+	in := "![img](resource://xifDo7NTSL300Lp1goVutw)"
+
+	assert.Equal(t, in, w.String(context.Background(), in))
+	assert.Zero(t, defaultSvc.calls, "an unreachable backend must not fall back to the raw default service")
 }
 
 // An already-public URL in the answer must be left alone.

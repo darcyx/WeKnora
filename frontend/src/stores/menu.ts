@@ -37,6 +37,7 @@ export const useMenuStore = defineStore('menuStore', () => {
     { title: '', titleKey: 'menu.automations', icon: 'automation', path: 'automations' },
     { title: '', titleKey: 'toolbox.title', icon: 'toolbox', path: 'toolbox' },
     { title: '', titleKey: 'menu.organizations', icon: 'organization', path: 'organizations', requiredCapability: 'organizations' },
+    { title: '', titleKey: 'feedbackAdmin.title', icon: 'feedback', path: 'feedback' },
     { title: '', titleKey: 'menu.settings', icon: 'setting', path: 'settings' },
     { title: '', titleKey: 'menu.logout', icon: 'logout', path: 'logout' }
   ])
@@ -79,7 +80,7 @@ export const useMenuStore = defineStore('menuStore', () => {
       if (authStore.isLiteMode && liteHiddenPaths.has(item.path)) {
         return false
       }
-      if (item.path === 'organizations' && !authStore.hasRole('admin')) {
+      if ((item.path === 'organizations' || item.path === 'feedback') && !authStore.hasRole('admin')) {
         return false
       }
       if (!deploymentCapabilities.isSupported(item.requiredCapability)) {

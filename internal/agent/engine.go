@@ -50,6 +50,7 @@ type AgentEngine struct {
 	questionOrigin       *QuestionOriginInfo     // Source of a picked suggested question, if any
 	pageContext          *PageContextInfo        // Page the user has open, if any
 	assistantName        string                  // Workspace name for the assistant, if renamed
+	appInfo              string                  // Compact JSON supplied through this turn's request ext object
 	sessionID            string                  // Session ID for logging and event emission
 	systemPromptTemplate string                  // System prompt template (optional, uses default if empty)
 	memoryPrompt         string                  // Long-term memory envelope appended to the system prompt
@@ -144,6 +145,7 @@ func NewAgentEngine(
 		eventBus:             eventBus,
 		knowledgeBasesInfo:   knowledgeBasesInfo,
 		selectedDocs:         selectedDocs,
+		appInfo:              config.AppInfo,
 		sessionID:            sessionID,
 		systemPromptTemplate: systemPromptTemplate,
 		tokenEstimator:       tokenEst,
@@ -1010,7 +1012,8 @@ func (e *AgentEngine) runReActIteration(
 	e.logContextDrift(ctx, round, currentTokens, response.Usage)
 	// Calibration needs only a prompt count; some providers report no total.
 	e.calibrateEstimator(ctx, round, *messagesPtr, tools, response.Usage, state)
-	if response.Usage.TotalTokens > 0 {
+	if response.Usage.PromptTokens > 0 || response.Usage.CompletionTokens > 0 || response.Usage.TotalTokens > 0 {
+		state.AddUsage(response.Usage)
 		e.lastUsage = response.Usage
 		state.TurnUsage.Accumulate(response.Usage)
 		logger.Infof(ctx, "[Agent][Round-%d] Usage: prompt=%d, completion=%d, total=%d, "+
