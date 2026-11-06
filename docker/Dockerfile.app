@@ -53,21 +53,10 @@ RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate
 # so that module's go.mod must exist before `go mod download`.
 COPY go.mod go.sum ./
 COPY third_party/anydoc-go/go.mod third_party/anydoc-go/go.mod
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# GHA exports ordinary layers, not the contents of cache mounts.
+RUN go mod download
 COPY cmd/download cmd/download
 RUN go run cmd/download/duckdb/duckdb.go
-COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod bash ./scripts/copy-licenses.sh /license-bundle
-
-# Get version and commit info for build injection
-ARG VERSION_ARG
-ARG COMMIT_ID_ARG
-ARG BUILD_TIME_ARG
-
-# Set build-time variables
-ENV VERSION=${VERSION_ARG}
-ENV COMMIT_ID=${COMMIT_ID_ARG}
-ENV BUILD_TIME=${BUILD_TIME_ARG}
 
 # Link the anydoc parser engine (office docs converted in-process, no
 # Python docreader). Default on so Hub / compose images ship a working
@@ -76,6 +65,8 @@ ENV BUILD_TIME=${BUILD_TIME_ARG}
 ARG WITH_ANYDOC=1
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
+COPY third_party/anydoc-go third_party/anydoc-go
+COPY scripts/build-anydoc-lib.sh scripts/build-anydoc-lib.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
@@ -84,22 +75,27 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         ./scripts/build-anydoc-lib.sh; \
     fi
 
-# Build the application with version info. Mount the Go build cache as well as
-# the module cache: `COPY . .` invalidates this layer on every source change,
-# and without the mount each rebuild regenerates the whole compile cache inside
-# the layer (~2.7 GB), which occupies disk locally and is uploaded to the CI
-# layer cache. Mounted, the cache lives outside the layer and repeated builds
-# reuse compiled objects instead of recompiling from scratch. Read the Go
-# version in this builder so host machines without Go still report it correctly.
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+COPY . .
+RUN bash ./scripts/copy-licenses.sh /license-bundle
+
+# Only the final Go build depends on application source and version metadata.
+ARG VERSION_ARG
+ARG COMMIT_ID_ARG
+ARG BUILD_TIME_ARG
+ENV VERSION=${VERSION_ARG}
+ENV COMMIT_ID=${COMMIT_ID_ARG}
+ENV BUILD_TIME=${BUILD_TIME_ARG}
+
+# The compiler cache mount accelerates rebuilds on persistent local builders.
+# Read the Go version here so host machines without Go still report it correctly.
+RUN --mount=type=cache,target=/root/.cache/go-build \
     export GO_VERSION="$(go version)"; \
     if [ "$WITH_ANYDOC" = "1" ]; then \
         make build-prod GO_BUILD_TAGS=anydoc; \
     else \
         make build-prod; \
     fi
-RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
+RUN cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
 
 # Final stage
 FROM debian:12.12-slim
