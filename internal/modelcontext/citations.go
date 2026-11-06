@@ -24,41 +24,13 @@ Retrieved content uses request-local source handles: chunk://N identifies a know
 - Never invent a handle or change its number, and never write raw chunk IDs, knowledge IDs, or knowledge-base IDs.
   This does not change separate instructions to preserve retrieved Markdown image URLs.`
 
-const citationEnabledProtocolPrompt = `
-- Source citations are enabled for this answer. List only documents actually used to support the answer and having a valid original HTTP(S) link.
-- Take the document title and source_url from the same result; use that result's url only when source_url is absent. A present but invalid source_url is not a reason to borrow another link. Omit documents without a valid link or title.
-- Deduplicate by document, even when several chunks were used. Do not list every retrieved result, historical citations, directory entries, or links that were merely mentioned in a source.
-- Follow the active answer template on whether to include references and whether to show a reference label. Citation enablement permits references; it does not require adding a section or label omitted by the template.
-- When the template calls for the label, write exactly one plain-text line: 参考来源, with no heading markup, numbering, colon, or bold. Otherwise omit that label. Place eligible reference links after the body using one line per document: - <a href="{url}" target="_blank">{文档名}</a>
-- Copy the original link exactly, escaping HTML attribute/text characters as necessary. Never invent or shorten links, and never substitute chunk://, doc://, kb://, or weknora:// references for original links.
-- If an original web URL is represented by a supplied url://N handle, copy that handle in href; the runtime restores the real URL. This does not apply to internal document or chunk handles.
-- Do not output <ref>, <kb>, or <web> citation tags, inline attribution links, or a second reference section. Omit the entire section when no eligible sources exist. Place any follow-up buttons after this section.
-- Each source supports only its supplied text or image evidence. Preserve applicable conditions and verify quotations against the actual result; document titles or image captions alone do not prove a claim.
-- For a requested exact JSON/code output, do not break a required schema by appending a reference section. User-requested navigation/download links and images may remain in the body.
-- These rules supersede earlier, saved, or custom prompt instructions about citation syntax.`
-
-const citationDisabledProtocolPrompt = `
-- Source citations are disabled for this answer. Do not add <ref>, <kb>, <web>, or source ` +
-	`attribution links to the answer. This does not prohibit a URL explicitly requested by the ` +
-	`user, Wiki navigation links, downloadable deliverables, or relevant image URLs.
-- These rules supersede earlier, saved, or custom prompt instructions that require source citations.`
-
-// ProtocolPrompt returns the internal, non-user-editable source protocol for a
-// model call. Citation formatting stays out of custom and template prompts.
-func sourceProtocolPrompt(citationsEnabled bool) string {
-	if citationsEnabled {
-		return sourceHandleProtocolPrompt + citationEnabledProtocolPrompt
-	}
-	return sourceHandleProtocolPrompt + citationDisabledProtocolPrompt
-}
-
-// ProtocolPrompt returns the source protocol configured for this registry.
+// ProtocolPrompt describes source handles; reference presentation belongs to the caller's prompt.
 // Request lifecycle code should normally call this through Registry.
 func (r *sourceRegistry) ProtocolPrompt() string {
 	if r == nil {
 		return ""
 	}
-	return sourceProtocolPrompt(r.citationsEnabled)
+	return sourceHandleProtocolPrompt
 }
 
 var (

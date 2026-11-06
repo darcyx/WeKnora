@@ -80,7 +80,7 @@ const retrievalReviewSchema = `{
  "type":"object","additionalProperties":false,
  "properties":{
   "gap_id":{"type":"string"},
-  "call_id":{"type":"string","description":"Observed successful call; satisfied may reuse any currently available applicable result without executing another search"},
+  "call_id":{"type":"string","description":"Required for progress, no_progress and exhausted_no_progress: use this gap's last_call_id for its latest unreviewed successful observation. satisfied may reuse any currently available applicable result without executing another search"},
 	"status":{"type":"string","enum":["progress","no_progress","satisfied","needs_user","exhausted_no_progress","user_conditions"]},
   "quotes":{"type":"array","items":{"type":"string"},"description":"Short supporting excerpts from that call, required for progress or satisfied; XML escaping and Markdown emphasis/code formatting may differ, but preserve wording and conditions. Cite facts relevant to the remaining question, not just new text"},
   "evidence":{"type":"array","minItems":1,"description":"For satisfied supported by multiple observations, use this instead of call_id and quotes. Each excerpt must belong to its own call.","items":{"type":"object","additionalProperties":false,"required":["call_id","quotes"],"properties":{"call_id":{"type":"string"},"quotes":{"type":"array","minItems":1,"items":{"type":"string"}}}}},
@@ -93,7 +93,18 @@ const retrievalReviewSchema = `{
 }`
 
 func (e *AgentEngine) retrievalTools(tools []chat.Tool) []chat.Tool {
-	if e.retrieval == nil || e.usesRuntimeRetrieval() {
+	if e.retrieval == nil {
+		return tools
+	}
+	// Early stopping applies while the ordinary tools still hide the review protocol.
+	if e.retrievalGuard {
+		for i := range tools {
+			if isBudgetedSearchTool(tools[i].Function.Name) {
+				tools[i].Function.Description += "\n" + questionSearchGuidance()
+			}
+		}
+	}
+	if e.usesRuntimeRetrieval() {
 		return tools
 	}
 	var reviewSchema map[string]any
@@ -155,7 +166,6 @@ func (e *AgentEngine) retrievalTools(tools []chat.Tool) []chat.Tool {
 			delete(metadata, "required")
 			delete(metadata, "oneOf")
 			def.Parameters, _ = json.Marshal(schema)
-			def.Description += "\n" + questionSearchGuidance()
 			continue
 		}
 		required, _ := schema["required"].([]any)
@@ -173,7 +183,7 @@ func (e *AgentEngine) retrievalTools(tools []chat.Tool) []chat.Tool {
 			"For partial results, answer from sufficient evidence; recover only needed failed knowledge_base_ids, preserving the query and other arguments. The runtime restricts recovery to the recorded failed targets; do not invent document or tag selectors. " +
 			"Use action=recovery with a grounded lead for that missing fact; a supplement must select a scope independent of the failure. " +
 			"Reuse gap_id; changing query, mode, library or reader does not reset allowances. " +
-			"Use review_retrieval for a necessary blocker or stop decision without executing another retrieval; satisfied is optional when answering."
+			"Use review_retrieval for a necessary blocker or to stop one fact while other work continues; it is optional when ending with an answer or a no-answer response."
 	}
 	terminalSchema := maps.Clone(reviewSchema)
 	terminalSchema["required"] = []string{"status"}
@@ -204,7 +214,7 @@ func (e *AgentEngine) retrievalTools(tools []chat.Tool) []chat.Tool {
 			"Unanswered fields stay blocked. Completing the fields permits reassessment; it does not satisfy the fact or reset any allowance. " +
 			"For satisfied, cite call_id and quotes from one applicable successful observation, or evidence entries with separate call_id and quotes for multiple observations; evidence from another fact is allowed when applicable. " +
 			"Do not search merely to register a clarification or duplicate evidence. Waiting for another document fact is not needs_user. " +
-			"Use exhausted_no_progress when there is no grounded next lead. This updates state only; it does not verify semantic relevance for you. " +
+			"To stop a fact while other work continues, use exhausted_no_progress with its last_call_id, referring to the latest unreviewed successful observation. When ending the response, answer or use the configured no-answer response directly; do not call this tool merely to finish. " +
 			"Do not narrate these internal decisions in the answer.",
 	}})
 }
@@ -463,7 +473,7 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 		"Returning to or narrowing a covered scope keeps its existing stop and allowances. Explicitly select a covered source when continuing an older fact in a broader runtime scope. " +
 		"Reuse applicable observations across facts through review_retrieval; evidence_call_id is a source reference, not another execution. " +
 		"A saved satisfied status is not usable evidence when evidence_available is false; do not infer an answer from that status. " +
-		"You may answer from applicable observations without registering satisfied. Review only to request further controlled retrieval or record a necessary blocker; tool success alone is not evidence sufficiency. " +
+		"You may answer from applicable observations or directly use the configured no-answer response when successful retrieval leaves no usable answer and no grounded next lead, without a terminal review. Review only to request further controlled retrieval or record a necessary blocker or stop for continuing work; tool success alone is not evidence sufficiency. " +
 		"Failed sources remain separate from usable evidence. Recover only needed transient sources with the original arguments and explicit knowledge_base_ids; " +
 		"unknown failures cannot be retried. Do not retry a failed source as a supplement or necessary reading."
 }
@@ -542,9 +552,9 @@ func (e *AgentEngine) retrievalCorrectionGuidance(step types.AgentStep) string {
 		reviewOnly = reviewOnly && call.Name == reviewRetrievalTool
 		readOnly = readOnly && call.Name == "read_document"
 	}
-	const retained = " Existing successful observations remain usable. A rejected call does not establish missing user information and does not justify another search. Answer the supported question now if possible. Otherwise correct only the reported decision once; preserve all stop and recovery limits."
+	const retained = " Existing successful observations remain usable. A rejected call does not establish missing user information and does not justify another search. Answer the supported question now if possible. If further work requires correction, correct only the reported decision once; preserve all stop and recovery limits."
 	if reviewOnly {
-		return "The evidence review was rejected; no retrieval was attempted. Associate each quote with the observation that actually contains it; use separate evidence entries for multiple sources. Do not search again to repair a citation. A satisfied review is not required just to answer." + retained
+		return "The retrieval review was rejected; no retrieval was attempted. A terminal review is not required to finish: answer from available evidence, or use the configured no-answer response if successful retrieval left no usable answer and no grounded next lead. Only if continuing work needs a corrected review, follow the reported error: progress, no_progress and exhausted_no_progress require the gap's last_call_id for its latest unreviewed successful observation; evidence quotes must belong to their cited calls. Do not search to repair a review." + retained
 	}
 	if readOnly {
 		return "The requested reading was not dispatched. Check whether its full answer or source range is already present; reuse that evidence. Only an observed, still-needed unread source/range warrants a corrected read." + retained

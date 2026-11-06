@@ -88,6 +88,27 @@ func TestRetrievalDispatchRecoveryUsesTypedFailureAndOriginalOperation(t *testin
 	require.True(t, e.retrieval.snapshot().Gaps[0].RecoveryUsed)
 }
 
+func TestRetrievalExhaustedReviewPreservesStopAndObservationValidation(t *testing.T) {
+	e, p := newRetrievalProbeEngine(t)
+	first := retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.True(t, first.Result.Success, first.Result.Error)
+	for _, tool := range e.buildToolsForLLM() {
+		if tool.Function.Name == reviewRetrievalTool {
+			require.Contains(t, tool.Function.Description, "do not call this tool merely to finish")
+			require.Contains(t, string(tool.Function.Parameters), "Required for progress, no_progress and exhausted_no_progress")
+		}
+	}
+	rejected := retrievalProbeCall(e, "missing-call", reviewRetrievalTool, `{"gap_id":"gap-1","status":"exhausted_no_progress"}`)
+	require.False(t, rejected.Result.Success)
+	require.Equal(t, retrievalPending, e.retrieval.snapshot().Gaps[0].Status)
+	stopped := retrievalProbeCall(e, "stop", reviewRetrievalTool, `{"gap_id":"gap-1","call_id":"first","status":"exhausted_no_progress"}`)
+	require.True(t, stopped.Result.Success, stopped.Result.Error)
+	require.Equal(t, retrievalExhausted, e.retrieval.snapshot().Gaps[0].Status)
+	again := retrievalProbeCall(e, "again", agenttools.ToolSearchKnowledge, `{"query":"another wording"}`)
+	require.False(t, again.Result.Success)
+	require.Len(t, p.calls, 1)
+}
+
 func TestRetrievalSchemaAndTerminalReview(t *testing.T) {
 	e, p := newRetrievalProbeEngine(t)
 	e.toolRegistry.RegisterTool(newCountingTool(agenttools.ToolAskUser))

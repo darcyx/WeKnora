@@ -192,7 +192,7 @@ func TestDefaultTemplatesComposeWithBrowserCitationsAndOutputPolicy(t *testing.T
 						template.Content,
 					)
 					require.Equal(t, browser, strings.Contains(prompt, "User-selected source for this turn"))
-					require.Equal(t, !citations, strings.Contains(prompt, "Source citations are disabled"))
+					require.NotContains(t, prompt, "Source citations are")
 					require.NotContains(t, prompt, types.SourcedAnswerOutputPrompt)
 					require.Contains(t, prompt, "Copy supplied handles exactly")
 					for _, conflict := range []string{

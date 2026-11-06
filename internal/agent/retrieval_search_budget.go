@@ -9,10 +9,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-const questionSearchGrace = 3
+const questionSearchGrace = 2
 
 func questionSearchGuidance() string {
-	return fmt.Sprintf("The first %d search calls per independent user question or genuinely new applicability branch may omit retrieval metadata and progress reviews. This is not a conversation-wide quota or a total search limit. Rephrasing or changing query/tool/library does not reset it. Afterwards the original progress, supplement, recovery and stopping rules apply. Stop when evidence is sufficient; no satisfied review is needed just to answer. Necessary user-information blockers, permissions and the single failure recovery always apply.", questionSearchGrace)
+	return fmt.Sprintf("The first %d search calls per independent user question or genuinely new applicability branch may omit retrieval metadata and progress reviews. This is an allowance, not a target, conversation-wide quota or total search limit. Rephrasing or changing query/tool/library does not reset it. Afterwards the original progress, supplement, recovery and stopping rules apply. Search once, inspect the results, then continue only with a concrete lead relevant to the unanswered question; adjacent topics or rewording alone are not new leads. Stop when evidence is sufficient, or when successful retrieval leaves no usable answer and no grounded next lead. In the latter case, directly use the configured no-answer response without claiming the capability is unsupported. Neither case requires review_retrieval merely to finish. Necessary user-information blockers, permissions and the single failure recovery always apply; a failed tool call is not evidence that documents are absent.", questionSearchGrace)
 }
 
 func isBudgetedSearchTool(name string) bool {

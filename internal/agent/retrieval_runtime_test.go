@@ -39,6 +39,11 @@ func TestRuntimeRetrievalUsesOriginalToolsAndRecordedOutcomes(t *testing.T) {
 	for _, tool := range e.buildToolsForLLM() {
 		require.NotEqual(t, reviewRetrievalTool, tool.Function.Name)
 		require.NotContains(t, string(tool.Function.Parameters), `"retrieval"`)
+		if tool.Function.Name == agenttools.ToolSearchKnowledge {
+			require.Contains(t, tool.Function.Description, "an allowance, not a target")
+			require.Contains(t, tool.Function.Description, "no usable answer and no grounded next lead")
+			require.Contains(t, tool.Function.Description, "Neither case requires review_retrieval merely to finish")
+		}
 	}
 	require.Empty(t, e.retrievalStatePrompt())
 	first := retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
@@ -66,9 +71,9 @@ func TestRuntimeRetrievalGraceThenOriginalSupplementAndStop(t *testing.T) {
 		require.True(t, call.Result.Success, call.Result.Error)
 	}
 	require.False(t, e.usesRuntimeRetrieval())
-	require.Contains(t, e.retrievalStatePrompt(), "first 3 search calls")
+	require.Contains(t, e.retrievalStatePrompt(), fmt.Sprintf("first %d search calls", questionSearchGrace))
 	require.False(t, retrievalProbeCall(e, "unreviewed", agenttools.ToolSearchKnowledge, `{"query":"again"}`).Result.Success)
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: "2", Status: retrievalNoProgress}))
+	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: fmt.Sprint(questionSearchGrace - 1), Status: retrievalNoProgress}))
 	call := retrievalProbeCall(e, "supplement", agenttools.ToolSearchKnowledge, `{"query":"TapTap configuration","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap"}}`)
 	require.True(t, call.Result.Success, call.Result.Error)
 	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: "supplement", Status: retrievalNoProgress}))

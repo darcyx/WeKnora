@@ -12,29 +12,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestQuestionSearchGraceRestoresOriginalRulesAfterThreeCalls(t *testing.T) {
+func TestQuestionSearchGraceRestoresOriginalRulesAfterAllowance(t *testing.T) {
 	e, tool := newRetrievalProbeEngine(t)
 	e.EnableRetrievalGuard()
 	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"the user asks for sandbox configuration"}`}
-	for _, id := range []string{"one", "two", "three"} {
-		args := `{"query":"` + id + `"}`
-		if id == "two" {
-			args = `{"query":"two","retrieval":{"gap_id":"invented","conditions":"iOS","action":"recovery","recovery_call_id":"invented"}}`
+	for i := 0; i < questionSearchGrace; i++ {
+		args := fmt.Sprintf(`{"query":"query-%d"}`, i)
+		if i == 1 {
+			args = `{"query":"query-1","retrieval":{"gap_id":"invented","conditions":"iOS","action":"recovery","recovery_call_id":"invented"}}`
 		}
-		call := retrievalProbeCall(e, id, agenttools.ToolSearchKnowledge, args)
+		call := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, args)
 		require.True(t, call.Result.Success, call.Result.Error)
 	}
-	require.Len(t, tool.calls, 3)
+	require.Len(t, tool.calls, questionSearchGrace)
 	require.Len(t, e.retrieval.snapshot().Gaps, 1)
-	require.JSONEq(t, `{"query":"two"}`, string(tool.calls[1]))
-	fourth := retrievalProbeCall(e, "illegal-fourth", agenttools.ToolSearchKnowledge, `{"query":"four","retrieval":{"gap_id":"gap-1","action":"initial"}}`)
-	require.False(t, fourth.Result.Success)
-	require.Contains(t, fourth.Result.Error, "already been searched")
-	require.Len(t, tool.calls, 3)
+	require.JSONEq(t, `{"query":"query-1"}`, string(tool.calls[1]))
+	blocked := retrievalProbeCall(e, "illegal-initial", agenttools.ToolSearchKnowledge, `{"query":"again","retrieval":{"gap_id":"gap-1","action":"initial"}}`)
+	require.False(t, blocked.Result.Success)
+	require.Contains(t, blocked.Result.Error, "already been searched")
+	require.Len(t, tool.calls, questionSearchGrace)
 
-	fourth = retrievalProbeCall(e, "four", agenttools.ToolSearchKnowledge, `{"query":"four","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap","review":{"call_id":"three","status":"no_progress"}}}`)
-	require.True(t, fourth.Result.Success, fourth.Result.Error)
-	require.Len(t, tool.calls, 4, "the grace threshold is not a hard total search cap")
+	supplement := retrievalProbeCall(e, "supplement", agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"supplement","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap","review":{"call_id":"%d","status":"no_progress"}}}`, questionSearchGrace-1))
+	require.True(t, supplement.Result.Success, supplement.Result.Error)
+	require.Len(t, tool.calls, questionSearchGrace+1, "the grace threshold is not a hard total search cap")
 	state := e.retrieval.snapshot()
 	require.True(t, state.Gaps[0].SupplementUsed)
 	raw, err := json.Marshal(state)
@@ -43,10 +43,10 @@ func TestQuestionSearchGraceRestoresOriginalRulesAfterThreeCalls(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &saved))
 	restored, err := restoreRetrievalControl(saved)
 	require.NoError(t, err)
-	require.Equal(t, 4, restored.searchCount(&saved.Gaps[0]))
-	fifth := retrievalProbeCall(e, "five", agenttools.ToolSearchKnowledge, `{"query":"five","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap","review":{"call_id":"four","status":"no_progress"}}}`)
-	require.False(t, fifth.Result.Success)
-	require.Len(t, tool.calls, 4)
+	require.Equal(t, questionSearchGrace+1, restored.searchCount(&saved.Gaps[0]))
+	spent := retrievalProbeCall(e, "spent", agenttools.ToolSearchKnowledge, `{"query":"again","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap","review":{"call_id":"supplement","status":"no_progress"}}}`)
+	require.False(t, spent.Result.Success)
+	require.Len(t, tool.calls, questionSearchGrace+1)
 	require.Equal(t, retrievalExhausted, e.retrieval.snapshot().Gaps[0].Status)
 }
 
@@ -54,7 +54,8 @@ func TestQuestionSearchGraceIsIndependentAcrossConversationBranches(t *testing.T
 	e, _ := newRetrievalProbeEngine(t)
 	e.EnableRetrievalGuard()
 	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"a broad sandbox question"}`}
-	for _, id := range []string{"one", "two", "three"} {
+	for i := 0; i < questionSearchGrace; i++ {
+		id := fmt.Sprint(i)
 		require.True(t, retrievalProbeCall(e, id, agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
 	}
 	previous, err := json.Marshal(e.retrieval.snapshot())
@@ -70,16 +71,17 @@ func TestQuestionSearchGraceIsIndependentAcrossConversationBranches(t *testing.T
 	next.chatModel = model
 	next.SetRetrievalPersistence(previous, nil)
 	require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-	for _, id := range []string{"ios-one", "ios-two", "ios-three"} {
+	for i := 0; i < questionSearchGrace; i++ {
+		id := fmt.Sprintf("ios-%d", i)
 		call := retrievalProbeCall(next, id, agenttools.ToolSearchKnowledge, `{"query":"iOS sandbox","retrieval":{"gap_id":"gap-1","conditions":"iOS App Store","action":"initial"}}`)
 		require.True(t, call.Result.Success, call.Result.Error)
 	}
-	require.Len(t, tool.calls, 3)
+	require.Len(t, tool.calls, questionSearchGrace)
 	state := next.retrieval.snapshot()
 	require.Len(t, state.Gaps, 2)
 	c := &retrievalControl{state: state}
-	require.Equal(t, 3, c.searchCount(&state.Gaps[0]))
-	require.Equal(t, 3, c.searchCount(&state.Gaps[1]))
+	require.Equal(t, questionSearchGrace, c.searchCount(&state.Gaps[0]))
+	require.Equal(t, questionSearchGrace, c.searchCount(&state.Gaps[1]))
 	require.Equal(t, "message:ios", state.Gaps[1].GoalInputID)
 	require.Equal(t, "iOS（App Store）包", state.Gaps[1].Conditions)
 	_, err = restoreRetrievalControl(state)
@@ -139,7 +141,8 @@ func TestQuestionSearchGraceUsesInRunUserBranch(t *testing.T) {
 			e, tool := newRetrievalProbeEngine(t)
 			e.EnableRetrievalGuard()
 			e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"sandbox configuration is requested"}`}
-			for _, id := range []string{"one", "two", "three"} {
+			for i := 0; i < questionSearchGrace; i++ {
+				id := fmt.Sprint(i)
 				require.True(t, retrievalProbeCall(e, id, agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
 			}
 			require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", Status: retrievalNeedsUser, MissingUserFields: []string{"platform"}}))
@@ -161,7 +164,7 @@ func TestQuestionSearchGraceUsesInRunUserBranch(t *testing.T) {
 			require.NoError(t, err)
 			call := retrievalProbeCall(e, "ios-search", agenttools.ToolSearchKnowledge, string(args))
 			require.True(t, call.Result.Success, call.Result.Error)
-			require.Len(t, tool.calls, 4)
+			require.Len(t, tool.calls, questionSearchGrace+1)
 			state := e.retrieval.snapshot()
 			require.Len(t, state.Gaps, 2)
 			require.Equal(t, retrievalPending, state.Gaps[0].Status, "the old clarification is resolved without refunding its searches")
@@ -177,14 +180,15 @@ func TestQuestionSearchGraceQueuesParallelSearches(t *testing.T) {
 	e.EnableRetrievalGuard()
 	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"sandbox configuration is requested"}`}
 	response := &types.ChatResponse{}
-	for _, id := range []string{"one", "two", "three"} {
+	for i := 0; i < questionSearchGrace; i++ {
+		id := fmt.Sprint(i)
 		response.ToolCalls = append(response.ToolCalls, types.LLMToolCall{ID: id, Function: types.FunctionCall{
 			Name: agenttools.ToolSearchKnowledge, Arguments: `{"query":"` + id + `"}`,
 		}})
 	}
 	step := &types.AgentStep{}
 	e.executeToolCallsParallel(t.Context(), response, step, 0, "session", "message")
-	require.Len(t, tool.calls, 3)
+	require.Len(t, tool.calls, questionSearchGrace)
 	for _, call := range step.ToolCalls {
 		require.True(t, call.Result.Success, call.Result.Error)
 	}
@@ -268,7 +272,7 @@ func TestQuestionSearchGracePreservesPartialFailureScopes(t *testing.T) {
 			require.True(t, call.Result.Success, call.Result.Error)
 			require.Len(t, tool.calls, 2)
 			if errors.Is(cause, context.DeadlineExceeded) {
-				call = retrievalProbeCall(e, "recover-first", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["b"],"retrieval":{"action":"recovery","recovery_call_id":"first"}}`)
+				call = retrievalProbeCall(e, "recover-first", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["b"],"retrieval":{"gap_id":"gap-1","action":"recovery","recovery_call_id":"first","lead":"sandbox"}}`)
 				require.True(t, call.Result.Success, call.Result.Error)
 				require.Len(t, tool.calls, 3, "a later independent search does not hide the original recoverable failure")
 				require.True(t, e.retrieval.snapshot().Gaps[0].RecoveryUsed)

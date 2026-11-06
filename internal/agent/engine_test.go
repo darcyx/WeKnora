@@ -769,15 +769,16 @@ func TestClampCompletionBudgetToContext(t *testing.T) {
 			clampCompletionBudgetToContext(999999))
 }
 
-func TestBuildSystemPromptUsesInternalCitationSetting(t *testing.T) {
-	model := &mockChat{}
-	enabledEngine := newTestEngine(t, model)
-	require.Contains(t, enabledEngine.buildSystemPrompt(context.Background()), "Source citations are enabled")
-
-	disabledEngine := newTestEngine(t, model, withCitationsEnabled(false))
-	prompt := disabledEngine.buildSystemPrompt(context.Background())
-	require.Contains(t, prompt, "Source citations are disabled")
-	require.NotContains(t, prompt, "Source citations are enabled")
+func TestBuildSystemPromptLeavesReferenceRulesToCustomPrompt(t *testing.T) {
+	const referenceRule = "参考来源仅列实际使用且有有效链接的文档，按文档去重。"
+	for _, enabled := range []bool{true, false} {
+		engine := newTestEngine(t, &mockChat{}, withCitationsEnabled(enabled))
+		engine.systemPromptTemplate = referenceRule
+		prompt := engine.buildSystemPrompt(context.Background())
+		require.Contains(t, prompt, referenceRule)
+		require.NotContains(t, prompt, "Source citations are")
+		require.NotContains(t, prompt, "These rules supersede")
+	}
 }
 
 func TestBuildSystemPromptUsesHostWorkspace(t *testing.T) {
