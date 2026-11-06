@@ -65,6 +65,17 @@ const awaitingRow = () => ({
 const cards = (m: Record<string, any>) =>
   (m.agentEventStream as Record<string, any>[]).filter((e) => e.type === 'tool_approval_required')
 
+test('FAQ clarification history shows the question without an internal tool call', async () => {
+  const { handler, messagesList } = setup()
+  await handler.handleMsgList([{
+    id: 'faq-a', role: 'assistant', content: '国内还是海外？', is_completed: true,
+    agent_steps: [{ iteration: 0, tool_calls: [{ id: 'ragpipe-faq-clarification', name: 'faq_clarification', args: {} }] }],
+  }])
+  const events = messagesList[0].agentEventStream as Record<string, any>[]
+  assert.ok(events.some((e) => e.type === 'answer' && e.content === '国内还是海外？'))
+  assert.ok(!events.some((e) => e.type === 'tool_call' && e.tool_name === 'faq_clarification'))
+})
+
 test('history renders a suspended message as settled with its pending card', async () => {
   const { handler, messagesList } = setup()
   await handler.handleMsgList([awaitingRow()])

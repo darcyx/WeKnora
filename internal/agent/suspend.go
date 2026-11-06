@@ -45,10 +45,13 @@ type RunSnapshot struct {
 	// UserMessages holds the raw text referenced by UserMessagesBefore.
 	UserMessages map[string]string `json:"user_messages,omitempty"`
 
-	CompletedSteps []types.AgentStep     `json:"completed_steps"`
-	KnowledgeRefs  []*types.SearchResult `json:"knowledge_refs,omitempty"`
-	CurrentRound   int                   `json:"current_round"`
-	TurnUsage      types.TokenUsage      `json:"turn_usage"`
+	CompletedSteps  []types.AgentStep     `json:"completed_steps"`
+	KnowledgeRefs   []*types.SearchResult `json:"knowledge_refs,omitempty"`
+	CurrentRound    int                   `json:"current_round"`
+	TurnUsage       types.TokenUsage      `json:"turn_usage"`
+	Plan            *types.ExecutionPlan  `json:"plan,omitempty"`
+	Retrieval       *retrievalState       `json:"retrieval,omitempty"`
+	RetrievalTurnID string                `json:"retrieval_turn_id,omitempty"`
 
 	PendingRound PendingRound `json:"pending_round"`
 }
@@ -161,6 +164,11 @@ func (e *AgentEngine) beginTurn(query string, imageURLs []string, state *types.A
 	e.progress.query, e.progress.imageURLs, e.progress.state = query, imageURLs, state
 	e.progress.userMessages = make(map[string]string)
 	e.progress.collaborationDeliveries = nil
+	e.retrievalTurnID = ""
+	e.retrievalProjectReviewed = ""
+	e.retrievalSearchGapID = ""
+	e.retrievalSearchInputID = ""
+	e.initRetrieval(query)
 }
 
 func (e *AgentEngine) recordSteerMessage(id, content string) {
@@ -170,6 +178,9 @@ func (e *AgentEngine) recordSteerMessage(id, content string) {
 		e.progress.userMessages = make(map[string]string)
 	}
 	e.progress.userMessages[id] = content
+	if e.retrieval != nil {
+		e.retrieval.recordUserInput("message:"+id, content)
+	}
 }
 
 func (e *AgentEngine) beginRound(step types.AgentStep, calls []types.LLMToolCall) {
@@ -286,6 +297,9 @@ func (e *AgentEngine) snapshot(blocked int) (*RunSnapshot, error) {
 		KnowledgeRefs:           append([]*types.SearchResult(nil), p.state.KnowledgeRefs...),
 		CurrentRound:            p.state.CurrentRound,
 		TurnUsage:               p.state.TurnUsage,
+		Plan:                    p.state.Plan,
+		Retrieval:               e.retrievalSnapshot(),
+		RetrievalTurnID:         e.retrievalTurnID,
 		PendingRound:            PendingRound{Step: step, Calls: calls, BlockedIndex: blocked},
 	}, nil
 }

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/event"
@@ -38,6 +39,13 @@ type ToolExecContext struct {
 	// Mode says whether the client can show and answer prompts; IM and
 	// MCP-server runs have no such surface.
 	Mode types.RunMode
+	// RetrievalTargets is the harness-validated failed sub-scope of a recovery,
+	// never a model argument or a replacement authorization grant.
+	RetrievalTargets types.SearchTargets
+	// KnowledgeSearch runs the admitted FAQ/document sequence inside the existing
+	// registry validation, authority, panic recovery and output-budget boundary.
+	KnowledgeSearch   func(context.Context, json.RawMessage) (*types.ToolResult, error)
+	RetrievalRecovery func(context.Context) (*types.ToolResult, error)
 }
 
 // Attended reports whether a client can answer prompts now.

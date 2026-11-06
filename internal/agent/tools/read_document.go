@@ -573,6 +573,7 @@ func (t *ReadDocumentTool) buildData(
 		"knowledge_id":      knowledge.ID,
 		"knowledge_base_id": knowledge.KnowledgeBaseID,
 		"knowledge_title":   strings.TrimSpace(knowledge.Title),
+		"source_url":        types.DocumentReferenceURL(knowledge.GetMetadata(), knowledge.CustomMetadata, knowledge.Source),
 		// Keep citation identities when chunks are omitted from SSE/history.
 		"chunk_ids":       chunkIDs,
 		"source_chunk_id": sourceChunkID,

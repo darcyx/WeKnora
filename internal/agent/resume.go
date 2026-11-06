@@ -2,10 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
-	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -21,10 +21,20 @@ func (e *AgentEngine) Resume(
 	llmContext []chat.Message,
 	snapshot []byte,
 	answered *types.AgentPrompt,
-) (*types.AgentState, error) {
+) (_ *types.AgentState, err error) {
+	// The engine owns the error event for every failure path, like Execute,
+	// so callers must not emit another one.
+	defer func() {
+		if err != nil {
+			e.emitExecutionError(ctx, sessionID, err)
+		}
+	}()
 	snap, err := DecodeRunSnapshot(snapshot)
 	if err != nil {
 		return nil, err
+	}
+	if snap.Plan != nil && (snap.Plan.Current < 0 || snap.Plan.Current > len(snap.Plan.Steps) || len(snap.Plan.Steps) == 0 || len(snap.Plan.Steps) > 6) {
+		return nil, fmt.Errorf("snapshot plan is inconsistent")
 	}
 	e.bindCollaborationInput(sessionID, messageID)
 	p := snap.PendingRound
@@ -66,9 +76,44 @@ func (e *AgentEngine) Resume(
 		KnowledgeRefs: append([]*types.SearchResult{}, snap.KnowledgeRefs...),
 		CurrentRound:  snap.CurrentRound,
 		TurnUsage:     snap.TurnUsage,
+		Plan:          snap.Plan,
 	}
 	systemPrompt := e.buildSystemPrompt(ctx)
+	if snap.Retrieval != nil && snap.RetrievalTurnID != "" && snap.RetrievalTurnID != messageID {
+		return nil, fmt.Errorf("retrieval snapshot belongs to a different assistant message")
+	}
 	e.beginTurn(snap.Query, snap.ImageURLs, state)
+	e.setRetrievalHistory(llmContext)
+	if e.retrieval != nil {
+		e.retrievalTurnID = messageID
+	}
+	if snap.Retrieval != nil {
+		if e.retrieval == nil {
+			return nil, fmt.Errorf("retrieval capability changed while the run was suspended")
+		}
+		if snap.RetrievalTurnID == "" {
+			e.scopeLegacyRetrievalSnapshot(snap.Retrieval)
+		}
+		e.retrieval, err = restoreRetrievalForScope(*snap.Retrieval, e.retrieval.snapshot().Scope)
+		if err != nil {
+			return nil, fmt.Errorf("restore retrieval state: %w", err)
+		}
+	}
+	e.recordRetrievalUserMessage()
+	if len(e.retrievalPrevious) > 0 && e.retrieval != nil {
+		var saved retrievalState
+		if err := json.Unmarshal(e.retrievalPrevious, &saved); err != nil {
+			return nil, err
+		}
+		e.retrieval, err = restoreRetrievalForScope(saved, e.retrieval.snapshot().Scope)
+		if err != nil {
+			return nil, err
+		}
+		e.recordRetrievalUserMessage()
+	}
+	if err := e.bindRetrievalPersistence(ctx); err != nil {
+		return nil, err
+	}
 	if err := e.restoreCollaborationDeliveries(ctx, snap); err != nil {
 		return nil, err
 	}
@@ -134,21 +179,12 @@ func (e *AgentEngine) Resume(
 		messages = e.appendToolImages(ctx, messages, step)
 		state.CurrentRound++
 	}
+	if state.Plan != nil {
+		messages = append(messages, planInstruction(state.Plan))
+		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound)
+	}
 
 	if _, err := e.executeLoop(ctx, state, snap.Query, messages, tools, sessionID, messageID); err != nil {
-		logger.Errorf(ctx, "[Agent] Resumed execution failed: %v", err)
-		if emitErr := e.eventBus.Emit(ctx, event.Event{
-			ID:        generateEventID("error"),
-			Type:      event.EventError,
-			SessionID: sessionID,
-			Data: event.ErrorData{
-				Error:     err.Error(),
-				Stage:     "agent_execution",
-				SessionID: sessionID,
-			},
-		}); emitErr != nil {
-			logger.Warnf(ctx, "[Agent] Failed to emit resumed execution error: %v", emitErr)
-		}
 		return nil, err
 	}
 	return state, nil

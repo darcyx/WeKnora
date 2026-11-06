@@ -112,6 +112,8 @@ type PatchAgentRequest struct {
 	WebSearchProviderID *string `json:"web_search_provider_id" extensions:"x-agent"`
 	// Whether earlier turns are kept in the conversation context
 	MultiTurnEnabled *bool `json:"multi_turn_enabled" extensions:"x-agent"`
+	// Whether the agent decomposes complex queries into a plan before the ReAct loop
+	PlanningEnabled *bool `json:"planning_enabled" extensions:"x-agent"`
 }
 
 // apply overlays the request onto an agent's current state, as an update
@@ -168,6 +170,9 @@ func (p PatchAgentRequest) apply(agent *types.CustomAgent) UpdateAgentRequest {
 	}
 	if p.MultiTurnEnabled != nil {
 		cfg.MultiTurnEnabled = *p.MultiTurnEnabled
+	}
+	if p.PlanningEnabled != nil {
+		cfg.PlanningEnabled = *p.PlanningEnabled
 	}
 	return req
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"golang.org/x/sync/errgroup"
@@ -281,13 +282,20 @@ func (e *AgentEngine) failTruncatedToolCalls(
 	ctx context.Context, response *types.ChatResponse,
 	step *types.AgentStep, iteration int, sessionID string,
 ) {
+	e.failToolCalls(ctx, response, step, iteration, sessionID, truncatedArgumentsError)
+}
+
+func (e *AgentEngine) failToolCalls(
+	ctx context.Context, response *types.ChatResponse,
+	step *types.AgentStep, iteration int, sessionID, reason string,
+) {
 	for i, tc := range response.ToolCalls {
 		toolCall := types.ToolCall{
 			ID:               agenttools.NormalizeToolCallID(tc.ID, tc.Function.Name, i),
 			Name:             tc.Function.Name,
 			Args:             map[string]any{"_raw": tc.Function.Arguments},
 			ProviderMetadata: tc.ProviderMetadata,
-			Result:           &types.ToolResult{Success: false, Error: truncatedArgumentsError},
+			Result:           &types.ToolResult{Success: false, Error: reason},
 		}
 		step.ToolCalls = append(step.ToolCalls, toolCall)
 		e.emitToolOutcome(ctx, toolCall, iteration, sessionID)
@@ -311,9 +319,10 @@ func (e *AgentEngine) executeToolCallsParallel(
 
 	for i, tc := range response.ToolCalls {
 		i, tc := i, tc // capture loop vars
-		if !agenttools.CanRunConcurrently(tc.Function.Name) {
+		if !agenttools.CanRunConcurrently(tc.Function.Name) || e.retrievalGuard && isBudgetedSearchTool(tc.Function.Name) ||
+			kbToolNames[tc.Function.Name] && e.usesRuntimeRetrievalTool(tc.Function.Name) {
 			// Drain preceding reads before a mutation, and finish the mutation
-			// before starting later reads. Preserve model order across barriers.
+			// before starting later reads. Runtime-managed retrieval shares one question ledger.
 			_ = g.Wait()
 			results[i] = e.runToolCall(ctx, tc, i, iteration, round, sessionID, assistantMessageID)
 			if s := suspensionOf(results[i]); s != nil {
@@ -456,8 +465,22 @@ func (e *AgentEngine) runToolCall(
 func (e *AgentEngine) runToolCallAnswered(
 	ctx context.Context, tc types.LLMToolCall, i int,
 	iteration, round int, sessionID, assistantMessageID string, answered *types.AgentPrompt,
-) types.ToolCall {
+) (completed types.ToolCall) {
 	tc.ID = agenttools.NormalizeToolCallID(tc.ID, tc.Function.Name, i)
+	controlledRetrieval := e.retrieval != nil && kbToolNames[tc.Function.Name]
+	dispatched := false
+	defer func() {
+		if controlledRetrieval && completed.Result != nil && !completed.Result.Success && completed.Result.Output == "" {
+			completed.Result.Output = completed.Result.Error
+		}
+		if !dispatched && e.retrieval != nil && (controlledRetrieval || tc.Function.Name == reviewRetrievalTool) &&
+			completed.Result != nil && !completed.Result.Success {
+			if completed.Result.Data == nil {
+				completed.Result.Data = make(map[string]any)
+			}
+			completed.Result.Data[retrievalDispatchBlocked] = true
+		}
+	}()
 	total := "?" // unknown in isolation; callers log the batch size
 	toolTag := fmt.Sprintf("[Agent][Round-%d][Tool %s (%d/%s)]",
 		round, tc.Function.Name, i+1, total)
@@ -526,6 +549,29 @@ func (e *AgentEngine) runToolCallAnswered(
 		}
 	}
 
+	if e.retrieval != nil && tc.Function.Name == reviewRetrievalTool {
+		if len(tc.UnresolvedHandles) > 0 {
+			return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
+				Result: &types.ToolResult{Success: false, Error: "Retrieval review rejected: unresolved evidence reference"}}
+		}
+		return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args,
+			ProviderMetadata: tc.ProviderMetadata, Result: e.reviewRetrieval(ctx, tc.Function.Arguments)}
+	}
+	executionArguments := tc.Function.Arguments
+	if controlledRetrieval {
+		if len(tc.UnresolvedHandles) > 0 {
+			return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
+				Result: &types.ToolResult{Success: false, Error: "Retrieval not dispatched: tool arguments contain unresolved model handles"}}
+		}
+		var err error
+		executionArguments, err = e.prepareRetrievalCall(ctx, tc, args)
+		if err != nil {
+			return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
+				Result: &types.ToolResult{Success: false, Error: "Retrieval not dispatched: " + err.Error()}}
+		}
+		dispatched = true
+	}
+
 	// Keep the provider-visible proxy call intact; resolve a separate target
 	// identity for live events, persisted presentation and tracing.
 	var target *types.ToolCallTarget
@@ -533,6 +579,10 @@ func (e *AgentEngine) runToolCallAnswered(
 		target = e.toolRegistry.MCPCallTarget(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 	}
 	executionName, executionArgs := tc.Function.Name, args
+	if controlledRetrieval {
+		executionArgs = nil
+		_ = json.Unmarshal([]byte(executionArguments), &executionArgs)
+	}
 	if target != nil {
 		executionName, executionArgs = target.Name, target.Args
 	}
@@ -592,6 +642,9 @@ func (e *AgentEngine) runToolCallAnswered(
 			"unresolved_handle_count": len(tc.UnresolvedHandles),
 		},
 	})
+	if controlledRetrieval {
+		toolCtx = api.WithoutTransportRetries(toolCtx)
+	}
 
 	principal, _ := types.PrincipalFromContext(ctx)
 	// Same ID stored on this turn's user messages; host auto-review uses it
@@ -612,11 +665,16 @@ func (e *AgentEngine) runToolCallAnswered(
 		UserID:             principal.StorageID(),
 		// ApprovalCtx keeps the round-level ctx without the per-tool execution timeout,
 		// so MCP tool human-approval (issue #1173) can legitimately block longer.
-		ApprovalCtx: toolCtx,
-		ExecTimeout: execTimeout,
-		Snapshot:    e.snapshotFunc(i, tc.Function.Name),
-		Answered:    answered,
-		Mode:        e.mode,
+		ApprovalCtx:       toolCtx,
+		ExecTimeout:       execTimeout,
+		Snapshot:          e.snapshotFunc(i, tc.Function.Name),
+		Answered:          answered,
+		Mode:              e.mode,
+		RetrievalTargets:  e.retrieval.dispatchTargets(e.retrievalCallReference(tc.ID)),
+		RetrievalRecovery: e.retrieval.dispatchRecovery(e.retrievalCallReference(tc.ID)),
+		KnowledgeSearch: func(ctx context.Context, arguments json.RawMessage) (*types.ToolResult, error) {
+			return e.executeWithFAQ(ctx, tc, arguments)
+		},
 	})
 
 	var result *types.ToolResult
@@ -628,10 +686,7 @@ func (e *AgentEngine) runToolCallAnswered(
 		err = fmt.Errorf("tool arguments contain unresolved model handles: %v", tc.UnresolvedHandles)
 	} else {
 		execCtx, toolCancel := context.WithTimeout(toolExecCtx, execTimeout)
-		result, err = e.toolRegistry.ExecuteTool(
-			execCtx, tc.Function.Name,
-			json.RawMessage(tc.Function.Arguments),
-		)
+		result, err = e.toolRegistry.ExecuteTool(execCtx, tc.Function.Name, json.RawMessage(executionArguments))
 		toolCancel()
 		if err == nil {
 			e.describeToolImages(toolCtx, result)
@@ -651,9 +706,13 @@ func (e *AgentEngine) runToolCallAnswered(
 
 	if err != nil {
 		logger.Errorf(ctx, "%s Failed in %dms: %v", toolTag, duration, err)
-		toolCall.Result = &types.ToolResult{
-			Success: false,
-			Error:   err.Error(),
+		if toolCall.Result == nil {
+			toolCall.Result = &types.ToolResult{}
+		}
+		toolCall.Result.Success = false
+		toolCall.Result.Error = err.Error()
+		if toolCall.Result.FAQ != nil {
+			toolCall.Result.FAQ.Reply = ""
 		}
 	} else {
 		success := result != nil && result.Success
@@ -665,6 +724,20 @@ func (e *AgentEngine) runToolCallAnswered(
 			toolTag, duration, success, outputLen)
 	}
 
+	if controlledRetrieval {
+		content := e.modelContext.DecodeObservationText(e.modelContext.ModelToolResultForTool(tc.Function.Name, toolCall.Result))
+		if observeErr := e.retrieval.observe(e.retrievalCallReference(tc.ID), content, retrievalCallOutcome(ctx, result, err), retrievalCallFailures(ctx, result)...); observeErr != nil {
+			logger.Errorf(ctx, "%s Cannot record retrieval outcome: %v", toolTag, observeErr)
+			if result != nil && result.FAQ != nil {
+				result.FAQ.Reply = ""
+			}
+		} else if result != nil && result.FAQ != nil && result.FAQ.Reply != "" {
+			if reviewErr := e.recordFAQDecision(e.retrievalCallReference(tc.ID), content, result.FAQ); reviewErr != nil {
+				logger.Errorf(ctx, "%s Cannot record FAQ decision: %v", toolTag, reviewErr)
+				result.FAQ.Reply = ""
+			}
+		}
+	}
 	finishToolSpan(toolSpan, toolCall, err, duration)
 
 	// Pipeline event for monitoring

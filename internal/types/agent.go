@@ -103,12 +103,16 @@ type AgentConfig struct {
 	// MaxIterations caps ReAct rounds. Zero is unset (filled with a default);
 	// a negative value is unlimited — the loop runs until the model stops,
 	// the user cancels, or another guard fires. See UnlimitedMaxIterations.
-	MaxIterations  int      `json:"max_iterations"`
-	AllowedTools   []string `json:"allowed_tools"`           // List of allowed tool names
-	Temperature    float64  `json:"temperature"`             // LLM temperature for agent
-	KnowledgeBases []string `json:"knowledge_bases"`         // Accessible knowledge base IDs
-	KnowledgeIDs   []string `json:"knowledge_ids"`           // Accessible knowledge IDs (individual documents)
-	SystemPrompt   string   `json:"system_prompt,omitempty"` // Unified system prompt (uses web_search_status placeholder for dynamic behavior)
+	MaxIterations int `json:"max_iterations"`
+	// PlanningEnabled turns on the engine-driven plan-and-execute decomposition
+	// before the ReAct loop. Defaults to false (off). When enabled, the planner
+	// decides whether a task needs decomposition.
+	PlanningEnabled bool     `json:"planning_enabled"`
+	AllowedTools    []string `json:"allowed_tools"`           // List of allowed tool names
+	Temperature     float64  `json:"temperature"`             // LLM temperature for agent
+	KnowledgeBases  []string `json:"knowledge_bases"`         // Accessible knowledge base IDs
+	KnowledgeIDs    []string `json:"knowledge_ids"`           // Accessible knowledge IDs (individual documents)
+	SystemPrompt    string   `json:"system_prompt,omitempty"` // Unified system prompt (uses web_search_status placeholder for dynamic behavior)
 	// Deprecated: Use SystemPrompt instead. Kept for backward compatibility during migration.
 	SystemPromptWebEnabled  string        `json:"system_prompt_web_enabled,omitempty"`  // Deprecated: Custom prompt when web search is enabled
 	SystemPromptWebDisabled string        `json:"system_prompt_web_disabled,omitempty"` // Deprecated: Custom prompt when web search is disabled
@@ -120,6 +124,7 @@ type AgentConfig struct {
 	MultiTurnEnabled        bool          `json:"multi_turn_enabled"`                   // Whether multi-turn conversation is enabled
 	MemoryEnabled           *bool         `json:"memory_enabled,omitempty"`             // nil inherits workspace
 	SearchTargets           SearchTargets `json:"-"`                                    // Pre-computed unified search targets (runtime only)
+	FAQPreflightUsage       *TokenUsage   `json:"-"`                                    // Model usage incurred before the agent loop
 	// MCP service selection
 	MCPSelectionMode string   `json:"mcp_selection_mode"` // MCP selection mode: "all", "selected", "none"
 	MCPServices      []string `json:"mcp_services"`       // Selected MCP service IDs (when mode is "selected")
@@ -393,6 +398,13 @@ type Cleanable interface {
 
 // ToolResult represents the result of a tool execution
 type ToolResult struct {
+	// FAQ carries a verified FAQ decision within this execution, never a tool argument.
+	FAQ *FAQToolResult `json:"-"`
+	// InvalidArguments is set by schema validation, never inferred from error text.
+	InvalidArguments bool `json:"-"`
+	// RetrievalFailures retains typed causes and failed scopes for live dispatch.
+	// Public diagnostics remain in Data; snapshots retain classified outcomes only.
+	RetrievalFailures []RetrievalFailure `json:"-"`
 	// OutputFiles holds sandbox references for this live result only. History
 	// uses the final answer's persistent resource references instead.
 	// A non-nil empty slice means output inspection found no eligible changes;
@@ -414,6 +426,25 @@ type ToolResult struct {
 	// Suspend, when set, means the call did not run: it is waiting on a user
 	// prompt and the run must end so it can be resumed later. Live only.
 	Suspend *PromptSuspension `json:"-"`
+}
+
+type FAQToolResult struct {
+	Reply             string
+	MissingUserFields []string
+	Clarification     json.RawMessage
+	References        []*SearchResult
+	Usage             TokenUsage
+}
+
+type RetrievalFailure struct {
+	// Retry replays only this isolated stage; it is never serialized or model supplied.
+	Retry            func(context.Context) (*ToolResult, error) `json:"-"`
+	KnowledgeBaseIDs []string
+	// Targets and Stage identify the actual failed sub-operation; a KB alone
+	// cannot distinguish successful and failed document/tag targets.
+	Targets SearchTargets
+	Stage   string
+	Cause   error
 }
 
 // Image description detail levels requested by a file read.
@@ -468,6 +499,9 @@ func (t ToolCall) ExecutionArgs() map[string]interface{} {
 // request protocol.
 const PipelineToolCallIDPrefix = "ragpipe-"
 
+// FAQClarificationToolCallID identifies the saved state of an ordinary FAQ follow-up.
+const FAQClarificationToolCallID = PipelineToolCallIDPrefix + "faq-clarification"
+
 // IsPipelineToolCallID reports whether a tool call was synthesized by the
 // fast-answer pipeline rather than requested by the model.
 func IsPipelineToolCallID(id string) bool {
@@ -502,6 +536,7 @@ type AgentStep struct {
 	// IntermediateAnswer preserves a plain answer followed by a loop-end steer.
 	// The canonical final answer is still stored in Message.Content.
 	IntermediateAnswer bool `json:"intermediate_answer,omitempty"`
+	PlanReport         bool `json:"plan_report,omitempty"`
 	// ReasoningContent stores the OpenAI-protocol reasoning_content emitted by the
 	// model in this round. Persisted on AgentStep so cross-turn replay can put it
 	// back on the assistant message — required by MiMo / DeepSeek V3.2+ thinking
@@ -580,6 +615,21 @@ func (s *AgentStep) GetObservations() []string {
 	return observations
 }
 
+// ExecutionPlan tracks the current turn's planned work across suspensions.
+type ExecutionPlan struct {
+	Steps         []ExecutionPlanStep `json:"steps"`
+	Current       int                 `json:"current"`
+	Replans       int                 `json:"replans,omitempty"`
+	ReportRetries int                 `json:"report_retries,omitempty"`
+}
+
+type ExecutionPlanStep struct {
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Result      string `json:"result,omitempty"`
+	StartStep   int    `json:"start_step,omitempty"`
+}
+
 // AgentState tracks the execution state of an agent across iterations
 type AgentState struct {
 	PendingSteerMessages []string              `json:"-"`
@@ -590,12 +640,13 @@ type AgentState struct {
 	FinalAnswer          string                `json:"final_answer"`   // The final answer to the query
 	KnowledgeRefs        []*SearchResult       `json:"knowledge_refs"` // Collected knowledge references
 	TurnUsage            TokenUsage            `json:"turn_usage"`     // LLM usage accumulated across this turn
+	Plan                 *ExecutionPlan        `json:"plan,omitempty"`
 	// Suspended is set when the run ended waiting on a user prompt.
 	// SuspendedStep is the interrupted round: its thought and the calls
 	// that finished before the blocked one, kept for display.
 	Suspended     *PromptSuspension `json:"-"`
 	SuspendedStep *AgentStep        `json:"-"`
-	Usage                TokenUsage      `json:"usage"`          // Cumulative model usage for this agent execution
+	Usage         TokenUsage        `json:"usage"` // Cumulative model usage for this agent execution
 }
 
 // AddUsage accumulates model-reported usage for this agent execution.

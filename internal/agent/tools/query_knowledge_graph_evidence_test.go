@@ -503,3 +503,15 @@ func TestQueryKnowledgeGraph_RejectsRelationsWhenTagValidationFails(t *testing.T
 	assert.NotEmpty(t, result.Data["errors"])
 	assert.Contains(t, result.Output, "failed to validate graph result scope")
 }
+
+func TestDocumentReferenceGraphKeepsOriginalLink(t *testing.T) {
+	chunks := &stubGraphChunkRepo{chunks: map[string]*types.Chunk{"c1": {ID: "c1", KnowledgeID: "doc", KnowledgeBaseID: "kb-1", IsEnabled: true, Content: "证据"}}}
+	documents := liveGraphEvidenceDocuments()
+	documents.documents["doc"].Metadata = types.JSON(`{"source_url":"https://docs.example/graph"}`)
+	tool := graphEvidenceTool(graphEvidenceGraph([]string{"c1"}, []string{"c1"}), chunks, documents, nil)
+	result := executeGraphEvidenceTool(t, tool)
+	rows := result.Data["results"].([]map[string]interface{})
+	require.NotEmpty(t, rows)
+	require.Equal(t, "https://docs.example/graph", rows[0]["source_url"])
+	require.Equal(t, "Evidence", rows[0]["knowledge_title"])
+}

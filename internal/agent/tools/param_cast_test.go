@@ -58,6 +58,34 @@ func TestCastParams_NoChangeNeeded(t *testing.T) {
 	}
 }
 
+func TestCastParamsPreservesExactNumericConversions(t *testing.T) {
+	for _, tc := range []struct{ target, input, want string }{
+		{"string", "9007199254740993", `"9007199254740993"`},
+		{"string", "9223372036854775807", `"9223372036854775807"`},
+		{"string", "1.1234567890123456789", `"1.1234567890123456789"`},
+		{"integer", "9007199254740993.0", "9007199254740993"},
+		{"integer", "9.007199254740993e15", "9007199254740993"},
+		{"integer", "9223372036854775807.0", "9223372036854775807"},
+		{"integer", "9223372036854775808.0", "9223372036854775808.0"},
+		{"integer", "9007199254740993.1", "9007199254740993.1"},
+		{"boolean", "1.00000000000000000001", "1.00000000000000000001"},
+		{"boolean", "1e0", "true"},
+		{"boolean", "1e-10000", "1e-10000"},
+	} {
+		t.Run(tc.target+"/"+tc.input, func(t *testing.T) {
+			schema := json.RawMessage(`{"type":"object","properties":{"value":{"type":"` + tc.target + `"}}}`)
+			result := CastParams(json.RawMessage(`{"value":`+tc.input+`}`), schema)
+			var values map[string]json.RawMessage
+			if err := json.Unmarshal(result, &values); err != nil {
+				t.Fatal(err)
+			}
+			if string(values["value"]) != tc.want {
+				t.Fatalf("got %s, want exact literal %s", values["value"], tc.want)
+			}
+		})
+	}
+}
+
 func TestCastParams_NilSchema(t *testing.T) {
 	args := json.RawMessage(`{"foo":"bar"}`)
 	result := CastParams(args, nil)

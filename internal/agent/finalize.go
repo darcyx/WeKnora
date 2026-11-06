@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/compaction"
@@ -172,13 +173,35 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		return err
 	}
 	_, tail := splitter.Flush()
-	_ = e.eventBus.Emit(ctx, event.Event{
-		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true},
-	})
-
 	// Safety net: strip any residual <think> blocks that may have leaked through
 	fullAnswer := agenttools.StripThinkBlocks(llmResult.Content)
+	// Streamed text stays unless post-processing changed it; then replace it whole.
+	public, err := e.publicAnswer(ctx, fullAnswer, messages)
+	if err != nil {
+		return err
+	}
+	if public != fullAnswer {
+		if answerStreamed {
+			_ = e.eventBus.Emit(ctx, event.Event{
+				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+				Data: event.AgentFinalAnswerData{Replace: true},
+			})
+		}
+		fullAnswer, terminalContent, tail = public, "", public
+	}
+	// With tools disabled some models still reply with only a tool call;
+	// never finish the turn with a blank answer.
+	if strings.TrimSpace(fullAnswer) == "" {
+		logger.Warnf(ctx, "[Agent][FinalAnswer] Empty synthesis (tool_calls=%d) - using fallback",
+			len(llmResult.ToolCalls))
+		fullAnswer = stalledAnswerFallback
+		terminalContent, tail = "", fullAnswer
+	}
+	_ = e.eventBus.Emit(ctx, event.Event{
+		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true, IsFallback: isRuntimeFallbackAnswer(fullAnswer)},
+	})
+
 	logger.Infof(ctx, "[Agent][FinalAnswer] Final answer generated: %d characters", len(fullAnswer))
 	common.PipelineInfo(ctx, "Agent", "final_answer_done", map[string]interface{}{
 		"session_id": sessionID,

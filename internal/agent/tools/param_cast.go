@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"bytes"
 	"encoding/json"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -49,13 +51,13 @@ func CastParams(args json.RawMessage, schema json.RawMessage) json.RawMessage {
 		}
 
 		var val interface{}
-		if err := json.Unmarshal(rawVal, &val); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(rawVal))
+		decoder.UseNumber()
+		if err := decoder.Decode(&val); err != nil {
 			continue
 		}
-		// Integer literals already have the requested JSON representation. A
-		// float64-to-int64 round trip would corrupt values above 2^53. Keep
-		// decimal/exponent notation on the existing normalization path.
-		if _, isNumber := val.(float64); isNumber && targetType == "integer" &&
+		// Integer literals already have the requested representation, even beyond int64.
+		if _, isNumber := val.(json.Number); isNumber && targetType == "integer" &&
 			!strings.ContainsAny(string(rawVal), ".eE") {
 			continue
 		}
@@ -113,11 +115,12 @@ func castValue(val interface{}, targetType string) (interface{}, bool) {
 			}
 		}
 		// JSON number 0/1 -> bool
-		if n, ok := val.(float64); ok {
-			if n == 0 {
+		if n, ok := val.(json.Number); ok {
+			i, exact := exactJSONInteger(n)
+			if exact && i == 0 {
 				return false, true
 			}
-			if n == 1 {
+			if exact && i == 1 {
 				return true, true
 			}
 		}
@@ -128,10 +131,9 @@ func castValue(val interface{}, targetType string) (interface{}, bool) {
 				return i, true
 			}
 		}
-		// JSON numbers are float64 in Go; convert to int if it's a whole number
-		if f, ok := val.(float64); ok {
-			if f == float64(int64(f)) {
-				return int64(f), true
+		if n, ok := val.(json.Number); ok {
+			if i, exact := exactJSONInteger(n); exact {
+				return i, true
 			}
 		}
 
@@ -159,12 +161,29 @@ func castValue(val interface{}, targetType string) (interface{}, bool) {
 				return "true", true
 			}
 			return "false", true
-		case float64:
-			return strconv.FormatFloat(v, 'f', -1, 64), true
+		case json.Number:
+			return v.String(), true
 		case int64:
 			return strconv.FormatInt(v, 10), true
 		}
 	}
 
 	return val, false
+}
+
+func exactJSONInteger(n json.Number) (int64, bool) {
+	// Bound exponent expansion before exact parsing, including underflow to zero.
+	f, err := n.Float64()
+	if err != nil || f < -0x1p63 || f > 0x1p63 {
+		return 0, false
+	}
+	if f == 0 {
+		mantissa, _, _ := strings.Cut(strings.ToLower(n.String()), "e")
+		return 0, strings.Trim(mantissa, "-0.") == ""
+	}
+	rational, ok := new(big.Rat).SetString(n.String())
+	if !ok || !rational.IsInt() || !rational.Num().IsInt64() {
+		return 0, false
+	}
+	return rational.Num().Int64(), true
 }

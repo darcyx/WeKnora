@@ -267,6 +267,7 @@ func TestFinishStalledTurn_EmitsAnswerThatNeverStreamed(t *testing.T) {
 			require.Len(t, emitted, 2, "the text, then the Done marker")
 			assert.Equal(t, tc.wantAnswer, emitted[0].Content)
 			assert.False(t, emitted[0].Done)
+			assert.Equal(t, tc.response.Content != tc.wantAnswer, emitted[0].IsFallback)
 			assert.Equal(t, tc.truncated, emitted[0].Truncated)
 			assert.True(t, emitted[1].Done)
 			assert.Equal(t, tc.truncated, emitted[1].Truncated)

@@ -1,11 +1,90 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/stretchr/testify/require"
 )
+
+type missingInputSuggestionMessages struct {
+	interfaces.MessageService
+	message *types.Message
+}
+
+type suggestionEventMessages struct {
+	interfaces.MessageService
+	err error
+}
+
+func (s suggestionEventMessages) GetMessage(context.Context, string, string) (*types.Message, error) {
+	return &types.Message{}, s.err
+}
+
+type suggestionEventRepository struct {
+	interfaces.MessageSuggestionRepository
+	events int
+}
+
+func (r *suggestionEventRepository) GetByID(context.Context, uint64, string, string) (*types.MessageSuggestionSet, error) {
+	return &types.MessageSuggestionSet{ID: "set", SessionID: "other-session", AssistantMessageID: "other-answer"}, nil
+}
+
+func (r *suggestionEventRepository) CreateEvent(context.Context, *types.MessageSuggestionEvent) error {
+	r.events++
+	return nil
+}
+
+func TestSuggestionEventsRequireMessageReadAccess(t *testing.T) {
+	repo := &suggestionEventRepository{}
+	denied := errors.New("session is not accessible")
+	s := &messageSuggestionService{repo: repo, messageService: suggestionEventMessages{err: denied}}
+	ctx := context.WithValue(t.Context(), types.TenantIDContextKey, uint64(1))
+	for _, eventType := range []string{types.SuggestionEventImpression, types.SuggestionEventDismiss} {
+		require.ErrorIs(t, s.RecordEvent(ctx, "other-session", "set", "", eventType), denied)
+	}
+	require.Zero(t, repo.events)
+	s.messageService = suggestionEventMessages{}
+	require.NoError(t, s.RecordEvent(ctx, "other-session", "set", "", types.SuggestionEventImpression))
+	require.Equal(t, 1, repo.events)
+}
+
+func (s missingInputSuggestionMessages) GetMessage(context.Context, string, string) (*types.Message, error) {
+	return s.message, nil
+}
+
+func TestFollowUpsRespectMissingInputBeforeGenerationAndCache(t *testing.T) {
+	message := &types.Message{ID: "answer", SessionID: "session", Role: "assistant", IsCompleted: true, Content: "发一下订单号就可以。"}
+	message.ExecutionContext.RetrievalState = json.RawMessage(`{"policy":"policy","state":{"scope":"current","gaps":[
+		{"id":"gap-1","scope":"current","status":"needs_user","missing_user_fields":["订单号"]}]}}`)
+	message.ExecutionContext.QuestionSuggestions = &types.QuestionSuggestionConfig{FollowUps: types.FollowUpSuggestionConfig{Enabled: true, AllowRegenerate: true}}
+	// No repository or model: none may be reached, including an old ready cache.
+	s := &messageSuggestionService{messageService: missingInputSuggestionMessages{message: message}}
+	ctx := context.WithValue(t.Context(), types.TenantIDContextKey, uint64(1))
+	for _, regenerate := range []bool{false, true} {
+		set, err := s.EnsureFollowUps(ctx, message.SessionID, message.ID, regenerate)
+		require.NoError(t, err)
+		require.Equal(t, types.SuggestionStatusSuppressed, set.Status)
+		require.Equal(t, "needs_user", set.SuppressionReason)
+		require.Empty(t, set.Questions)
+		require.False(t, set.AllowRegenerate)
+	}
+	set, err := s.GetFollowUps(ctx, message.SessionID, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.SuggestionStatusSuppressed, set.Status)
+	require.Equal(t, message.ID, set.AssistantMessageID)
+
+	for _, raw := range []string{"", `{}`, `{"state":{"scope":"current","gaps":[{"scope":"current","status":"pending"}]}}`,
+		`{"state":{"scope":"current","gaps":[{"scope":"old","status":"needs_user","missing_user_fields":["订单号"]}]}}`} {
+		message.ExecutionContext.RetrievalState = json.RawMessage(raw)
+		require.Nil(t, missingInputFollowUps(message), "resolved, out-of-scope and legacy answers retain their existing recommendation path")
+	}
+}
 
 func TestParseGeneratedSuggestionsFiltersAndDeduplicates(t *testing.T) {
 	content := "```json\n{\"questions\":[" +

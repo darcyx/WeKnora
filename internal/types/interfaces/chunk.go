@@ -139,6 +139,8 @@ type ChunkRepository interface {
 	// FindFAQChunkWithDuplicateQuestion finds a single FAQ chunk whose standard_question or
 	// similar_questions overlap with the given question list. Returns nil if no duplicate found.
 	FindFAQChunkWithDuplicateQuestion(ctx context.Context, tenantID uint64, kbID string, excludeChunkID string, questions []string) (*types.Chunk, error)
+	// FindExactFAQQuestions returns all enabled FAQ entries matching a question within a resolved target.
+	FindExactFAQQuestions(ctx context.Context, target *types.SearchTarget, question string) ([]*types.Chunk, error)
 	// ListAllFAQChunksForExport lists all FAQ chunks for export with full metadata, tag_id, is_enabled, and flags
 	ListAllFAQChunksForExport(ctx context.Context, tenantID uint64, knowledgeID string) ([]*types.Chunk, error)
 	// UpdateChunkFlagsBatch updates flags for multiple chunks in batch using a single SQL statement.

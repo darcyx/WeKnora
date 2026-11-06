@@ -196,18 +196,52 @@ func uploadOnlyQuery(ctx context.Context, req *CreateKnowledgeQARequest) string 
 	return types.UploadOnlyQuestion(types.LanguageFromContextOrDefault(ctx))
 }
 
-// marshalAppInfo preserves the complete extension object as compact JSON for
-// the current agent turn. An empty ext object means there is no <app_info>
-// block to inject.
+// marshalAppInfo copies the extension object as compact JSON for the current
+// agent turn, without credential fields: <app_info> reaches the model and
+// tracing, and nothing in the agent needs the caller's auth material. An empty
+// ext object means there is no <app_info> block to inject.
 func marshalAppInfo(ext map[string]interface{}) (string, error) {
 	if len(ext) == 0 {
 		return "", nil
 	}
-	payload, err := json.Marshal(ext)
+	payload, err := json.Marshal(redactAppInfo(ext))
 	if err != nil {
 		return "", fmt.Errorf("marshal ext app info: %w", err)
 	}
 	return string(payload), nil
+}
+
+// redactAppInfo returns a copy of v without keys that name credentials.
+func redactAppInfo(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for key, value := range typed {
+			if isCredentialKey(key) {
+				continue
+			}
+			out[key] = redactAppInfo(value)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(typed))
+		for i, value := range typed {
+			out[i] = redactAppInfo(value)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func isCredentialKey(key string) bool {
+	key = strings.ToLower(key)
+	for _, marker := range []string{"token", "password", "secret", "authorization", "apikey", "api_key", "cookie"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseQARequest parses and validates a QA request, returns the request context

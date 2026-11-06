@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStreamRetryReplacesFailedPartialAnswer(t *testing.T) {
+func TestStreamRetryNeverPublishesFailedReActDraft(t *testing.T) {
 	model := &mockChat{responses: []mockResponse{
 		{chunks: []types.StreamResponse{
 			{ResponseType: types.ResponseTypeAnswer, Content: "partial draft"},
@@ -33,6 +33,7 @@ func TestStreamRetryReplacesFailedPartialAnswer(t *testing.T) {
 	var rendered string
 	replaces := 0
 	for _, data := range recorder.snapshot() {
+		require.NotContains(t, data.Content, "partial draft")
 		if data.Replace {
 			rendered = ""
 			replaces++
@@ -40,7 +41,7 @@ func TestStreamRetryReplacesFailedPartialAnswer(t *testing.T) {
 		rendered += data.Content
 	}
 	require.Equal(t, "final answer", rendered)
-	require.Equal(t, 1, replaces)
+	require.Zero(t, replaces)
 }
 
 func TestStreamFailureWithoutAnswerDoesNotEmitReplace(t *testing.T) {
@@ -61,7 +62,7 @@ func TestStreamFailureWithoutAnswerDoesNotEmitReplace(t *testing.T) {
 	}
 }
 
-func TestStreamCancellationKeepsPartialAnswer(t *testing.T) {
+func TestStreamCancellationDoesNotPublishAmbiguousReActDraft(t *testing.T) {
 	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
 		{ResponseType: types.ResponseTypeAnswer, Content: "partial draft"},
 		{ResponseType: types.ResponseTypeError, Content: "context canceled", Done: true},
@@ -77,9 +78,7 @@ func TestStreamCancellationKeepsPartialAnswer(t *testing.T) {
 		ctx, &messages, emptyTools(), &types.AgentState{}, "question", 0, "session",
 	)
 	require.Error(t, err)
-	for _, data := range recorder.snapshot() {
-		require.False(t, data.Replace, "cancellation has no retry; keep the partial answer")
-	}
+	require.Empty(t, recorder.snapshot(), "an unfinished ReAct body is not a confirmed answer")
 }
 
 func TestStreamSuccessDoesNotEmitReplace(t *testing.T) {

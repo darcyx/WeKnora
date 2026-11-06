@@ -14,6 +14,24 @@ import (
 
 func fastPolicy() RetryPolicy { return RetryPolicy{MaxRetries: 3} }
 
+func TestCallerManagedRecoveryDoesNotMultiplyTransportRetries(t *testing.T) {
+	for _, managed := range []bool{false, true} {
+		ctx := context.Background()
+		want := 4
+		if managed {
+			ctx = WithoutTransportRetries(ctx)
+			want = 1
+		}
+		attempts := 0
+		err := withRetry(ctx, fastPolicy(), "test", func() error {
+			attempts++
+			return &TransportError{Op: "send", Err: context.DeadlineExceeded}
+		})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Equal(t, want, attempts)
+	}
+}
+
 // The failure this helper exists to make impossible: every attempt fails at
 // the transport, and the caller gets an error rather than a nil response with
 // a nil error to check. The eight hand-written loops it replaces returned

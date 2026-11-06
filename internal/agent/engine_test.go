@@ -337,6 +337,12 @@ func withMaxContextTokens(n int) testEngineOption {
 	}
 }
 
+func withPlanningEnabled(enabled bool) testEngineOption {
+	return func(cfg *types.AgentConfig) {
+		cfg.PlanningEnabled = enabled
+	}
+}
+
 func TestWithinIterationBudgetUnlimited(t *testing.T) {
 	unlimited := newTestEngine(t, &mockChat{}, withMaxIterations(types.UnlimitedMaxIterations))
 	require.True(t, unlimited.withinIterationBudget(0))
@@ -698,6 +704,9 @@ func TestRedactHistoryKBResultsKeepsTurnID(t *testing.T) {
 	require.Len(t, redacted, 1)
 	require.NotEqual(t, "stale chunk", redacted[0].Content)
 	require.Equal(t, "turn-a", redacted[0].TurnID)
+	require.NotContains(t, redacted[0].Content, "Please perform a fresh search")
+	require.Contains(t, redacted[0].Content, "only if the current answer needs it")
+	require.Contains(t, redacted[0].Content, "does not reset retrieval state or budgets")
 }
 
 // History loads up to the whole window, past the compaction threshold, so the

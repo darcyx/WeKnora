@@ -175,6 +175,30 @@ func TestStreamFinalAnswer_DisablesThinking(t *testing.T) {
 	}
 }
 
+// Seen in production: with tools disabled the model replied with only a
+// hallucinated tool call, which used to finish the turn with a blank answer.
+func TestStreamFinalAnswer_ToolCallOnlyFallsBack(t *testing.T) {
+	model := &finalSynthesisChat{}
+	engine := newTestEngine(t, model, withMaxIterations(8))
+	var fallback bool
+	engine.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
+		fallback = fallback || ev.Data.(event.AgentFinalAnswerData).IsFallback
+		return nil
+	})
+	model.synthesize = func(context.Context, []chat.Message, *chat.ChatOptions) (<-chan types.StreamResponse, error) {
+		return finalSynthesisChunks(types.StreamResponse{
+			ResponseType: types.ResponseTypeToolCall, FinishReason: "tool_calls", Done: true,
+			ToolCalls: []types.LLMToolCall{{ID: "c1", Type: "function",
+				Function: types.FunctionCall{Name: "read_skill", Arguments: "{}"}}},
+		}), nil
+	}
+	state := &types.AgentState{CurrentRound: 8}
+	_, err := engine.executeLoop(t.Context(), state, "Summarize", emptyMessages(), nil, "session", "message")
+	require.NoError(t, err)
+	require.Equal(t, stalledAnswerFallback, state.FinalAnswer)
+	require.True(t, fallback)
+}
+
 func finalSynthesisInputTokens(e *AgentEngine, messages []chat.Message, opts *chat.ChatOptions) int {
 	return e.tokenEstimator.EstimateMessages(messages) + e.tokenEstimator.EstimateMessage(
 		&chat.Message{Role: "system", Content: opts.RuntimeNotice},

@@ -84,6 +84,22 @@ func TestRerankResults_modelErrorKeepsRawResults(t *testing.T) {
 	}
 }
 
+func TestExecuteReportsRerankModelError(t *testing.T) {
+	svc := &stubKnowledgeBaseService{results: []*types.SearchResult{{
+		ID: "c1", Content: "raw retrieved fact", KnowledgeID: "doc", KnowledgeBaseID: "kb", Score: 0.8,
+	}}}
+	tool := NewSearchKnowledgeTool(svc, nil, nil,
+		types.SearchTargets{{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb", TenantID: 1}},
+		&stubReranker{err: errors.New("upstream 500")}, nil)
+	result, err := tool.Execute(t.Context(), json.RawMessage(`{"query":"fact"}`))
+	if err != nil || result == nil || !result.Success {
+		t.Fatalf("raw retrieval fallback must remain usable: result=%+v err=%v", result, err)
+	}
+	if result.Data["rerank_outcome"] != string(types.RerankOutcomeModelError) || result.Data["count"] != 1 {
+		t.Fatalf("rerank degradation must accompany preserved results: %+v", result.Data)
+	}
+}
+
 // Scores below agentRerankFallbackMinScore mean nothing is relevant; the tool
 // must return empty instead of resurrecting the candidates.
 func TestRerankResults_allBelowFallbackFloorReturnsEmpty(t *testing.T) {

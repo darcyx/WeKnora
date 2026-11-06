@@ -70,36 +70,44 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 	"discover_mcp_tools": {opaqueOutput: true, mcpRoutingKey: "server_id", mcpDirectoryOutput: true},
 	"call_mcp_tool":      {opaqueOutput: true, mcpRoutingKey: "tool_ref"},
 	"read_file":          {},
+	"review_retrieval":   {sourceTextKeys: map[string]struct{}{"quotes": {}}},
 	"search_knowledge": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	// read_document takes one id that may name a document (doc://N) or a chunk
 	// (chunk://N); the "id" key resolves against both handle tables.
 	"read_document": {
-		sourceIDKeys: map[string]struct{}{"id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"id": {}},
+		sourceOutput:   true,
 	},
 	"list_documents": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_id": {}},
+		sourceOutput:   true,
 	},
 	// Retired retrieval tools keep their policies so stored histories that
 	// still carry their calls decode and compact exactly as they did.
 	"knowledge_search": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	"grep_chunks": {
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceOutput:   true,
 	},
 	"list_knowledge_chunks": {
-		sourceIDKeys: map[string]struct{}{"knowledge_id": {}, "faq_id": {}, "chunk_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_id": {}, "faq_id": {}, "chunk_id": {}},
+		sourceOutput:   true,
 	},
 	"get_document_info": {
-		sourceIDKeys: map[string]struct{}{"knowledge_ids": {}, "faq_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_ids": {}, "faq_ids": {}},
+		sourceOutput:   true,
 	},
 	// Past conversations carry no durable chunk or document IDs, so there is
 	// nothing to compact; the output is prose the model may quote.
@@ -109,8 +117,9 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 	// service, so there is nothing here for the model to hold a handle on.
 	"search_memory": {},
 	"query_knowledge_graph": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	toolDatabaseQuery: {
 		sourceTextKeys: map[string]struct{}{"sql": {}},
@@ -132,11 +141,13 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 		sourceOutput: true,
 	},
 	"wiki_read_page": {
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceOutput:   true,
 	},
 	"wiki_read_source_doc": {
-		sourceIDKeys: map[string]struct{}{"knowledge_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_id": {}},
+		sourceOutput:   true,
 	},
 	"wiki_write_page": {
 		sourceIDKeys: map[string]struct{}{"source_refs": {}},
@@ -148,8 +159,9 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 		sourceIDKeys: map[string]struct{}{"suspected_knowledge_ids": {}},
 	},
 	"wiki_search": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_id": {}, "knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_id": {}, "knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	toolWikiReadIssue: {
 		decodedIssueIDKeys:  map[string]struct{}{"issue_id": {}},
@@ -258,7 +270,7 @@ func sourceArgumentAllowed(toolName, key string) bool {
 	return ok
 }
 
-// sourceBareTextAllowed reports structured-text arguments (SQL) whose handles
+// sourceBareTextAllowed reports structured-text arguments (SQL and evidence quotes) whose handles
 // must decode to bare durable IDs rather than weknora:// URIs.
 func sourceBareTextAllowed(toolName, key string) bool {
 	policy, ok := toolHandlePolicies[toolName]

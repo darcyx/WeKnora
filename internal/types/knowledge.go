@@ -269,7 +269,10 @@ func (k *Knowledge) CustomMetadataText() string {
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
-		keys = append(keys, key)
+		// Older imports may have copied ingestion settings into custom metadata.
+		if key != metadataKeyProcessOverrides {
+			keys = append(keys, key)
+		}
 	}
 	sort.Strings(keys)
 	lines := make([]string, 0, len(keys))

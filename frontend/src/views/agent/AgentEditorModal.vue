@@ -915,6 +915,17 @@
             </div>
           </div>
 
+          <!-- 计划-执行分解（仅智能推理模式：复杂查询先拆成步骤计划再进 ReAct 循环） -->
+          <div v-if="isAgentMode" class="setting-row">
+            <div class="setting-info">
+              <label>{{ $t('agent.editor.planningEnabled') }}</label>
+              <p class="desc">{{ $t('agentEditor.desc.planningEnabled') }}</p>
+            </div>
+            <div class="setting-control">
+              <t-switch v-model="formData.config.planning_enabled" />
+            </div>
+          </div>
+
           <!-- 问题改写（仅多轮对话开启且普通模式时显示） -->
           <div v-if="formData.config.multi_turn_enabled && !isAgentMode" class="setting-row">
             <div class="setting-info">
@@ -2959,6 +2970,7 @@ const defaultFormData = {
     multi_turn_enabled: false,
     history_turns: 5,
     retain_retrieval_history: false,
+    planning_enabled: false,
     // 长期记忆：默认跟随空间设置。写 true 与不写等价，只有 false 才会
     // 让这个智能体单独不读记忆。
     memory_enabled: true,

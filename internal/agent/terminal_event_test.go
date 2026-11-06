@@ -122,6 +122,11 @@ func TestExecuteLoop_AllEmptyResponses_FallbackIsSoleTerminalAnswer(t *testing.T
 	engine := newTestEngine(t, mock)
 	recorder := &terminalAnswerRecorder{}
 	recorder.attach(engine.eventBus)
+	var fallback bool
+	engine.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
+		fallback = fallback || ev.Data.(event.AgentFinalAnswerData).IsFallback
+		return nil
+	})
 
 	state := &types.AgentState{}
 	_, err := engine.executeLoop(
@@ -141,6 +146,7 @@ func TestExecuteLoop_AllEmptyResponses_FallbackIsSoleTerminalAnswer(t *testing.T
 	done, content := recorder.snapshot()
 	assert.Equal(t, 1, done, "retries exhausted must still emit exactly one terminal answer event")
 	assert.Contains(t, content, "unable to generate a response", "the terminal answer must be the fallback text")
+	assert.True(t, fallback, "recommendation suppression must recognize runtime fallback answers")
 }
 
 func TestEmptyResponseRecoveryPreservesUserIntentAndTools(t *testing.T) {

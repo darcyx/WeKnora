@@ -62,12 +62,6 @@ func (s *sessionService) AgentQA(
 	// bind script execution to a per-session MicroVM instance.
 	ctx = types.WithSessionID(ctx, sessionID)
 	ctx = types.WithRunMode(ctx, req.Mode)
-	sessionJSON, err := json.Marshal(req.Session)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal session, session ID: %s, error: %v", sessionID, err)
-		return fmt.Errorf("failed to marshal session: %w", err)
-	}
-
 	// customAgent is required for AgentQA (handler has already done permission check for shared agent)
 	if req.CustomAgent == nil {
 		logger.Warnf(ctx, "Custom agent not provided for session: %s", sessionID)
@@ -76,8 +70,8 @@ func (s *sessionService) AgentQA(
 
 	// Resolve retrieval tenant using shared helper
 	agentTenantID := s.resolveRetrievalTenantID(ctx, req)
-	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query: %s, session: %s",
-		sessionID, agentTenantID, req.Query, string(sessionJSON))
+	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query length: %d",
+		sessionID, agentTenantID, len([]rune(req.Query)))
 
 	var tenantInfo *types.Tenant
 	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
@@ -320,6 +314,16 @@ func (s *sessionService) AgentQA(
 		return err
 	}
 
+	if receiver, ok := engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
+		receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
+	}
+	if err := s.bindAgentRetrievalState(ctx, req, agentConfig, engine); err != nil {
+		return err
+	}
+	if receiver, ok := engine.(interface{ SetFAQResolver(agent.FAQResolver) }); ok && faqRequestEligible(req, agentConfig) {
+		receiver.SetFAQResolver(s.agentFAQResolver(req, agentConfig, summaryModel, rerankModel, llmContext))
+	}
+
 	// Recall long-term memory for this turn. Like the RAG path this is a
 	// no-model read, and an agent may opt out of it entirely.
 	memoryCtx := types.ApplyAgentMemoryPreference(ctx, agentConfig.MemoryEnabled)
@@ -422,17 +426,8 @@ func (s *sessionService) AgentQA(
 		_, err = engine.Execute(ctx, sessionID, req.AssistantMessageID, agentQuery, llmContext, agentImageURLs)
 	}
 	if err != nil {
+		// The engine has already emitted EventError for this failure.
 		logger.Errorf(ctx, "Agent execution failed: %v", err)
-		// Emit error event to the EventBus used by this agent
-		eventBus.Emit(ctx, event.Event{
-			Type:      event.EventError,
-			SessionID: sessionID,
-			Data: event.ErrorData{
-				Error:     err.Error(),
-				Stage:     "agent_execution",
-				SessionID: sessionID,
-			},
-		})
 	}
 	// Return empty - events will be handled by Handler via EventBus subscription
 	return nil
@@ -526,6 +521,7 @@ func (s *sessionService) buildAgentConfig(
 	customAgent := req.CustomAgent
 	agentConfig := &types.AgentConfig{
 		MaxIterations:                 customAgent.Config.MaxIterations,
+		PlanningEnabled:               customAgent.Config.PlanningEnabled,
 		Temperature:                   customAgent.Config.Temperature,
 		WebSearchEnabled:              customAgent.Config.WebSearchEnabled && req.WebSearchEnabled,
 		LocalBrowserEnabled:           req.LocalBrowserEnabled,
