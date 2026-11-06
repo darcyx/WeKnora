@@ -64,9 +64,10 @@ func TestRetrievalBoundaryFirstSearchRepairsRedundantMetadata(t *testing.T) {
 
 	model.reply = `{"decision":"reuse","gap_id":"gap-1","reason":"payment options and payment methods require the same answer"}`
 	duplicate := retrievalProbeCall(e, "duplicate", agenttools.ToolSearchKnowledge, `{"query":"支付手段","retrieval":{"action":"initial","goal_quote":"海外支持哪些支付方式和有没有参数需要申请","fact":"海外支付手段","conditions":"海外"}}`)
-	require.True(t, duplicate.Result.Success, duplicate.Result.Error)
-	require.Len(t, tool.calls, 3)
-	require.Len(t, e.retrieval.snapshot().Attempts, 3)
+	require.False(t, duplicate.Result.Success, "a reworded initial search cannot bypass the two-call allowance")
+	require.Contains(t, duplicate.Result.Error, "already been searched")
+	require.Len(t, tool.calls, 2)
+	require.Len(t, e.retrieval.snapshot().Attempts, 2)
 }
 
 func TestRetrievalBoundaryReusesUnsearchedFact(t *testing.T) {
