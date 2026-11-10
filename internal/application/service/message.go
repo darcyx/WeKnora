@@ -24,6 +24,7 @@ var regThinkIndex = regexp.MustCompile(`(?s)<think>.*?</think>`)
 // It reads the chat history knowledge base configuration from the tenant's ChatHistoryConfig,
 // which is managed via the settings UI.
 type messageService struct {
+	chunkRepo      interfaces.ChunkRepository
 	messageRepo    interfaces.MessageRepository    // Repository for message storage operations
 	sessionRepo    interfaces.SessionRepository    // Repository for session validation
 	tenantService  interfaces.TenantService        // Service for tenant operations (read ChatHistoryConfig)
@@ -43,8 +44,10 @@ func NewMessageService(messageRepo interfaces.MessageRepository,
 	modelService interfaces.ModelService,
 	suggestionRepo interfaces.MessageSuggestionRepository,
 	historyRedis *redis.Client,
+	chunkRepo interfaces.ChunkRepository,
 ) interfaces.MessageService {
 	return &messageService{
+		chunkRepo:      chunkRepo,
 		messageRepo:    messageRepo,
 		sessionRepo:    sessionRepo,
 		tenantService:  tenantService,
@@ -338,13 +341,18 @@ func (s *messageService) ClearSessionMessages(ctx context.Context, sessionID str
 		return err
 	}
 
-	// Async cleanup: delete associated Knowledge entries from the chat history KB
-	bgCtx := context.WithoutCancel(ctx)
-	go s.DeleteSessionKnowledge(bgCtx, sessionID)
+	// Capture references before deleting the rows the cleanup used to read.
+	knowledgeIDs, err := s.messageRepo.GetKnowledgeIDsBySessionID(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("load chat history references before clearing session: %w", err)
+	}
 
 	if err := s.messageRepo.DeleteMessagesBySessionID(ctx, sessionID); err != nil {
 		logger.Errorf(ctx, "Failed to delete messages for session %s: %v", sessionID, err)
 		return err
+	}
+	if len(knowledgeIDs) > 0 {
+		go s.deleteSessionKnowledgeIDs(context.WithoutCancel(ctx), sessionID, knowledgeIDs)
 	}
 	if s.suggestionRepo != nil {
 		if err := s.suggestionRepo.DeleteBySessionID(ctx, tenantID, sessionID); err != nil {
@@ -483,7 +491,10 @@ func (s *messageService) DeleteSessionKnowledge(ctx context.Context, sessionID s
 		logger.Warnf(ctx, "Failed to get knowledge IDs for session %s: %v", sessionID, err)
 		return
 	}
+	s.deleteSessionKnowledgeIDs(ctx, sessionID, knowledgeIDs)
+}
 
+func (s *messageService) deleteSessionKnowledgeIDs(ctx context.Context, sessionID string, knowledgeIDs []string) {
 	if len(knowledgeIDs) == 0 {
 		return
 	}

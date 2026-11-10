@@ -1,3 +1,4 @@
+import { feedbackAdminEN } from '../feedbackAdminMessages'
 import common from './ko-KR/common.ts'
 import auth from './ko-KR/auth.ts'
 import chat from './ko-KR/chat.ts'
@@ -9,6 +10,7 @@ import settings from './ko-KR/settings.ts'
 import system from './ko-KR/system.ts'
 
 export default {
+  feedbackAdmin: feedbackAdminEN,
   ...common,
   ...auth,
   ...chat,

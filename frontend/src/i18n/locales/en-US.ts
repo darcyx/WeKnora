@@ -1,3 +1,4 @@
+import { feedbackAdminEN } from '../feedbackAdminMessages'
 import common from './en-US/common.ts'
 import auth from './en-US/auth.ts'
 import chat from './en-US/chat.ts'
@@ -9,6 +10,7 @@ import settings from './en-US/settings.ts'
 import system from './en-US/system.ts'
 
 export default {
+  feedbackAdmin: feedbackAdminEN,
   ...common,
   ...auth,
   ...chat,

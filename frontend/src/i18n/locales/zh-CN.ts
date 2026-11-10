@@ -8,7 +8,9 @@ import model from './zh-CN/model.ts'
 import settings from './zh-CN/settings.ts'
 import system from './zh-CN/system.ts'
 
+import { feedbackAdminZH } from '../feedbackAdminMessages'
 export default {
+  feedbackAdmin: feedbackAdminZH,
   ...common,
   ...auth,
   ...chat,

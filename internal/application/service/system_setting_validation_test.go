@@ -68,3 +68,18 @@ func TestValidateRegistrationModes(t *testing.T) {
 		t.Fatal("unknown registration mode accepted")
 	}
 }
+
+func TestTokenQuotaDefaultLimits(t *testing.T) {
+	for _, key := range []string{
+		TokenQuotaDefaultDailyLimitSetting,
+		TokenQuotaDefaultMonthlyLimitSetting,
+	} {
+		entry, ok := registry[key]
+		if !ok {
+			t.Fatalf("missing token quota setting %q", key)
+		}
+		if entry.Default != int64(200_000_000) {
+			t.Fatalf("%s default = %v, want 200000000", key, entry.Default)
+		}
+	}
+}

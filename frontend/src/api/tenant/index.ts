@@ -92,6 +92,8 @@ export type TenantAPIKeyCapability =
   | 'system_runtime_read'
   | 'system_runtime_manage'
   | 'system_audit_read'
+  | 'system_token_quota_read'
+  | 'system_token_quota_manage'
 
 export interface TenantAPIKey {
   id: number
