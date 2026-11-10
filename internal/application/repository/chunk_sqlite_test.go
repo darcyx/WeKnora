@@ -378,7 +378,7 @@ func TestListPagedChunksByKnowledgeID_StableFAQOrdering(t *testing.T) {
 		chunk.CreatedAt = updatedAt
 		chunk.UpdatedAt = updatedAt
 	}
-	require.NoError(t, db.Create(&chunks).Error)
+	require.NoError(t, repo.CreateChunks(ctx, chunks))
 
 	listPage := func(pageNumber int, sortOrder string) []*types.Chunk {
 		page, total, err := repo.ListPagedChunksByKnowledgeID(

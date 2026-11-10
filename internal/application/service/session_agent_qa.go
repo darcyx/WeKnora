@@ -544,6 +544,7 @@ func (s *sessionService) buildAgentConfig(
 		LLMCallTimeout:                customAgent.Config.LLMCallTimeout,
 		MaxCompletionTokens:           customAgent.Config.MaxCompletionTokens,
 		RetainRetrievalHistory:        customAgent.Config.RetainRetrievalHistory,
+		AppInfo:                       req.AppInfo,
 		SharedAgentReadOnly:           req.SharedAgentReadOnly,
 		AssistantAccess:               types.CapAccessLevel(req.AssistantAccess, customAgent.Config.AccessLevel),
 		// The model is always told it may call tools in parallel; without

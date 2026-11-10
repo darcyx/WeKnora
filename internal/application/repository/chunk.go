@@ -313,11 +313,11 @@ func (r *chunkRepository) ListPagedChunksByKnowledgeID(
 	// Determine sort order based on knowledge type
 	var orderClause string
 	if knowledgeType == types.KnowledgeTypeFAQ {
-		// FAQ: sort by updated_at, then ID to keep pagination stable when
-		// bulk imports give multiple entries the same timestamp.
-		orderClause = "updated_at DESC, id DESC"
+		// FAQ: sort by updated_at. SeqID makes offset pages deterministic for a
+		// fixed result set when multiple entries share an update timestamp.
+		orderClause = "updated_at DESC, seq_id DESC"
 		if sortOrder == "asc" {
-			orderClause = "updated_at ASC, id ASC"
+			orderClause = "updated_at ASC, seq_id ASC"
 		}
 	} else {
 		// Document: sort by chunk_index
@@ -1012,7 +1012,7 @@ func (r *chunkRepository) ListAllFAQChunksForExport(
 	for {
 		var batchChunks []*types.Chunk
 		if err := r.db.WithContext(ctx).
-			Select("id, metadata, tag_id, is_enabled, flags").
+			Select("id, seq_id, metadata, tag_id, is_enabled, flags").
 			Where("tenant_id = ? AND knowledge_id = ? AND chunk_type = ? AND status = ?",
 				tenantID, knowledgeID, types.ChunkTypeFAQ, types.ChunkStatusIndexed).
 			Order("created_at ASC").

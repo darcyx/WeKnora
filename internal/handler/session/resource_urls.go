@@ -115,8 +115,9 @@ func buildStreamResponseFor(
 	evt interfaces.StreamEvent,
 	requestID string,
 	rewriter *storageurl.StreamRewriter,
+	messageIDs ...string,
 ) *types.StreamResponse {
-	response := buildStreamResponse(evt, requestID)
+	response := buildStreamResponse(evt, requestID, messageIDs...)
 	if !rewriter.Enabled() {
 		return response
 	}
@@ -143,10 +144,11 @@ func emitStreamEvent(
 	evt interfaces.StreamEvent,
 	requestID string,
 	rewriter *storageurl.StreamRewriter,
+	messageIDs ...string,
 ) {
-	response := buildStreamResponseFor(ctx, evt, requestID, rewriter)
+	response := buildStreamResponseFor(ctx, evt, requestID, rewriter, messageIDs...)
 	if terminalResponseTypes[evt.Type] {
-		flushHeldStreamContent(ctx, c, requestID, rewriter)
+		flushHeldStreamContent(ctx, c, requestID, rewriter, messageIDs...)
 	}
 	c.SSEvent("message", response)
 	c.Writer.Flush()
@@ -167,6 +169,7 @@ func flushHeldStreamContent(
 	c *gin.Context,
 	requestID string,
 	rewriter *storageurl.StreamRewriter,
+	messageIDs ...string,
 ) {
 	held := rewriter.FlushAll(ctx)
 	if len(held) == 0 || c.Request.Context().Err() != nil {
@@ -180,12 +183,20 @@ func flushHeldStreamContent(
 		logger.Debugf(ctx, "Flushing held stream fragment, type: %s, event: %s", responseType, eventID)
 		c.SSEvent("message", &types.StreamResponse{
 			ID:           requestID,
+			MessageID:    firstMessageID(messageIDs),
 			ResponseType: responseType,
 			Content:      fragment.Content,
 			Data:         heldFragmentData(fragment.Meta, eventID),
 		})
 		c.Writer.Flush()
 	}
+}
+
+func firstMessageID(messageIDs []string) string {
+	if len(messageIDs) == 0 {
+		return ""
+	}
+	return messageIDs[0]
 }
 
 // heldFragmentData rebuilds the metadata for a released tail from the event it

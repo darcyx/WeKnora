@@ -84,6 +84,7 @@ type qaRequestContext struct {
 	userCreatedAt         time.Time                // Persisted user message timestamp, echoed on agent_query
 	channel               string                   // Source channel: "web", "api", "im", etc.
 	attachments           types.MessageAttachments // Processed base64 file attachments (legacy inline uploads)
+	appInfo               string                   // Compact JSON serialized from the request ext object
 	attachmentIDs         []string                 // Pre-uploaded session-scoped document IDs, resolved after SSE starts
 	attachmentMetas       types.MessageAttachments // Metadata-only view of attachmentIDs for the persisted user message
 	suggestionAttribution *types.SuggestionAttribution
@@ -159,6 +160,7 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 		WebSearchEnabled:    rc.webSearchEnabled,
 		LocalBrowserEnabled: rc.localBrowserEnabled,
 		Attachments:         rc.attachments,
+		AppInfo:             rc.appInfo,
 		QuestionOrigin:      rc.questionOrigin,
 		PageContext:         rc.pageContext,
 		AssistantAccess:     rc.assistantAccess,
@@ -192,6 +194,54 @@ func uploadOnlyQuery(ctx context.Context, req *CreateKnowledgeQARequest) string 
 		return ""
 	}
 	return types.UploadOnlyQuestion(types.LanguageFromContextOrDefault(ctx))
+}
+
+// marshalAppInfo copies the extension object as compact JSON for the current
+// agent turn, retaining backend tokens while omitting other credential fields.
+// Tokens remain available to skills that call backend APIs. An empty
+// ext object means there is no <app_info> block to inject.
+func marshalAppInfo(ext map[string]interface{}) (string, error) {
+	if len(ext) == 0 {
+		return "", nil
+	}
+	payload, err := json.Marshal(redactAppInfo(ext))
+	if err != nil {
+		return "", fmt.Errorf("marshal ext app info: %w", err)
+	}
+	return string(payload), nil
+}
+
+// redactAppInfo returns a copy of v without keys that name credentials.
+func redactAppInfo(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for key, value := range typed {
+			if isCredentialKey(key) {
+				continue
+			}
+			out[key] = redactAppInfo(value)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(typed))
+		for i, value := range typed {
+			out[i] = redactAppInfo(value)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func isCredentialKey(key string) bool {
+	key = strings.ToLower(key)
+	for _, marker := range []string{"password", "secret", "authorization", "apikey", "api_key", "cookie"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseQARequest parses and validates a QA request, returns the request context
@@ -250,6 +300,11 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		}
 		request.Query = ""
 	}
+	appInfo, err := marshalAppInfo(request.Ext)
+	if err != nil {
+		logger.Errorf(ctx, "[%s] Failed to marshal ext app info: %v", logPrefix, err)
+		return nil, nil, errors.NewBadRequestError("ext must be valid JSON")
+	}
 
 	// Resolve the storage-reference representation up front: once the SSE stream
 	// has started an invalid value can no longer be reported as a 400.
@@ -273,7 +328,13 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	}
 
 	// Log request details
-	if requestJSON, err := json.Marshal(request); err == nil {
+	requestForLog := request
+	if len(requestForLog.Ext) > 0 {
+		// ext may contain credentials such as app_secret. It still flows to the
+		// model as requested, but must never be copied into application logs.
+		requestForLog.Ext = map[string]interface{}{"_redacted": true}
+	}
+	if requestJSON, err := json.Marshal(requestForLog); err == nil {
 		logger.Infof(ctx, "[%s] Request: session_id=%s, request=%s",
 			logPrefix, sessionID, secutils.SanitizeForLog(secutils.CompactImageDataURLForLog(string(requestJSON))))
 	}
@@ -531,6 +592,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		images:                request.Images,
 		channel:               request.Channel,
 		attachments:           processedAttachments,
+		appInfo:               appInfo,
 		attachmentIDs:         attachmentIDs,
 		attachmentMetas:       attachmentMetas,
 		suggestionAttribution: request.SuggestionAttribution,
