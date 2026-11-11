@@ -239,6 +239,10 @@ scripts/build-anydoc-lib.sh                          # host platform
 TARGET=aarch64-unknown-linux-musl scripts/build-anydoc-lib.sh
 ```
 
+Linux builds also require a target-compatible `objcopy` (from binutils).
+The script removes embedded LLVM bitcode sections from the packaged archive
+so Go's cgo validation accepts it; the native machine code is retained.
+
 Then build WeKnora with the engine linked in:
 
 ```bash

@@ -137,5 +137,12 @@ dest="$crate_dir/lib/$lib_dir"
 mkdir -p "$dest"
 cp "$crate_dir/target/$target/release/$lib_name" "$dest/$lib_name"
 
+case "$target" in
+  *-linux-*)
+    # Rust archives carry LLVM bitcode that Go's cgo object validation rejects.
+    objcopy --remove-section=.llvmbc --remove-section=.llvmcmd "$dest/$lib_name"
+    ;;
+esac
+
 echo "Wrote $dest/$lib_name"
 echo "Build WeKnora with the archive: go build -tags anydoc ./cmd/server"

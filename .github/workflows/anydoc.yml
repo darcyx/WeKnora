@@ -10,12 +10,14 @@ on:
     paths:
       - "third_party/anydoc-go/**"
       - "scripts/build-anydoc-lib.sh"
+      - "scripts/test-build-anydoc-lib.sh"
       - "internal/infrastructure/docparser/**"
       - ".github/workflows/anydoc.yml"
   pull_request:
     paths:
       - "third_party/anydoc-go/**"
       - "scripts/build-anydoc-lib.sh"
+      - "scripts/test-build-anydoc-lib.sh"
       - "internal/infrastructure/docparser/**"
       - ".github/workflows/anydoc.yml"
   workflow_dispatch:
@@ -43,6 +45,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Test archive packaging
+        run: bash scripts/test-build-anydoc-lib.sh
 
       - uses: dtolnay/rust-toolchain@stable
 
