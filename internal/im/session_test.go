@@ -271,11 +271,11 @@ func TestPickIMStoredAnswerPrefersFirstNonEmpty(t *testing.T) {
 	}
 }
 
-func TestMergeIMAgentAnswerBuffersUsesLiveThenComplete(t *testing.T) {
+func TestMergeIMAgentAnswerBuffersFallsBackToLive(t *testing.T) {
 	var builder, outer, live strings.Builder
 	live.WriteString("live answer")
 
-	mergeIMAgentAnswerBuffers(&builder, &outer, &live, "complete final")
+	mergeIMAgentAnswerBuffers(&builder, &outer, live.String(), "")
 	if builder.String() != "live answer" {
 		t.Fatalf("builder = %q, want live answer", builder.String())
 	}
@@ -285,8 +285,7 @@ func TestMergeIMAgentAnswerBuffersUsesLiveThenComplete(t *testing.T) {
 
 	builder.Reset()
 	outer.Reset()
-	live.Reset()
-	mergeIMAgentAnswerBuffers(&builder, &outer, &live, "complete final")
+	mergeIMAgentAnswerBuffers(&builder, &outer, live.String(), "complete final")
 	if builder.String() != "complete final" {
 		t.Fatalf("builder = %q, want complete final", builder.String())
 	}

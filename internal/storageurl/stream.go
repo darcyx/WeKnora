@@ -136,6 +136,13 @@ func (s *StreamRewriter) Rewriter() *Rewriter {
 	return s.rewriter
 }
 
+// Discard drops a buffered tail when the producer replaces its whole segment.
+func (s *StreamRewriter) Discard(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.held, key)
+}
+
 // Push feeds the next chunk of the stream identified by key and returns the
 // rewritten content that is ready to emit. Set flush on the stream's terminal
 // chunk to release any held tail. meta is retained opaquely alongside the tail

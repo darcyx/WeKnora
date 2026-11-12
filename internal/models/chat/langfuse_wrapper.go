@@ -249,6 +249,9 @@ func buildLangfuseModelParams(opts *ChatOptions) map[string]interface{} {
 	if budget := opts.CompletionBudget(); budget > 0 {
 		params["max_completion_tokens"] = budget
 	}
+	if level, requested := opts.Reasoning(); requested {
+		params["requested_reasoning_effort"] = string(level)
+	}
 	if opts.FrequencyPenalty != 0 {
 		params["frequency_penalty"] = opts.FrequencyPenalty
 	}

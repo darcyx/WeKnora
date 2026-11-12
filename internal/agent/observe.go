@@ -401,6 +401,9 @@ func (e *AgentEngine) analyzeResponse(
 			answer = "Sorry, this request was blocked by the content safety policy. Please try rephrasing your question."
 		}
 
+		if response.AnswerStreamed && response.AnswerEventID != "" && response.Content != "" {
+			return responseVerdict{isDone: true, finalAnswer: answer, step: step, answerID: response.AnswerEventID}
+		}
 		answerID := generateEventID("answer")
 		e.eventBus.Emit(ctx, event.Event{
 			ID:        answerID,

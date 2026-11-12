@@ -946,7 +946,7 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool, m
 	}
 
 	// Setup stop event handler
-	h.setupStopEventHandler(eventBus, reqCtx.sessionID, reqCtx.session.TenantID, reqCtx.assistantMessage, cancel)
+	h.setupStopEventHandler(eventBus, reqCtx.sessionID, reqCtx.session.TenantID, reqCtx.assistantMessage, cancel, mode)
 
 	// Watch for stop events independently of the client SSE connection so a
 	// user-requested stop reliably cancels generation even when the client
@@ -1256,7 +1256,7 @@ func (h *Handler) AgentQA(c *gin.Context) {
 
 	// Route to appropriate handler based on agent mode
 	if agentModeEnabled {
-		h.executeQA(reqCtx, qaModeAgent, true)
+		h.executeQA(reqCtx, qaModeAgent, !request.DisableTitle)
 	} else {
 		logger.Infof(reqCtx.ctx, "Agent mode disabled, delegating to normal mode for session: %s", reqCtx.sessionID)
 		h.executeQA(reqCtx, qaModeNormal, !request.DisableTitle)
@@ -1602,20 +1602,24 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	asyncDone := make(chan struct{})
 	go func() {
 		defer close(asyncDone)
+		stageName := "knowledge_qa_execution"
+		if mode == qaModeAgent {
+			stageName = "agent_execution"
+		}
+		reportFailure := func(reason string) {
+			_ = streamCtx.eventBus.Emit(context.WithoutCancel(streamCtx.asyncCtx), event.Event{
+				ID: uuid.NewString(), Type: event.EventError, SessionID: sessionID,
+				Data: event.ErrorData{Error: reason, Stage: stageName, SessionID: sessionID},
+			})
+		}
 		defer func() {
 			if r := recover(); r != nil {
-				if streamCtx.releaseTurn != nil {
-					streamCtx.releaseTurn()
-				}
 				buf := make([]byte, 10240)
-				runtime.Stack(buf, true)
-				stageName := "Knowledge QA"
-				if mode == qaModeAgent {
-					stageName = "Agent QA"
-				}
+				n := runtime.Stack(buf, false)
 				logger.ErrorWithFields(streamCtx.asyncCtx,
-					errors.NewInternalServerError(fmt.Sprintf("%s service panicked: %v\n%s", stageName, r, string(buf))),
+					errors.NewInternalServerError(fmt.Sprintf("%s service panicked: %v\n%s", stageName, r, buf[:n])),
 					map[string]interface{}{"session_id": sessionID})
+				reportFailure(qaFailureContent)
 			}
 			// Agent mode: complete the assistant message in defer (normal mode does it via event handler)
 			if mode == qaModeAgent {
@@ -1650,9 +1654,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 						injected = streamCtx.steerSink.InjectedIDs()
 					}
 					h.discardSteerBacklog(updateCtx, sessionID, streamCtx.assistantMessage.ID, injected)
-					h.completeStreamAssistantMessage(
-						updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID,
-					)
+					h.completeStreamAssistantMessage(updateCtx, streamCtx, "", "")
 				} else {
 					kicked := h.kickNextRunFromSteerBacklog(updateCtx, reqCtx, streamCtx)
 					h.completeStreamAssistantMessage(
@@ -1695,36 +1697,21 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		qaReq := reqCtx.buildQARequest()
 
 		var serviceErr error
-		var stageName string
 		if mode == qaModeNormal {
-			stageName = "knowledge_qa_execution"
 			serviceErr = h.sessionService.KnowledgeQA(streamCtx.asyncCtx, qaReq, streamCtx.eventBus)
 		} else {
-			stageName = "agent_execution"
 			serviceErr = h.sessionService.AgentQA(streamCtx.asyncCtx, qaReq, streamCtx.eventBus)
 		}
 
 		if serviceErr != nil {
-			if mode == qaModeNormal && streamCtx.releaseTurn != nil {
-				streamCtx.releaseTurn()
-			}
-			// A user-requested stop cancels asyncCtx, which surfaces here as a
-			// context cancellation. That is an expected outcome, not a failure:
-			// the stop event already notifies the client, so don't emit a
-			// spurious error event (which would otherwise show an error toast).
-			if streamCtx.asyncCtx.Err() != nil {
+			if cause := context.Cause(streamCtx.asyncCtx); stderrors.Is(cause, context.Canceled) {
 				logger.Infof(streamCtx.asyncCtx, "QA cancelled by user stop for session: %s", sessionID)
 			} else {
+				if cause != nil {
+					serviceErr = cause
+				}
 				logger.ErrorWithFields(streamCtx.asyncCtx, serviceErr, nil)
-				streamCtx.eventBus.Emit(streamCtx.asyncCtx, event.Event{
-					Type:      event.EventError,
-					SessionID: sessionID,
-					Data: event.ErrorData{
-						Error:     serviceErr.Error(),
-						Stage:     stageName,
-						SessionID: sessionID,
-					},
-				})
+				reportFailure(serviceErr.Error())
 			}
 		}
 	}()
@@ -2207,9 +2194,9 @@ func (h *Handler) completeQuickAnswerTurn(
 	}
 }
 
-// quickAnswerFailureContent is persisted when a pipeline error carries no
+// qaFailureContent is persisted when a pipeline error carries no
 // message, so the failed turn does not save an empty answer.
-const quickAnswerFailureContent = "Failed to generate the answer"
+const qaFailureContent = "Failed to generate the answer"
 
 // registerQuickAnswerFailureHandler completes and persists the assistant
 // message when the quick-answer pipeline reports EventError. The empty query
@@ -2227,7 +2214,7 @@ func (h *Handler) registerQuickAnswerFailureHandler(
 
 		errorContent := strings.TrimSpace(data.Error)
 		if errorContent == "" {
-			errorContent = quickAnswerFailureContent
+			errorContent = qaFailureContent
 		}
 		msg := streamCtx.assistantMessage
 		// Keep any partial answer the stream produced before failing and
@@ -2279,6 +2266,9 @@ func (h *Handler) completeStreamAssistantMessage(
 			return
 		}
 	}
+	if streamCtx.streamHandler != nil && streamCtx.streamHandler.executionError != nil {
+		query, userMessageID = "", ""
+	}
 	persist := func() error {
 		return h.completeAssistantMessage(ctx, streamCtx.assistantMessage, query, userMessageID)
 	}
@@ -2318,6 +2308,9 @@ func (h *Handler) completeAssistantMessage(
 		return err
 	}
 	h.ackBackgroundNotices(ctx, assistantMessage)
+	if userQuery == "" {
+		return nil
+	}
 
 	// Asynchronously index the Q&A pair into the chat history knowledge base for vector search.
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
@@ -2326,7 +2319,7 @@ func (h *Handler) completeAssistantMessage(
 		go h.messageService.IndexMessageToKB(
 			indexCtx, userQuery, assistantMessage.Content, assistantMessage.ID, assistantMessage.SessionID)
 	}
-	if userQuery != "" && h.suggestionService != nil {
+	if h.suggestionService != nil {
 		go func() {
 			if _, err := h.suggestionService.EnsureFollowUps(
 				bgCtx, assistantMessage.SessionID, assistantMessage.ID, false,
@@ -2335,9 +2328,7 @@ func (h *Handler) completeAssistantMessage(
 			}
 		}()
 	}
-	if userQuery != "" {
-		go h.recordTurnMemory(bgCtx, assistantMessage, userQuery, userMessageID)
-	}
+	go h.recordTurnMemory(bgCtx, assistantMessage, userQuery, userMessageID)
 	return nil
 }
 

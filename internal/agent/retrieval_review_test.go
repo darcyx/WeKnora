@@ -241,12 +241,13 @@ func TestRetrievalWaitingForEvidenceIsNotUserClarification(t *testing.T) {
 	require.Len(t, probe.calls, 1)
 }
 
-func TestRetrievalClarificationPublishesOnlyTheQuestion(t *testing.T) {
+func TestRetrievalClarificationReplacesTheFinalDraft(t *testing.T) {
 	e, probe := newRetrievalProbeEngine(t)
 	question := "请问是否已扣款？请提供订单号。"
+	preamble := "用户只说了支付未到账，缺少关键条件。"
 	model := &mockChat{responses: []mockResponse{
 		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer,
-			Content: "用户只说了支付未到账，缺少关键条件。", Done: true, FinishReason: "tool_calls",
+			Content: preamble, Done: true, FinishReason: "tool_calls",
 			ToolCalls: []types.LLMToolCall{{ID: "clarification-state", Function: types.FunctionCall{
 				Name: reviewRetrievalTool, Arguments: `{"new_fact":{"goal_quote":"支付未到账","fact":"支付到账情况"},"status":"needs_user","missing_user_fields":["扣款情况","订单号"]}`,
 			}}}}}},
@@ -263,7 +264,7 @@ func TestRetrievalClarificationPublishesOnlyTheQuestion(t *testing.T) {
 	state, err := e.executeLoop(context.Background(), state, "支付未到账", emptyMessages(), e.buildToolsForLLM(), "session", "message")
 	require.NoError(t, err)
 	require.Equal(t, "方便提供一下扣款情况、订单号吗？", state.FinalAnswer)
-	require.Equal(t, state.FinalAnswer, published, "the controller's missing fields govern the published clarification")
+	require.Equal(t, preamble+state.FinalAnswer, published, "upstream streams the preamble; known missing fields still govern the final clarification")
 	require.Len(t, model.calls, 2, "no separate classifier or supervisor call is introduced")
 	require.Empty(t, probe.calls)
 	require.Equal(t, retrievalNeedsUser, e.retrieval.snapshot().Gaps[0].Status)

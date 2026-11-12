@@ -530,6 +530,11 @@ func (e *AgentEngine) Execute(
 }
 
 func (e *AgentEngine) emitExecutionError(ctx context.Context, sessionID string, err error) {
+	if cause := context.Cause(ctx); errors.Is(cause, context.Canceled) {
+		return
+	} else if cause != nil {
+		err = cause
+	}
 	logger.Errorf(ctx, "[Agent] Execution failed: %v", err)
 	if emitErr := e.eventBus.Emit(ctx, event.Event{
 		ID: generateEventID("error"), Type: event.EventError, SessionID: sessionID,
@@ -713,6 +718,16 @@ func (g *loopGuards) resetRepeatedToolCallStreak() {
 	g.repeatedToolCallNudged = false
 }
 
+// retractAnswer removes the visible draft before another answer takes its place.
+func (e *AgentEngine) retractAnswer(ctx context.Context, sessionID, answerID string) {
+	if answerID != "" {
+		_ = e.eventBus.Emit(ctx, event.Event{
+			ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+			Data: event.AgentFinalAnswerData{Replace: true},
+		})
+	}
+}
+
 // closeAnswerStream emits the Done:true marker for an answer that is actually
 // finishing. Loop-end inject skips this so the client does not drop isReplying
 // while the engine continues. truncated rides along on the marker because an
@@ -746,7 +761,7 @@ func (e *AgentEngine) finishStalledTurn(
 	truncated bool,
 	query string,
 	conversation []chat.Message,
-) {
+) error {
 	// Text that arrived alongside tool calls is a preamble — "let me look that
 	// up" — from a round that meant to keep working. Presenting it as the final
 	// answer would show an opening line and call the turn finished, so the
@@ -764,7 +779,9 @@ func (e *AgentEngine) finishStalledTurn(
 			countTotalToolCalls(state.RoundSteps))
 		if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, conversation); err == nil {
 			state.IsComplete = true
-			return
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
 		} else {
 			logger.Warnf(ctx, "[Agent] Synthesis after stall failed, using the fallback: %v", err)
 		}
@@ -772,6 +789,16 @@ func (e *AgentEngine) finishStalledTurn(
 	answerID := ""
 	if response.AnswerStreamed && answer != "" {
 		answerID = response.AnswerEventID
+	}
+	if e.holdRetrievalAnswer() {
+		public, err := e.publicAnswer(ctx, answer, conversation)
+		if err != nil {
+			return err
+		}
+		if public != answer {
+			e.retractAnswer(ctx, sessionID, answerID)
+			answer, answerID, truncated = public, "", false
+		}
 	}
 	if strings.TrimSpace(answer) == "" {
 		answer = stalledAnswerFallback
@@ -800,6 +827,7 @@ func (e *AgentEngine) finishStalledTurn(
 	e.closeAnswerStream(ctx, sessionID, answerID, truncated)
 	state.FinalAnswer = answer
 	state.IsComplete = true
+	return nil
 }
 
 func (e *AgentEngine) maxIterationsDisplay() string {
@@ -842,15 +870,9 @@ func (e *AgentEngine) executeLoop(
 	// (thinking + tool_call history) gets written onto assistantMessage.AgentSteps
 	// so it can be persisted by the caller's defer. Use WithoutCancel so a
 	// cancelled ctx does not short-circuit the emit on the stop path.
-	completionEmitted := false
-	emitCompletion := func() {
-		if completionEmitted {
-			return
-		}
-		completionEmitted = true
+	defer func() {
 		e.emitCompletionEvent(context.WithoutCancel(ctx), state, sessionID, messageID, startTime)
-	}
-	defer emitCompletion()
+	}()
 	if e.collaboration != nil {
 		defer func() {
 			b := e.collaboration
@@ -891,13 +913,6 @@ loop:
 		case <-ctx.Done():
 			logger.Warnf(ctx, "[Agent] Context cancelled at round %d: %v",
 				state.CurrentRound+1, ctx.Err())
-			// Try to salvage existing results
-			if totalTC := countTotalToolCalls(state.RoundSteps); totalTC > 0 {
-				logger.Infof(ctx, "[Agent] Synthesizing final answer from %d existing tool results",
-					totalTC)
-				_ = e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, messages)
-				state.IsComplete = true
-			}
 			return state, ctx.Err()
 		default:
 		}
@@ -949,6 +964,9 @@ loop:
 		}
 	}
 
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return state, cause
+	}
 	return state, nil
 }
 
@@ -1102,8 +1120,11 @@ func (e *AgentEngine) runReActIteration(
 	// the window. Compacting and retrying once turns that into a recovered
 	// round instead of a wasted one. Once per turn: if the retry overflows
 	// too, the problem is not the history size.
-	if !e.overflowRecovered && e.responseHitContextLimit(resp) {
+	if ctx.Err() == nil && !e.overflowRecovered && resp.FinishReason != "content_filter" && e.responseHitContextLimit(resp) {
 		e.overflowRecovered = true
+		state.AddUsage(resp.Usage)
+		state.TurnUsage.Accumulate(resp.Usage)
+		e.retractAnswer(ctx, sessionID, resp.AnswerEventID)
 		logger.Warnf(ctx, "[Agent][Round-%d] Response hit the context window (finish=%s, "+
 			"completion=%d of %d requested); compacting and retrying once",
 			round, resp.FinishReason, resp.Usage.CompletionTokens, e.getCompletionTokenBudget())
@@ -1128,10 +1149,6 @@ func (e *AgentEngine) runReActIteration(
 		}
 	}
 	response = resp
-	if planInProgress(state) && response.FinishReason == "content_filter" {
-		// The provider can return a partial private report alongside the terminal reason.
-		response.Content = ""
-	}
 	e.logContextDrift(ctx, round, currentTokens, response.Usage)
 	// Calibration needs only a prompt count; some providers report no total.
 	e.calibrateEstimator(ctx, round, *messagesPtr, tools, response.Usage, state)
@@ -1153,7 +1170,7 @@ func (e *AgentEngine) runReActIteration(
 	// act.go refuses the calls, the model is told to re-issue them, writes an
 	// even longer call, and hits the cap again. Give up rather than spend the
 	// whole round budget on it (#3446).
-	if isLengthFinishReason(response.FinishReason) {
+	if ctx.Err() == nil && isLengthFinishReason(response.FinishReason) {
 		guards.consecutiveLength++
 		if guards.consecutiveLength >= maxConsecutiveLengthRounds {
 			logger.Warnf(ctx, "[Agent][Round-%d] %d consecutive rounds cut off at the completion cap "+
@@ -1185,8 +1202,7 @@ func (e *AgentEngine) runReActIteration(
 			if e.collaborationOwnsFailure(ctx) {
 				return iterOutcomeBreak, fmt.Errorf("collaboration stopped after repeated output truncation")
 			}
-			e.finishStalledTurn(ctx, state, sessionID, response, true, query, *messagesPtr)
-			return iterOutcomeBreak, nil
+			return iterOutcomeBreak, e.finishStalledTurn(ctx, state, sessionID, response, true, query, *messagesPtr)
 		}
 	} else {
 		guards.consecutiveLength = 0
@@ -1197,7 +1213,7 @@ func (e *AgentEngine) runReActIteration(
 	// — a model burning its whole budget on reasoning returns empty every
 	// round, which used to land in the else branch and reset the counter, so
 	// the guard could never fire on the one shape that needs it most (#3446).
-	if len(response.ToolCalls) == 0 {
+	if ctx.Err() == nil && response.FinishReason != "content_filter" && len(response.ToolCalls) == 0 {
 		guards.resetFailedToolCallStreak()
 		if guards.sawPlainRound && response.Content == guards.lastResponseContent {
 			guards.consecutiveSameContent++
@@ -1217,8 +1233,7 @@ func (e *AgentEngine) runReActIteration(
 			if e.collaborationOwnsFailure(ctx) {
 				return iterOutcomeBreak, fmt.Errorf("collaboration stopped after repeated responses without progress")
 			}
-			e.finishStalledTurn(ctx, state, sessionID, response, false, query, *messagesPtr)
-			return iterOutcomeBreak, nil
+			return iterOutcomeBreak, e.finishStalledTurn(ctx, state, sessionID, response, false, query, *messagesPtr)
 		}
 	} else {
 		guards.consecutiveSameContent = 0
@@ -1241,20 +1256,27 @@ func (e *AgentEngine) runReActIteration(
 	state.PendingSteerMessages = nil
 	state.PendingBackground = nil
 
-	// If the request was cancelled while the LLM was streaming (e.g. the
-	// user pressed "stop"), the stream driver still returns a usable
-	// response (partial content / finish_reason="stop" / no tool calls).
-	// Do NOT let analyzeResponse treat that partial thinking text as the
-	// final answer — it would pollute Message.Content with mid-stream
-	// thinking and show up as a duplicate card next to the intermediate-
-	// steps tree. Preserve the partial thinking as an AgentStep and break
-	// out of the loop without marking state.IsComplete. executeLoop's
-	// deferred emitCompletionEvent will persist the step onto
-	// Message.AgentSteps so it still appears in the tree on refresh.
+	if response.FinishReason == "content_filter" && (len(response.ToolCalls) > 0 || planInProgress(state)) {
+		// The provider may include unfinished tool calls or a private step report.
+		e.retractAnswer(ctx, sessionID, response.AnswerEventID)
+		e.failToolCalls(ctx, response, &step, state.CurrentRound, sessionID, "The provider filtered this tool call before execution.")
+		step.Thought = ""
+		response.ToolCalls = nil
+		response.AnswerEventID = ""
+		response.AnswerStreamed = false
+		response.Content = ""
+	}
+
+	// Save already-published partial answers on cancellation; keep private
+	// reasoning and tool preambles on the step without completing the run.
 	if ctx.Err() != nil {
 		logger.Warnf(ctx, "[Agent][Round-%d] Context cancelled during LLM call; preserving partial step",
 			round)
-		if step.Thought != "" || len(step.ToolCalls) > 0 || len(step.UserMessagesBefore) > 0 ||
+		if response.AnswerStreamed && (len(response.ToolCalls) == 0 || answersWithPageButtons(response)) {
+			state.FinalAnswer = response.Content
+			step.Thought = ""
+		}
+		if step.Thought != "" || step.ReasoningContent != "" || len(step.ToolCalls) > 0 || len(step.UserMessagesBefore) > 0 ||
 			len(step.BackgroundInjections) > 0 {
 			state.RoundSteps = append(state.RoundSteps, step)
 		}
@@ -1362,6 +1384,14 @@ func (e *AgentEngine) runReActIteration(
 		if !planInProgress(state) && toolCallsSucceeded(step.ToolCalls) {
 			answer := *response
 			answer.ToolCalls, answer.FinishReason = nil, "stop"
+			answer.Content, err = e.publicAnswer(ctx, response.Content, *messagesPtr)
+			if answer.AnswerStreamed && answer.Content != response.Content && ctx.Err() == nil {
+				e.retractAnswer(ctx, sessionID, answer.AnswerEventID)
+				answer.AnswerStreamed = false
+			}
+			if err != nil {
+				return iterOutcomeBreak, err
+			}
 			analyzed = &answer
 		}
 	}
@@ -1371,6 +1401,8 @@ func (e *AgentEngine) runReActIteration(
 		guards.pendingRuntimeNotice = "An independent part of the user request remains. Use its registered gap to retrieve or record existing evidence, then include its answer or precise limitation alongside the clarification. Keep dependent work stopped."
 		state.PendingSteerMessages = step.UserMessagesBefore
 		state.PendingBackground = step.BackgroundInjections
+		// The retry opens a new answer event; retract a draft this round already streamed.
+		e.retractAnswer(ctx, sessionID, response.AnswerEventID)
 		return iterOutcomeContinue, nil
 	}
 	verdict := e.analyzeResponse(ctx, analyzed, step, state.CurrentRound, sessionID, roundStart)

@@ -61,10 +61,10 @@ func (p *Projector) Chat(r *sdk.StreamResponse) (ProjectedEvent, bool) {
 	if p.assistantMessageID == "" && r.AssistantMessageID != "" {
 		p.assistantMessageID = r.AssistantMessageID
 	}
-	if r.ResponseType == sdk.ResponseTypeComplete {
+	if r.ResponseType == sdk.ResponseTypeComplete || r.ResponseType == sdk.ResponseTypeStop {
 		p.done = true
 	}
-	if r.ResponseType == sdk.ResponseTypeError && r.Done {
+	if r.ResponseType == sdk.ResponseTypeError && sdk.IsTerminalErrorFrame(r.Done, r.Data) {
 		p.done = true
 	}
 
@@ -103,10 +103,10 @@ func (p *Projector) Agent(r *sdk.AgentStreamResponse) (ProjectedEvent, bool) {
 		return ProjectedEvent{}, false
 	}
 	p.seen = true
-	if r.ResponseType == sdk.AgentResponseTypeComplete {
+	if r.ResponseType == sdk.AgentResponseTypeComplete || r.ResponseType == sdk.AgentResponseTypeStop {
 		p.done = true
 	}
-	if r.ResponseType == sdk.AgentResponseTypeError && r.Done {
+	if r.ResponseType == sdk.AgentResponseTypeError && sdk.IsTerminalErrorFrame(r.Done, r.Data) {
 		p.done = true
 	}
 

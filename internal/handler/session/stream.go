@@ -156,26 +156,18 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 	// Set headers for SSE
 	setSSEHeaders(c)
 
-	// Check if stream is already completed
 	streamCompleted := false
-	for _, evt := range events {
-		if evt.Type == "complete" {
-			streamCompleted = true
-			break
-		}
-	}
-
 	// Replay existing events, a segment's worth of chunks per frame
 	replay := coalesceReplayEvents(events)
 	logger.Debugf(ctx, "Replaying %d existing events as %d frames", len(events), len(replay))
 	for _, evt := range replay {
+		streamCompleted = streamCompleted || endsQAStream(evt)
 		emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter, message.ID)
 	}
 
 	// If stream is already completed, send final event and return
 	if streamCompleted {
 		logger.Infof(ctx, "Stream already completed, session ID: %s, message ID: %s", sessionID, messageID)
-		sendCompletionEvent(c, message.RequestID)
 		return
 	}
 
@@ -204,14 +196,8 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 				return
 			}
 
-			// Send new events
-			streamCompletedNow := false
 			for _, evt := range newEvents {
-				// Check for completion event
-				if evt.Type == "complete" {
-					streamCompletedNow = true
-				}
-
+				streamCompleted = streamCompleted || endsQAStream(evt)
 				emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter, message.ID)
 			}
 
@@ -219,9 +205,8 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 			currentOffset = newOffset
 
 			// If stream completed, send final event and exit
-			if streamCompletedNow {
+			if streamCompleted {
 				logger.Infof(ctx, "Stream completed, session ID: %s, message ID: %s", sessionID, messageID)
-				sendCompletionEvent(c, message.RequestID)
 				return
 			}
 		}
@@ -374,6 +359,8 @@ func (h *Handler) handleAgentEventsForSSE(
 	defer heartbeat.Stop()
 
 	lastOffset := 0
+	streamCompleted := false
+	var titleTimeout <-chan time.Time
 	log := logger.GetLogger(ctx)
 	// Agent mode releases the sandbox turn lease, and therefore cancels ctx,
 	// before the completion event is published. Polling Redis with that
@@ -394,6 +381,8 @@ func (h *Handler) handleAgentEventsForSSE(
 			)
 			return
 
+		case <-titleTimeout:
+			return
 		case <-heartbeat.C:
 			c.SSEvent("message", gin.H{"response_type": "heartbeat"})
 			c.Writer.Flush()
@@ -406,8 +395,6 @@ func (h *Handler) handleAgentEventsForSSE(
 			}
 
 			// Send any new events
-			streamCompleted := false
-			titleReceived := false
 			for _, evt := range events {
 				// Check for stop event
 				if evt.Type == types.ResponseType(event.EventStop) {
@@ -444,14 +431,14 @@ func (h *Handler) handleAgentEventsForSSE(
 					return
 				}
 
-				// Check for completion event
-				if evt.Type == "complete" {
+				if endsQAStream(evt) {
 					streamCompleted = true
+					if evt.Type == types.ResponseTypeError {
+						waitForTitle = false
+					}
 				}
-
-				// Check for title event
 				if evt.Type == types.ResponseTypeSessionTitle {
-					titleReceived = true
+					waitForTitle = false
 				}
 
 				// Check if connection is still alive before writing. Build the
@@ -469,49 +456,13 @@ func (h *Handler) handleAgentEventsForSSE(
 			// Update offset
 			lastOffset = newOffset
 
-			// Check if stream is completed - wait for title event only if needed and not already received
 			if streamCompleted {
-				if waitForTitle && !titleReceived {
-					log.Infof("Stream completed for session=%s, message=%s, waiting for title event", sessionID, assistantMessageID)
-					// Wait up to 3 seconds for title event after completion
-					titleTimeout := time.After(3 * time.Second)
-				titleWaitLoop:
-					for {
-						select {
-						case <-titleTimeout:
-							log.Info("Title wait timeout, closing stream")
-							break titleWaitLoop
-						case <-c.Request.Context().Done():
-							log.Info("Connection closed while waiting for title")
-							return
-						default:
-							// Check for new events (title event)
-							events, newOff, err := h.streamManager.GetEvents(c.Request.Context(), sessionID, assistantMessageID, lastOffset)
-							if err != nil {
-								log.Warnf("Error getting events while waiting for title: %v", err)
-								break titleWaitLoop
-							}
-							if len(events) > 0 {
-								for _, evt := range events {
-									emitStreamEvent(ctx, c, evt, requestID, resourceRewriter, assistantMessageID)
-									// If we got the title, we can exit
-									if evt.Type == types.ResponseTypeSessionTitle {
-										log.Infof("Title event received: %s", evt.Content)
-										break titleWaitLoop
-									}
-								}
-								lastOffset = newOff
-							} else {
-								// No events, wait a bit before checking again
-								time.Sleep(100 * time.Millisecond)
-							}
-						}
-					}
-				} else {
-					log.Infof("Stream completed for session=%s, message=%s", sessionID, assistantMessageID)
+				if !waitForTitle {
+					return
 				}
-				sendCompletionEvent(c, requestID)
-				return
+				if titleTimeout == nil {
+					titleTimeout = time.After(3 * time.Second)
+				}
 			}
 		}
 	}

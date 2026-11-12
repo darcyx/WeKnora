@@ -3,8 +3,12 @@ package session
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,4 +71,59 @@ func TestHandleAgentEventsForSSE_DrainsCompletionAfterTurnContextCanceled(t *tes
 	body := recorder.Body.String()
 	require.Contains(t, body, "你好")
 	assert.Contains(t, body, `"response_type":"complete"`)
+}
+
+func TestAgentSSEEndsOnTerminalEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		first, last types.ResponseType
+	}{
+		{"early title", types.ResponseTypeSessionTitle, types.ResponseTypeComplete},
+		{"late title", types.ResponseTypeComplete, types.ResponseTypeSessionTitle},
+		{"standalone failure", types.ResponseTypeAnswer, types.ResponseTypeError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{streamManager: &growingStreamManager{stubStreamManager: stubStreamManager{events: []interfaces.StreamEvent{
+				{Type: tc.first, Done: true}, {Type: tc.last, Done: true},
+			}}, visible: 1}}
+			c, recorder := newTestGinContext(t, "")
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			c.Request = c.Request.WithContext(ctx)
+			h.handleAgentEventsForSSE(ctx, c, "s", "m", "r", nil, true, nil)
+			require.NoError(t, ctx.Err())
+			require.Contains(t, recorder.Body.String(), `"response_type":"`+string(tc.last)+`"`)
+		})
+	}
+}
+
+func TestLegacyToolErrorKeepsStreamOpen(t *testing.T) {
+	for _, key := range []string{"tool_name", "tool_call_id"} {
+		require.False(t, endsQAStream(interfaces.StreamEvent{
+			Type: types.ResponseTypeError, Done: true, Data: map[string]interface{}{key: "lookup"},
+		}))
+	}
+}
+
+func TestContinueStreamEndsOnStopOrError(t *testing.T) {
+	for _, terminal := range []types.ResponseType{"stop", types.ResponseTypeError} {
+		for _, visible := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s/initial-%d", terminal, visible), func(t *testing.T) {
+				h := &Handler{sessionService: &stubSessionService{}, messageService: &stubMessageServiceForStream{},
+					streamManager: &growingStreamManager{stubStreamManager: stubStreamManager{events: []interfaces.StreamEvent{
+						{ID: "a", Type: types.ResponseTypeAnswer, Content: "pending"}, {Type: terminal, Done: true},
+					}}, visible: visible},
+				}
+				r := gin.New()
+				r.GET("/stream/:session_id", h.ContinueStream)
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/stream/s?message_id=m", nil)
+				rec := httptest.NewRecorder()
+				r.ServeHTTP(rec, req)
+				require.NoError(t, ctx.Err())
+				require.Contains(t, rec.Body.String(), `"response_type":"`+string(terminal)+`"`)
+			})
+		}
+	}
 }

@@ -62,7 +62,7 @@ const (
 	// streamFlushInterval is how often buffered stream content is flushed to the IM platform.
 	// This prevents API rate-limiting while keeping perceived latency low.
 	streamFlushInterval = 300 * time.Millisecond
-	// agentCompleteWaitTimeout bounds how long IM waits for EventAgentComplete after
+	// agentCompleteWaitTimeout bounds how long IM waits for the AgentQA worker after
 	// the final answer stream finishes, preventing indefinite hangs.
 	agentCompleteWaitTimeout = 10 * time.Second
 )
@@ -777,16 +777,16 @@ func applyIMCompleteDataToMessage(msg *types.Message, data event.AgentCompleteDa
 	}
 }
 
-// waitForIMAgentComplete blocks until EventAgentComplete, ctx cancellation, or timeout.
+// waitForIMAgentComplete waits for the AgentQA worker, including errors it emits after Complete.
 func waitForIMAgentComplete(ctx context.Context, completeDone <-chan struct{}, sessionID string) {
 	timer := time.NewTimer(agentCompleteWaitTimeout)
 	defer timer.Stop()
 	select {
 	case <-completeDone:
 	case <-ctx.Done():
-		logger.Warnf(ctx, "[IM] QA context ended before agent complete event: session=%s", sessionID)
+		logger.Warnf(ctx, "[IM] QA context ended before AgentQA returned: session=%s", sessionID)
 	case <-timer.C:
-		logger.Warnf(ctx, "[IM] Timed out waiting for agent complete event: session=%s", sessionID)
+		logger.Warnf(ctx, "[IM] Timed out waiting for AgentQA to return: session=%s", sessionID)
 	}
 }
 
@@ -802,22 +802,22 @@ func pickIMStoredAnswer(candidates ...string) string {
 
 // mergeIMAgentAnswerBuffers copies optimistic/live answers into persistence buffers
 // when EventAgentFinalAnswer did not populate answerBuilder (e.g. cancel before complete).
-func mergeIMAgentAnswerBuffers(answerBuilder, answerOuter, agentLiveAnswer *strings.Builder, completeFinal string) {
+func mergeIMAgentAnswerBuffers(answerBuilder, answerOuter *strings.Builder, live, completeFinal string) {
 	if answerBuilder.Len() > 0 {
 		return
 	}
 	switch {
-	case agentLiveAnswer.Len() > 0:
-		live := agentLiveAnswer.String()
+	case strings.TrimSpace(completeFinal) != "":
+		answerBuilder.WriteString(completeFinal)
+		answerOuter.Reset()
+		answerOuter.WriteString(completeFinal)
+	case live != "":
 		answerBuilder.WriteString(live)
 		if answerOuter.Len() == 0 {
 			answerOuter.WriteString(live)
 		}
 	case answerOuter.Len() > 0:
 		answerBuilder.WriteString(answerOuter.String())
-	case strings.TrimSpace(completeFinal) != "":
-		answerBuilder.WriteString(completeFinal)
-		answerOuter.WriteString(completeFinal)
 	}
 }
 
@@ -2529,11 +2529,11 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 
 	var (
 		bufMu           sync.Mutex
-		reasoningInner  streamSection   // quick QA: model reasoning_content
-		agentInner      streamSection   // agent: retracted text + thoughts
-		agentLiveAnswer strings.Builder // agent: optimistic answer before tool retract
-		answerOuter     strings.Builder // final answer for display persistence
-		answerBuilder   strings.Builder // answer persisted to DB
+		reasoningInner  streamSection    // quick QA: model reasoning_content
+		agentInner      streamSection    // agent: retracted text + thoughts
+		agentLiveAnswer event.AnswerText // agent: optimistic answer before tool retract
+		answerOuter     strings.Builder  // final answer for display persistence
+		answerBuilder   strings.Builder  // answer persisted to DB
 		qaErr           error
 		done            = make(chan struct{})
 		completeDone    = make(chan struct{})
@@ -2577,14 +2577,15 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 
 	// retractAgentLiveAnswer moves the optimistic answer into the think block (Web: superseded preamble).
 	retractAgentLiveAnswer := func() {
-		if agentLiveAnswer.Len() == 0 {
+		live := agentLiveAnswer.String()
+		if live == "" {
 			return
 		}
 		if agentInner.text.Len() > 0 {
 			agentInner.ensureNewlineBefore()
 		}
-		agentInner.write(agentLiveAnswer.String())
-		agentLiveAnswer.Reset()
+		agentInner.write(live)
+		agentLiveAnswer = event.AnswerText{}
 	}
 
 	getStreamParts := func() IMStreamParts {
@@ -2612,8 +2613,8 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 
 		bufMu.Lock()
 		if useAgent && !agentDone {
-			if data.Content != "" {
-				agentLiveAnswer.WriteString(data.Content)
+			if data.Content != "" || data.Replace {
+				agentLiveAnswer.Apply(evt.ID, data)
 				streamedAny = true
 			}
 		} else {
@@ -2667,9 +2668,8 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		agentDone = true
 		agentCompleteFinalAnswer = data.FinalAnswer
 		applyIMCompleteDataToMessage(assistantMsg, data)
-		mergeIMAgentAnswerBuffers(&answerBuilder, &answerOuter, &agentLiveAnswer, data.FinalAnswer)
+		mergeIMAgentAnswerBuffers(&answerBuilder, &answerOuter, agentLiveAnswer.String(), data.FinalAnswer)
 		bufMu.Unlock()
-		closeComplete()
 		// Execute can emit EventError after Complete. The AgentQA return path
 		// closes done after those errors have been collected for finalization.
 		return nil
@@ -2722,7 +2722,9 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 			})
 			streamedAny = true
 		} else if useAgent {
-			retractAgentLiveAnswer()
+			if !agenttools.IsPageButtonTool(data.ToolName) {
+				retractAgentLiveAnswer()
+			}
 			upsertIMToolStep(&agentToolSteps, agentToolIdx, data.ToolCallID, func(step *IMToolStep) {
 				step.ToolName = data.ToolName
 				step.Pending = true
@@ -2989,7 +2991,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 
 	// Thread-safe answer collection
 	var answerMu sync.Mutex
-	var answerBuilder strings.Builder
+	var answerBuilder event.AnswerText
 	var qaErr error
 	var mcpAuthServices []imMCPAuthService
 	mcpAuthSeen := make(map[string]bool)
@@ -3006,7 +3008,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 			return nil
 		}
 		answerMu.Lock()
-		answerBuilder.WriteString(data.Content)
+		answerBuilder.Apply(evt.ID, data)
 		answerMu.Unlock()
 		if data.Done {
 			closeDone()
@@ -3082,11 +3084,11 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		}
 		answerMu.Lock()
 		applyIMCompleteDataToMessage(assistantMsg, data)
-		if answerBuilder.Len() == 0 && strings.TrimSpace(data.FinalAnswer) != "" {
-			answerBuilder.WriteString(data.FinalAnswer)
+		if strings.TrimSpace(data.FinalAnswer) != "" {
+			answerBuilder = event.AnswerText{}
+			answerBuilder.Apply(evt.ID, event.AgentFinalAnswerData{Content: data.FinalAnswer})
 		}
 		answerMu.Unlock()
-		closeComplete()
 		return nil
 	})
 

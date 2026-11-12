@@ -236,18 +236,6 @@ func buildStreamResponse(evt interfaces.StreamEvent, requestID string, messageID
 	return response
 }
 
-// sendCompletionEvent sends a final completion event to the client
-// NOTE: This is now a no-op because:
-//  1. The 'complete' event from handleComplete already signals stream completion
-//  2. Sending an extra empty 'answer' event with done:true causes frontend issues
-//     (multiple done events can confuse state management)
-//
-// The frontend should use 'complete' response_type to detect stream completion
-func sendCompletionEvent(c *gin.Context, requestID string) {
-	// Intentionally empty - completion is signaled by the 'complete' event
-	// which is already sent before this function is called
-}
-
 // createAgentQueryEvent creates a standard agent query event.
 // It carries the persisted user/assistant timestamps so the live UI can
 // display the same created_at that history reload will return.
@@ -326,10 +314,15 @@ func (h *Handler) setupStopEventHandler(
 	sessionTenantID uint64,
 	assistantMessage *types.Message,
 	cancel context.CancelFunc,
+	mode qaMode,
 ) {
 	eventBus.On(event.EventStop, func(ctx context.Context, evt event.Event) error {
 		logger.Infof(ctx, "Received stop event, cancelling async operations for session: %s", sessionID)
 		cancel()
+		if mode == qaModeAgent {
+			// AgentQA persists the final partial state when its worker returns.
+			return nil
+		}
 		// Preserve whatever has been streamed so far; do not overwrite Content.
 		// Use session's tenant for message update (ctx may have effectiveTenantID when using shared agent).
 		// Use WithoutCancel so the GORM UPDATE survives the upcoming ctx.Done triggered by cancel()/client disconnect.
@@ -406,11 +399,7 @@ func (h *Handler) startStopWatcher(
 							},
 						})
 						return
-					case evt.Type == types.ResponseTypeComplete:
-						// Generation finished normally; nothing left to stop.
-						return
-					case evt.Type == types.ResponseTypeError && evt.Done:
-						// Stream-level (terminal) error; generation has ended.
+					case endsQAStream(evt):
 						return
 					}
 				}

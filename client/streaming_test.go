@@ -455,6 +455,23 @@ func TestAgentQAStreamWithRequest_ExplicitTimeoutStillApplies(t *testing.T) {
 // TestAgentQAStreamWithRequest_TerminalErrorEndsStream verifies that a
 // response_type=error, done=true frame terminates the SDK call even when the
 // server leaves the HTTP connection open and never sends `complete` or EOF.
+func TestAgentStreamToolErrorContinuesUntilStop(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"response_type":"error","done":true,"data":{"tool_name":"search"}}`,
+		`data: {"response_type":"answer","content":"partial"}`,
+		`data: {"response_type":"stop","done":true}`,
+		`data: {"response_type":"answer","content":"late"}`,
+	}, "\n\n") + "\n\n"
+	var seen []AgentResponseType
+	err := new(Client).processAgentSSEStream(strings.NewReader(input), func(r *AgentStreamResponse) error {
+		seen = append(seen, r.ResponseType)
+		return nil
+	})
+	if err != nil || len(seen) != 3 || seen[2] != AgentResponseTypeStop {
+		t.Fatalf("frames=%v err=%v", seen, err)
+	}
+}
+
 func TestAgentQAStreamWithRequest_TerminalErrorEndsStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, _ := w.(http.Flusher)

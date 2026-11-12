@@ -456,8 +456,13 @@ func TestFinalSynthesisDoesNotRetryOrdinaryOutputTruncation(t *testing.T) {
 			Usage: &types.TokenUsage{PromptTokens: 5000, CompletionTokens: 2048, TotalTokens: 7048},
 		}), nil
 	}
+	recorder := &truncationRecorder{}
+	recorder.attach(engine.eventBus)
 	state := &types.AgentState{}
 	require.NoError(t, engine.streamFinalAnswerToEventBus(t.Context(), "Summarize", state, "session", emptyMessages()))
+	require.True(t, recorder.doneEvent(t).Truncated)
+	require.Len(t, state.RoundSteps, 1)
+	require.True(t, state.RoundSteps[0].Truncated)
 	require.Len(t, model.finals, 1)
 	require.Zero(t, model.summaries)
 	require.Equal(t, "Answer cut off at its output limit.", state.FinalAnswer)
@@ -679,4 +684,25 @@ func TestMaxIterationsPropagatesSynthesisFailureAndStillCompletes(t *testing.T) 
 	require.Equal(t, state.FinalAnswer, completions[0].FinalAnswer)
 	require.Equal(t, state.RoundSteps, completions[0].AgentSteps)
 	require.Equal(t, "message", completions[0].MessageID)
+}
+
+func TestStopDuringMaxIterationSynthesisKeepsOnlyPublishedAnswer(t *testing.T) {
+	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
+		{ResponseType: types.ResponseTypeAnswer, Content: "<think>private</think>partial"},
+		{ResponseType: types.ResponseTypeError, Content: "context canceled", Done: true},
+	}}}}
+	engine := newTestEngine(t, model, withMaxIterations(1))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	engine.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
+		if ev.Data.(event.AgentFinalAnswerData).Content == "partial" {
+			cancel()
+		}
+		return nil
+	})
+	state := &types.AgentState{CurrentRound: 1}
+	_, err := engine.executeLoop(ctx, state, "question", emptyMessages(), nil, "s", "m")
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, state.IsComplete)
+	require.Equal(t, "partial", state.FinalAnswer)
 }

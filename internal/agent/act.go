@@ -311,9 +311,11 @@ func (e *AgentEngine) failToolCalls(
 		toolCall := types.ToolCall{
 			ID:               agenttools.NormalizeToolCallID(tc.ID, tc.Function.Name, i),
 			Name:             tc.Function.Name,
-			Args:             map[string]any{"_raw": tc.Function.Arguments},
 			ProviderMetadata: tc.ProviderMetadata,
 			Result:           &types.ToolResult{Success: false, Error: reason},
+		}
+		if response.FinishReason != "content_filter" {
+			toolCall.Args = map[string]any{"_raw": tc.Function.Arguments}
 		}
 		step.ToolCalls = append(step.ToolCalls, toolCall)
 		e.emitToolOutcome(ctx, toolCall, iteration, sessionID)

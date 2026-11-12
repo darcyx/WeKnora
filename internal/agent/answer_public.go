@@ -11,6 +11,17 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 )
 
+// Buffer drafts only when retrieval admission or a known missing field can change the answer.
+func (e *AgentEngine) holdRetrievalAnswer() bool {
+	if e.retrieval == nil {
+		return false
+	}
+	c := e.retrieval
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return e.retrievalGuard && len(c.state.Gaps) == 0 || len(c.missingUserFields()) > 0
+}
+
 // publicAnswer degrades optional guard failures to the cleaned original answer.
 // Cancellation and persistence failures remain fatal.
 func (e *AgentEngine) publicAnswer(ctx context.Context, content string, messages []chat.Message) (string, error) {

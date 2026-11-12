@@ -2,6 +2,7 @@ package event
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -207,6 +208,45 @@ type AgentReferencesData struct {
 // AgentReferencesData does: the event package stays free of a types import.
 type MemoryRecalledData struct {
 	Memories interface{} `json:"memories"`
+}
+
+// AnswerText accumulates answer deltas in arrival order and scopes replacements to their event ID.
+type AnswerText struct {
+	order []string
+	parts map[string]*strings.Builder
+}
+
+func (a *AnswerText) Apply(id string, data AgentFinalAnswerData) {
+	if data.Content == "" && !data.Replace {
+		return
+	}
+	part := a.parts[id]
+	if part == nil {
+		if data.Content == "" {
+			return
+		}
+		if a.parts == nil {
+			a.parts = make(map[string]*strings.Builder)
+		}
+		part = &strings.Builder{}
+		a.parts[id] = part
+		a.order = append(a.order, id)
+	}
+	if data.Replace {
+		part.Reset()
+	}
+	part.WriteString(data.Content)
+}
+
+func (a *AnswerText) String() string {
+	if len(a.order) == 1 {
+		return a.parts[a.order[0]].String()
+	}
+	var text strings.Builder
+	for _, id := range a.order {
+		text.WriteString(a.parts[id].String())
+	}
+	return text.String()
 }
 
 // AgentFinalAnswerData represents final answer streaming data

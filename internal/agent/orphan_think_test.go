@@ -20,7 +20,7 @@ func orphanThinkResponse() mockResponse {
 	}}
 }
 
-func TestOrphanThinkBufferedAnswerMatchesPersistedRound(t *testing.T) {
+func TestOrphanThinkAnswerReplacementMatchesPersistedRound(t *testing.T) {
 	model := &mockChat{responses: []mockResponse{orphanThinkResponse()}}
 	e := newTestEngine(t, model)
 	e.toolRegistry = agenttools.NewToolRegistry()
@@ -29,9 +29,8 @@ func TestOrphanThinkBufferedAnswerMatchesPersistedRound(t *testing.T) {
 	var progress []string
 	e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, evt event.Event) error {
 		d := evt.Data.(event.AgentFinalAnswerData)
-		require.NotContains(t, d.Content, "refs")
-		require.NotContains(t, d.Content, "Prepare complete summary")
 		if d.Replace {
+			require.Contains(t, answer, "refs")
 			answer = ""
 			replacements++
 		}
@@ -44,7 +43,7 @@ func TestOrphanThinkBufferedAnswerMatchesPersistedRound(t *testing.T) {
 	})
 	state, err := e.Execute(context.Background(), "s", "m", "report", nil, nil)
 	require.NoError(t, err)
-	require.Zero(t, replacements, "internal content is withheld, not retracted after publication")
+	require.Equal(t, 1, replacements)
 	require.Equal(t, "## 进展\n\n真正的完整答案。", answer)
 	require.Equal(t, answer, state.FinalAnswer)
 	require.Len(t, state.RoundSteps, 1)

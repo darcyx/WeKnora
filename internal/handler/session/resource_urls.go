@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -86,13 +87,9 @@ var deltaResponseTypes = map[types.ResponseType]bool{
 	types.ResponseTypeReflection: true,
 }
 
-// terminalResponseTypes end the message as far as the client is concerned, so
-// any buffered tail must be released just before them. An error can be the last
-// event a run produces, and a completion may or may not follow it; flushing an
-// already-empty buffer is a no-op, so covering both is safe.
-var terminalResponseTypes = map[types.ResponseType]bool{
-	types.ResponseTypeComplete: true,
-	types.ResponseTypeError:    true,
+func endsQAStream(evt interfaces.StreamEvent) bool {
+	return evt.Type == types.ResponseTypeComplete || evt.Type == types.ResponseType(event.EventStop) ||
+		(evt.Type == types.ResponseTypeError && evt.Done && getString(evt.Data, "tool_call_id") == "" && getString(evt.Data, "tool_name") == "")
 }
 
 // holdbackKey identifies one delta stream. The event id is the key clients
@@ -124,7 +121,10 @@ func buildStreamResponseFor(
 
 	response.KnowledgeReferences = rewriter.Rewriter().CopyReferences(ctx, response.KnowledgeReferences)
 	response.Data = rewriter.Rewriter().CopyData(ctx, response.Data)
-	if deltaResponseTypes[evt.Type] {
+	if replace, _ := evt.Data["replace"].(bool); replace {
+		rewriter.Discard(holdbackKey(evt.Type, evt.ID))
+		response.Content = rewriter.Rewriter().String(ctx, response.Content)
+	} else if deltaResponseTypes[evt.Type] {
 		// The rewritten Data rides along with the held tail so a late release
 		// carries the same metadata as the event it was cut from.
 		response.Content = rewriter.Push(
@@ -147,7 +147,7 @@ func emitStreamEvent(
 	messageIDs ...string,
 ) {
 	response := buildStreamResponseFor(ctx, evt, requestID, rewriter, messageIDs...)
-	if terminalResponseTypes[evt.Type] {
+	if endsQAStream(evt) {
 		flushHeldStreamContent(ctx, c, requestID, rewriter, messageIDs...)
 	}
 	c.SSEvent("message", response)

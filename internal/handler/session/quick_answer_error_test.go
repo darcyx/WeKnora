@@ -116,7 +116,7 @@ func TestQuickAnswerFailureWithEmptyErrorUsesFallbackText(t *testing.T) {
 	}))
 
 	require.NotNil(t, messages.saved)
-	require.Equal(t, quickAnswerFailureContent, messages.saved.Content)
+	require.Equal(t, qaFailureContent, messages.saved.Content)
 	require.True(t, messages.saved.IsCompleted)
 	require.True(t, *released)
 }

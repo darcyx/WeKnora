@@ -23,7 +23,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	state *types.AgentState,
 	sessionID string,
 	conversation []chat.Message,
-) error {
+) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -44,7 +44,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	if state.Plan != nil {
 		messages = append(messages, planFinalInstruction(state.Plan))
 	}
-	holdPlanAnswer := state.Plan != nil
+	holdAnswer := state.Plan != nil || e.holdRetrievalAnswer()
 	runtimeNotice := "<runtime_event>{\"source\":\"runtime\",\"type\":\"final_synthesis\",\"message\":\"Tool " +
 		"execution has ended for this run. Respond to the current task, including the " +
 		"latest user corrections and source restrictions in the conversation. Base " +
@@ -60,7 +60,17 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// Generate a single ID for this entire final answer stream
 	answerID := generateEventID("answer")
 	logger.Debugf(ctx, "[Agent][FinalAnswer] AnswerID: %s", answerID)
-	answerStreamed := false
+	var published strings.Builder
+	defer func() {
+		if retErr == nil || published.Len() == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			state.FinalAnswer = published.String()
+		} else {
+			e.retractAnswer(ctx, sessionID, answerID)
+		}
+	}()
 	providerDone := false
 	terminalContent := ""
 	splitter := agenttools.NewThinkStreamSplitter()
@@ -92,18 +102,13 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			},
 			func(chunk *types.StreamResponse, _ string) {
 				// Defensive filter: only emit answer content, skip thinking chunks
-				if holdPlanAnswer || chunk.ResponseType == types.ResponseTypeThinking {
+				if holdAnswer || chunk.ResponseType == types.ResponseTypeThinking {
 					return
 				}
 				_, answerContent := splitter.Feed(chunk.Content)
 				if splitter.TakeAnswerReset() {
-					_ = e.eventBus.Emit(
-						ctx,
-						event.Event{
-							ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-							Data: event.AgentFinalAnswerData{Replace: true},
-						},
-					)
+					e.retractAnswer(ctx, sessionID, answerID)
+					published.Reset()
 				}
 				if chunk.Done {
 					_, tail := splitter.Flush()
@@ -126,7 +131,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 							Content: answerContent,
 						},
 					})
-					answerStreamed = true
+					published.WriteString(answerContent)
 				}
 			},
 		)
@@ -135,6 +140,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		// measured attempt even when its answer is replaced by recovery.
 		overflow := compaction.IsOverflowError(err)
 		if llmResult != nil && llmResult.Usage != nil {
+			state.AddUsage(*llmResult.Usage)
 			state.TurnUsage.Accumulate(*llmResult.Usage)
 			if err == nil && e.responseHitContextLimit(&types.ChatResponse{
 				FinishReason: llmResult.FinishReason, Usage: *llmResult.Usage,
@@ -160,13 +166,11 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			break // Sending the same rejected context again cannot recover.
 		}
 		messages = compacted
-		if answerStreamed {
-			_ = e.eventBus.Emit(ctx, event.Event{
-				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-				Data: event.AgentFinalAnswerData{Replace: true},
-			})
+		if published.Len() > 0 {
+			e.retractAnswer(ctx, sessionID, answerID)
 		}
-		answerStreamed, providerDone, terminalContent = false, false, ""
+		published.Reset()
+		providerDone, terminalContent = false, ""
 		splitter = agenttools.NewThinkStreamSplitter()
 	}
 	if err != nil {
@@ -185,19 +189,16 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	if err != nil {
 		return err
 	}
-	if holdPlanAnswer {
+	if holdAnswer {
 		// An interrupted step can still produce its private report despite the final instruction.
-		if isPrivatePlanReport(public) {
+		if state.Plan != nil && isPrivatePlanReport(public) {
 			public = stalledAnswerFallback
 		}
 		terminalContent = fullAnswer
 	}
 	if public != fullAnswer {
-		if answerStreamed {
-			_ = e.eventBus.Emit(ctx, event.Event{
-				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-				Data: event.AgentFinalAnswerData{Replace: true},
-			})
+		if published.Len() > 0 {
+			e.retractAnswer(ctx, sessionID, answerID)
 		}
 		fullAnswer, terminalContent, tail = public, "", public
 	}
@@ -209,9 +210,12 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		fullAnswer = stalledAnswerFallback
 		terminalContent, tail = "", fullAnswer
 	}
+	truncated := isLengthFinishReason(llmResult.FinishReason)
 	_ = e.eventBus.Emit(ctx, event.Event{
 		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true, IsFallback: isRuntimeFallbackAnswer(fullAnswer)},
+		Data: event.AgentFinalAnswerData{
+			Content: terminalContent + tail, Done: true, IsFallback: isRuntimeFallbackAnswer(fullAnswer), Truncated: truncated,
+		},
 	})
 
 	logger.Infof(ctx, "[Agent][FinalAnswer] Final answer generated: %d characters", len(fullAnswer))
@@ -219,9 +223,8 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		"session_id": sessionID,
 		"answer_len": len(fullAnswer),
 	})
-	// Delegated callers must distinguish a synthesized partial answer from a
-	// completed deliverable too, including the iteration-budget fallback path.
-	if e.collaboration != nil && e.collaboration.Child != nil && isLengthFinishReason(llmResult.FinishReason) {
+	// History and delegated callers both read truncation from the persisted steps.
+	if truncated {
 		state.RoundSteps = append(state.RoundSteps, types.AgentStep{
 			Iteration: state.CurrentRound,
 			Thought:   fullAnswer, Truncated: true, Timestamp: time.Now(),
@@ -294,6 +297,9 @@ func (e *AgentEngine) handleMaxIterations(
 
 	// Stream final answer generation through EventBus
 	if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, messages); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		logger.Errorf(ctx, "Failed to synthesize final answer: %v", err)
 		common.PipelineError(ctx, "Agent", "final_answer_failed", map[string]interface{}{
 			"error": err.Error(),

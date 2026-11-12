@@ -13,6 +13,14 @@ import (
 type faqAskSession struct{ interfaces.SessionService }
 
 func (faqAskSession) AgentQA(ctx context.Context, req *types.QARequest, bus *event.EventBus) error {
+	if err := bus.Emit(ctx, event.Event{ID: "draft", Type: event.EventAgentFinalAnswer,
+		Data: event.AgentFinalAnswerData{Content: "withdrawn draft"}}); err != nil {
+		return err
+	}
+	if err := bus.Emit(ctx, event.Event{ID: "draft", Type: event.EventAgentFinalAnswer,
+		Data: event.AgentFinalAnswerData{Replace: true}}); err != nil {
+		return err
+	}
 	if err := bus.Emit(ctx, event.Event{Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Content: "国内还是海外？", Done: true}}); err != nil {
 		return err
 	}

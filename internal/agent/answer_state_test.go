@@ -21,13 +21,23 @@ func registeredMissingFields(t *testing.T, fields ...string) *AgentEngine {
 }
 
 func TestRegisteredMissingFieldsBlockOrdinaryAndFinalAnswer(t *testing.T) {
-	for _, path := range []string{"ordinary", "final"} {
+	for _, path := range []string{"ordinary", "page button", "stalled", "final"} {
 		t.Run(path, func(t *testing.T) {
 			e := registeredMissingFields(t, "渠道")
-			e.chatModel = &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "打开支付配置并开启沙盒开关。", Done: true, FinishReason: "stop"}}}}}
+			const draft = "打开支付配置并开启沙盒开关。"
+			round := mockResponse{chunks: []types.StreamResponse{
+				{ResponseType: types.ResponseTypeAnswer, Content: draft},
+				{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "stop"},
+			}}
+			if path == "page button" {
+				round = pageToolResponse(draft, "open_page")
+				e.toolRegistry.RegisterTool(newCountingTool("open_page"))
+			}
+			e.chatModel = &mockChat{responses: []mockResponse{round}}
 			var public string
 			e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
 				data := ev.Data.(event.AgentFinalAnswerData)
+				require.NotContains(t, data.Content, draft)
 				if data.Replace {
 					public = ""
 				}
@@ -38,6 +48,15 @@ func TestRegisteredMissingFieldsBlockOrdinaryAndFinalAnswer(t *testing.T) {
 				response, err := e.streamThinkingToEventBus(t.Context(), nil, nil, 0, "session")
 				require.NoError(t, err)
 				require.Equal(t, "方便提供一下渠道吗？", response.Content)
+			} else if path == "stalled" {
+				state := &types.AgentState{}
+				err := e.finishStalledTurn(t.Context(), state, "session", &types.ChatResponse{Content: draft}, false, "sandbox", nil)
+				require.NoError(t, err)
+				require.Equal(t, "方便提供一下渠道吗？", state.FinalAnswer)
+			} else if path == "page button" {
+				state, err := e.executeLoop(t.Context(), &types.AgentState{}, "sandbox", nil, nil, "session", "message")
+				require.NoError(t, err)
+				require.Equal(t, "方便提供一下渠道吗？", state.FinalAnswer)
 			} else {
 				state := &types.AgentState{}
 				require.NoError(t, e.streamFinalAnswerToEventBus(t.Context(), "sandbox", state, "session", nil))

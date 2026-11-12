@@ -326,7 +326,7 @@ func (s *Server) runQA(
 
 	var (
 		mu       sync.Mutex
-		answer   strings.Builder
+		answer   event.AnswerText
 		final    string
 		refs     []*types.SearchResult
 		faqSteps []types.AgentStep
@@ -347,7 +347,7 @@ func (s *Server) runQA(
 			return nil
 		}
 		mu.Lock()
-		answer.WriteString(data.Content)
+		answer.Apply(evt.ID, data)
 		mu.Unlock()
 		if data.Done {
 			closeDone()
@@ -394,7 +394,7 @@ func (s *Server) runQA(
 			usage = turnUsage
 		}
 		mu.Unlock()
-		closeComplete()
+		// AgentQA may still publish an execution error before returning.
 		return nil
 	})
 	bus.On(event.EventError, func(_ context.Context, evt event.Event) error {
@@ -453,7 +453,7 @@ func (s *Server) runQA(
 			case <-complete:
 			case <-ctx.Done():
 			case <-timer.C:
-				logger.Warnf(ctx, "[mcpserver] ask timed out waiting for agent completion: session=%s", session.ID)
+				logger.Warnf(ctx, "[mcpserver] ask timed out waiting for AgentQA to return: session=%s", session.ID)
 			}
 			timer.Stop()
 		}
@@ -468,7 +468,7 @@ func (s *Server) runQA(
 
 	mu.Lock()
 	text := answer.String()
-	if strings.TrimSpace(text) == "" && final != "" {
+	if strings.TrimSpace(final) != "" {
 		text = final
 	}
 	collected := append([]*types.SearchResult(nil), refs...)
