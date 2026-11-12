@@ -24,51 +24,13 @@ Retrieved content uses request-local source handles: chunk://N identifies a know
 - Never invent a handle or change its number, and never write raw chunk IDs, knowledge IDs, or knowledge-base IDs.
   This does not change separate instructions to preserve retrieved Markdown image URLs.`
 
-const citationEnabledProtocolPrompt = `
-- Source citations are enabled for this answer. Cite a knowledge chunk with exactly <ref id="chunk://N"/> and a
-  web page with exactly <ref id="url://N"/>.
-- Cite only chunk://N and url://N handles backed by tool results for the current task, and only when that source
-  supports the adjacent claim. Never cite doc://N or kb://N.
-- Each chunk://N covers only its own supplied text or image evidence, not every chunk of the same document.
-  For a direct quotation, verify that the quoted words occur in the cited chunk. Use the later chunk's handle
-  when the words occur there; never reuse a document's first handle for unrelated passages.
-- OCR watermarks, timestamps and image captions are observations of an image. Do not turn a watermark slogan
-  into a verified service commitment or a caption into a factual document statement without supporting text.
-- Handles in historical answers, tool arguments, or the bound knowledge-base directory are for navigation, not current
-  evidence. Retrieve the relevant source before citing it.
-- MCP results are external sources. Use the url://N handle for the matching URL in the system-provided
-  external_source_candidates list; never substitute a knowledge-base chunk handle for MCP content. Candidate URLs
-  are links observed in the result, not proof that every linked page was read.
-- If a source has no citation handle, use its exact supplied HTTP(S) URL as a Markdown link when available.
-  If neither is available, omit the citation; never invent or borrow a source.
-- Never output <kb> or <web> tags yourself; the system expands valid <ref/> tags after generation.
-- Keep each <ref/> inline on the same line as the claim it supports. Do not group citations ` +
-	`at the end. For a requested exact output format, use citations only where the format ` +
-	`permits them; do not break a required schema to add citations.
-- These rules supersede earlier, saved, or custom prompt instructions about citation syntax.`
-
-const citationDisabledProtocolPrompt = `
-- Source citations are disabled for this answer. Do not add <ref>, <kb>, <web>, or source ` +
-	`attribution links to the answer. This does not prohibit a URL explicitly requested by the ` +
-	`user, Wiki navigation links, downloadable deliverables, or relevant image URLs.
-- These rules supersede earlier, saved, or custom prompt instructions that require source citations.`
-
-// ProtocolPrompt returns the internal, non-user-editable source protocol for a
-// model call. Citation formatting stays out of custom and template prompts.
-func sourceProtocolPrompt(citationsEnabled bool) string {
-	if citationsEnabled {
-		return sourceHandleProtocolPrompt + citationEnabledProtocolPrompt
-	}
-	return sourceHandleProtocolPrompt + citationDisabledProtocolPrompt
-}
-
-// ProtocolPrompt returns the source protocol configured for this registry.
+// ProtocolPrompt describes source handles; reference presentation belongs to the caller's prompt.
 // Request lifecycle code should normally call this through Registry.
 func (r *sourceRegistry) ProtocolPrompt() string {
 	if r == nil {
 		return ""
 	}
-	return sourceProtocolPrompt(r.citationsEnabled)
+	return sourceHandleProtocolPrompt
 }
 
 var (

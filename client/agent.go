@@ -58,6 +58,7 @@ const (
 	AgentResponseTypeAnswer AgentResponseType = "answer"
 	// AgentResponseTypeReflection is emitted for agent reflection.
 	AgentResponseTypeReflection AgentResponseType = "reflection"
+	AgentResponseTypeStop       AgentResponseType = "stop"
 	// AgentResponseTypeError is emitted when the agent fails.
 	AgentResponseTypeError AgentResponseType = "error"
 	// AgentResponseTypeComplete is emitted when the agent run has finished.
@@ -156,7 +157,10 @@ func (c *Client) processAgentSSEStream(reader io.Reader, callback AgentEventCall
 				// buggy/proxied server leaves the HTTP connection open and never
 				// follows it with `complete` or EOF. Deliver it to the callback
 				// first, then terminate the SDK call with an error.
-				if streamResponse.ResponseType == AgentResponseTypeError && streamResponse.Done {
+				if streamResponse.ResponseType == AgentResponseTypeStop {
+					return nil
+				}
+				if streamResponse.ResponseType == AgentResponseTypeError && IsTerminalErrorFrame(streamResponse.Done, streamResponse.Data) {
 					return NewSSEStreamError(streamResponse.Content)
 				}
 			}

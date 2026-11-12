@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -14,13 +15,17 @@ import (
 
 type tagTargetKnowledgeBaseService struct {
 	interfaces.KnowledgeBaseService
-	kbs map[string]*types.KnowledgeBase
+	kbs       map[string]*types.KnowledgeBase
+	lookupErr error
 }
 
 func (s *tagTargetKnowledgeBaseService) GetKnowledgeBasesByIDsOnly(
 	_ context.Context,
 	ids []string,
 ) ([]*types.KnowledgeBase, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	out := make([]*types.KnowledgeBase, 0, len(ids))
 	for _, id := range ids {
 		if kb := s.kbs[id]; kb != nil {
@@ -34,6 +39,7 @@ type tagTargetKnowledgeService struct {
 	interfaces.KnowledgeService
 	knowledges []*types.Knowledge
 	tagIDs     map[string][]string
+	lookupErr  error
 }
 
 func (s *tagTargetKnowledgeService) GetKnowledgeBatchWithSharedAccess(
@@ -41,6 +47,9 @@ func (s *tagTargetKnowledgeService) GetKnowledgeBatchWithSharedAccess(
 	_ uint64,
 	ids []string,
 ) ([]*types.Knowledge, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	allowed := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		allowed[id] = true
@@ -149,6 +158,23 @@ func TestBuildAgentConfig_TagOnlyScopePreservesRetrievalTarget(t *testing.T) {
 
 func tagTargetContext() context.Context {
 	return context.WithValue(context.Background(), types.TenantIDContextKey, uint64(100))
+}
+
+func TestBuildSearchTargetsDoesNotDropRequestedScopeOnLookupFailure(t *testing.T) {
+	for _, stage := range []string{"knowledge bases", "mentioned documents"} {
+		t.Run(stage, func(t *testing.T) {
+			svc := newTagTargetSessionService()
+			cause := errors.New("scope storage unavailable")
+			if stage == "knowledge bases" {
+				svc.knowledgeBaseService.(*tagTargetKnowledgeBaseService).lookupErr = cause
+			} else {
+				svc.knowledgeService.(*tagTargetKnowledgeService).lookupErr = cause
+			}
+			targets, err := svc.buildSearchTargets(tagTargetContext(), 100, []string{"faq-kb"}, []string{"doc-1"}, nil)
+			require.ErrorIs(t, err, cause)
+			require.Empty(t, targets, "a failed lookup must not silently turn a requested scope into partial targets")
+		})
+	}
 }
 
 func TestBuildSearchTargets_DocumentTagScopeResolvesKnowledgeIDs(t *testing.T) {

@@ -114,7 +114,7 @@ func (r *Registry) DecodeToolCalls(toolCalls []types.LLMToolCall) {
 			toolCalls[i].ModelArguments = toolCalls[i].Function.Arguments
 		}
 	}
-	normalizeWebFetchItems(toolCalls)
+	normalizeDoubleEncodedArrays(toolCalls)
 	normalizeMCPCallArguments(toolCalls)
 	r.resources.DecodeToolCalls(toolCalls)
 	r.sources.DecodeToolCallsWithPolicy(toolCalls, sourceArgumentAllowed, sourceBareTextAllowed)
@@ -348,6 +348,15 @@ func outputFilesPrompt(result *types.ToolResult) string {
 		return "\nOutput files: none identified by this call."
 	}
 	return "\nOutput files: `" + strings.Join(result.OutputFiles, "`, `") + "`"
+}
+
+// DecodeObservationText preserves distinct source identities in the internal ledger.
+// Public citation formatting may map several chunks to the same document link.
+func (r *Registry) DecodeObservationText(text string) string {
+	if r == nil {
+		return text
+	}
+	return r.sources.DecodeBareText(r.resources.DecodeText(text))
 }
 
 // DecodeOutputText applies the public citation policy to complete text. It is

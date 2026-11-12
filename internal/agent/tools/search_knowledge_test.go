@@ -177,6 +177,25 @@ func TestRetrievalParamsFallBackAndNeverUndercutLimit(t *testing.T) {
 	}
 }
 
+func TestRetrievalParamsAgentOverrideDoesNotMutateGlobal(t *testing.T) {
+	cfg := &config.Config{Conversation: &config.ConversationConfig{
+		EmbeddingTopK: 200, VectorThreshold: 0.4, KeywordThreshold: 0.25,
+	}}
+	tool := NewSearchKnowledgeTool(nil, nil, nil, nil, nil, cfg).WithEmbeddingTopK(20)
+	for _, tc := range []struct{ limit, want int }{{3, 20}, {30, 30}} {
+		topK, v, k := tool.retrievalParams(tc.limit)
+		if topK != tc.want || v != 0.4 || k != 0.25 {
+			t.Fatalf("limit=%d: got %d, %g, %g", tc.limit, topK, v, k)
+		}
+	}
+	for _, inherited := range []int{0, -1} {
+		topK, _, _ := tool.WithEmbeddingTopK(inherited).retrievalParams(3)
+		if topK != 200 || cfg.Conversation.EmbeddingTopK != 200 {
+			t.Fatal("an unset override must preserve the global pool")
+		}
+	}
+}
+
 func TestDeduplicateResultsKeepsFirstOccurrenceInOrder(t *testing.T) {
 	tool := &SearchKnowledgeTool{}
 	in := []*searchResultWithMeta{

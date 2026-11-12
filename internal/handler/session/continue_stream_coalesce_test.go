@@ -212,3 +212,22 @@ func TestContinueStream_ReplayHoldbackSurvivesToThePollLoop(t *testing.T) {
 	assert.Less(t, strings.LastIndex(body, `"response_type":"answer"`),
 		strings.Index(body, `"response_type":"complete"`))
 }
+
+func TestAnswerReplacementSurvivesLiveAndReplay(t *testing.T) {
+	old := chunk("answer", types.ResponseTypeAnswer, "discard ![old](resource://xifDo7")
+	replace := chunk("answer", types.ResponseTypeAnswer, "corrected")
+	replace.Data["replace"] = true
+	events := []interfaces.StreamEvent{old, replace, doneChunk("answer", types.ResponseTypeAnswer, "!")}
+	for _, frames := range [][]interfaces.StreamEvent{events, coalesceReplayEvents(events)} {
+		rewrite := publicStreamRewriter()
+		var rendered string
+		for _, frame := range frames {
+			res := buildStreamResponseFor(t.Context(), frame, "request", rewrite)
+			if res.Data["replace"] == true {
+				rendered = ""
+			}
+			rendered += res.Content
+		}
+		assert.Equal(t, "corrected!", rendered)
+	}
+}

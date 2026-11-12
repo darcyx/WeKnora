@@ -44,6 +44,8 @@ type Config struct {
 
 // AgentConfig represents the global agent settings.
 type AgentConfig struct {
+	// QATotalTimeoutSeconds bounds the entire AgentQA run; 0 disables it.
+	QATotalTimeoutSeconds int `yaml:"qa_total_timeout_seconds" json:"qa_total_timeout_seconds"`
 	// LLMCallTimeout is the default timeout for a single LLM call in seconds.
 	// Default: 120 (standard agents) or 300 (can be overridden by Env).
 	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout"`
@@ -64,6 +66,10 @@ type AgentConfig struct {
 	// become before its next use re-lists it from the server. 0 means default
 	// 3600 (1 hour); a negative value turns the age check off.
 	MCPDirectoryMaxAgeSeconds int `yaml:"mcp_directory_max_age_seconds" json:"mcp_directory_max_age_seconds"`
+	// UnlimitedIterationCap bounds a run whose agent declares unlimited rounds
+	// (smart-reasoning). 0 means default 40; a negative value keeps such runs
+	// truly unbounded.
+	UnlimitedIterationCap int `yaml:"unlimited_iteration_cap" json:"unlimited_iteration_cap"`
 }
 
 // Defaults for suspendable agent prompts.
@@ -96,6 +102,18 @@ func (c *AgentConfig) MCPDirectoryMaxAge() time.Duration {
 // PromptSuspend reports whether suspendable prompts may suspend their run.
 func (c *AgentConfig) PromptSuspend() bool {
 	return c == nil || c.PromptSuspendEnabled == nil || *c.PromptSuspendEnabled
+}
+
+// DefaultUnlimitedIterationCap is the absolute round ceiling applied to a run
+// whose agent declares unlimited iterations.
+const DefaultUnlimitedIterationCap = 40
+
+// HardIterationCap returns the configured absolute ceiling for unlimited runs.
+func (c *AgentConfig) HardIterationCap() int {
+	if c == nil || c.UnlimitedIterationCap == 0 {
+		return DefaultUnlimitedIterationCap
+	}
+	return c.UnlimitedIterationCap
 }
 
 // PromptHotWait returns the in-memory wait before a run is suspended.
@@ -659,7 +677,9 @@ func LoadConfig() (*Config, error) {
 
 	// Validate configuration values
 	applyOIDCEnvOverrides(&cfg)
-	applyAgentEnvOverrides(&cfg)
+	if err := applyAgentEnvOverrides(&cfg); err != nil {
+		return nil, err
+	}
 	applyKnowledgeBaseEnvOverrides(&cfg)
 	applyNetworkEnvOverrides()
 	applyAuthAndTenantDefaults(&cfg)
@@ -722,6 +742,10 @@ func ValidateConfig(cfg *Config) error {
 			errs = append(errs, fmt.Sprintf("auth.default_tenant_mode must be %q or %q, got %q",
 				AuthDefaultTenantModeCreatePersonal, AuthDefaultTenantModeTenantless, tenantMode))
 		}
+	}
+
+	if cfg.Agent != nil && (cfg.Agent.QATotalTimeoutSeconds < 0 || int64(cfg.Agent.QATotalTimeoutSeconds) > int64((1<<63-1)/time.Second)) {
+		errs = append(errs, "agent.qa_total_timeout_seconds must be non-negative and fit in a duration")
 	}
 
 	if cfg.Audit != nil && cfg.Audit.RetentionDays < 0 {
@@ -873,9 +897,19 @@ func applyNetworkEnvOverrides() {
 	utils.SetOutboundDialTimeout(dialTimeout)
 }
 
-func applyAgentEnvOverrides(cfg *Config) {
+func applyAgentEnvOverrides(cfg *Config) error {
 	if cfg.Agent == nil {
 		cfg.Agent = &AgentConfig{}
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_QA_TOTAL_TIMEOUT")); value != "" {
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			d, err = time.ParseDuration(value + "s")
+		}
+		if err != nil || d < 0 || d%time.Second != 0 {
+			return fmt.Errorf("WEKNORA_AGENT_QA_TOTAL_TIMEOUT must be a non-negative whole number of seconds or duration")
+		}
+		cfg.Agent.QATotalTimeoutSeconds = int(d / time.Second)
 	}
 	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_LLM_TIMEOUT")); value != "" {
 		if timeout, err := time.ParseDuration(value); err == nil {
@@ -908,6 +942,7 @@ func applyAgentEnvOverrides(cfg *Config) {
 		enabled := strings.EqualFold(value, "true")
 		cfg.Agent.PromptSuspendEnabled = &enabled
 	}
+	return nil
 }
 
 // applyAuthAndTenantDefaults fills in defaults for the Auth and Tenant

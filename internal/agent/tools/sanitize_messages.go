@@ -6,6 +6,11 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 )
 
+// FAQPreflightCallID identifies the host's search observation across live execution and replay.
+func FAQPreflightCallID(turnID string) string {
+	return NormalizeToolCallID("faq_"+turnID, ToolSearchKnowledge, 0)
+}
+
 // SanitizeMessages validates and fixes a message array for LLM compatibility.
 // It handles common issues that cause provider API errors:
 //   - Ensures no consecutive same-role messages (some providers reject these)
@@ -21,12 +26,31 @@ func SanitizeMessages(messages []chat.Message) []chat.Message {
 	result := make([]chat.Message, 0, len(messages))
 	for i, msg := range messages {
 		if msg.Role == "assistant" {
+			// The host chose this search. Providers must not receive a fabricated assistant tool call or reasoning signature.
+			if len(msg.ToolCalls) == 1 && msg.ToolCalls[0].Function.Name == ToolSearchKnowledge && msg.ToolCalls[0].ID == FAQPreflightCallID(msg.TurnID) {
+				continue
+			}
 			msg.Content = withoutProtocolArtifactLines(msg.Content)
 		}
 		// Skip empty non-system messages (some providers reject these)
 		if msg.Content == "" && msg.Role != "system" && msg.Role != "tool" && len(msg.ToolCalls) == 0 &&
 			len(msg.Images) == 0 && len(msg.MultiContent) == 0 {
 			continue
+		}
+
+		// Preserve runtime evidence as quoted input after the scoped tool result has been rendered.
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			faq := msg.Name == ToolSearchKnowledge && msg.ToolCallID == FAQPreflightCallID(msg.TurnID)
+			if faq || !hasMatchingToolCall(messages[:i], msg.ToolCallID) {
+				name := msg.Name
+				if faq {
+					name = "faq_preflight"
+				}
+				msg.Role = "user"
+				msg.Content = "<untrusted_tool_result name=\"" + html.EscapeString(name) +
+					"\">\n" + html.EscapeString(msg.Content) + "\n</untrusted_tool_result>"
+				msg.ToolCallID, msg.Name = "", ""
+			}
 		}
 
 		// Prevent consecutive same-role messages (except tool results)
@@ -61,18 +85,6 @@ func SanitizeMessages(messages []chat.Message) []chat.Message {
 				}
 				result[len(result)-1] = merged
 				continue
-			}
-		}
-
-		// Verify tool result messages reference a valid tool call
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			if !hasMatchingToolCall(messages[:i], msg.ToolCallID) {
-				// Preserve recoverable data without promoting external output to policy.
-				msg.Role = "user"
-				msg.Content = "<untrusted_tool_result name=\"" + html.EscapeString(msg.Name) +
-					"\">\n" + html.EscapeString(msg.Content) + "\n</untrusted_tool_result>"
-				msg.ToolCallID = ""
-				msg.Name = ""
 			}
 		}
 

@@ -70,36 +70,44 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 	"discover_mcp_tools": {opaqueOutput: true, mcpRoutingKey: "server_id", mcpDirectoryOutput: true},
 	"call_mcp_tool":      {opaqueOutput: true, mcpRoutingKey: "tool_ref"},
 	"read_file":          {},
+	"review_retrieval":   {sourceTextKeys: map[string]struct{}{"quotes": {}}},
 	"search_knowledge": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	// read_document takes one id that may name a document (doc://N) or a chunk
 	// (chunk://N); the "id" key resolves against both handle tables.
 	"read_document": {
-		sourceIDKeys: map[string]struct{}{"id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"id": {}},
+		sourceOutput:   true,
 	},
 	"list_documents": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_id": {}},
+		sourceOutput:   true,
 	},
 	// Retired retrieval tools keep their policies so stored histories that
 	// still carry their calls decode and compact exactly as they did.
 	"knowledge_search": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	"grep_chunks": {
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceOutput:   true,
 	},
 	"list_knowledge_chunks": {
-		sourceIDKeys: map[string]struct{}{"knowledge_id": {}, "faq_id": {}, "chunk_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_id": {}, "faq_id": {}, "chunk_id": {}},
+		sourceOutput:   true,
 	},
 	"get_document_info": {
-		sourceIDKeys: map[string]struct{}{"knowledge_ids": {}, "faq_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_ids": {}, "faq_ids": {}},
+		sourceOutput:   true,
 	},
 	// Past conversations carry no durable chunk or document IDs, so there is
 	// nothing to compact; the output is prose the model may quote.
@@ -109,8 +117,9 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 	// service, so there is nothing here for the model to hold a handle on.
 	"search_memory": {},
 	"query_knowledge_graph": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	toolDatabaseQuery: {
 		sourceTextKeys: map[string]struct{}{"sql": {}},
@@ -132,11 +141,14 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 		sourceOutput: true,
 	},
 	"wiki_read_page": {
-		sourceOutput: true,
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_ids": {}},
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceOutput:   true,
 	},
 	"wiki_read_source_doc": {
-		sourceIDKeys: map[string]struct{}{"knowledge_id": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_id": {}},
+		sourceOutput:   true,
 	},
 	"wiki_write_page": {
 		sourceIDKeys: map[string]struct{}{"source_refs": {}},
@@ -148,8 +160,9 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 		sourceIDKeys: map[string]struct{}{"suspected_knowledge_ids": {}},
 	},
 	"wiki_search": {
-		sourceIDKeys: map[string]struct{}{"knowledge_base_id": {}, "knowledge_base_ids": {}},
-		sourceOutput: true,
+		sourceTextKeys: map[string]struct{}{"quotes": {}},
+		sourceIDKeys:   map[string]struct{}{"knowledge_base_id": {}, "knowledge_base_ids": {}},
+		sourceOutput:   true,
 	},
 	toolWikiReadIssue: {
 		decodedIssueIDKeys:  map[string]struct{}{"issue_id": {}},
@@ -258,7 +271,7 @@ func sourceArgumentAllowed(toolName, key string) bool {
 	return ok
 }
 
-// sourceBareTextAllowed reports structured-text arguments (SQL) whose handles
+// sourceBareTextAllowed reports structured-text arguments (SQL and evidence quotes) whose handles
 // must decode to bare durable IDs rather than weknora:// URIs.
 func sourceBareTextAllowed(toolName, key string) bool {
 	policy, ok := toolHandlePolicies[toolName]
@@ -430,12 +443,16 @@ func walkJSONValue(key string, value interface{}, rewrite func(key, value string
 	return value
 }
 
-// Some providers double-encode items. Unwrap only this built-in's array before
-// resolving source handles; doing it at Execute time leaves nested url://N values
-// unresolved. ModelArguments has already retained the exact provider payload.
-func normalizeWebFetchItems(calls []types.LLMToolCall) {
+// Unwrap known array fields before resolving their handles. ModelArguments retains the wire payload.
+func normalizeDoubleEncodedArrays(calls []types.LLMToolCall) {
 	for i := range calls {
-		if calls[i].Function.Name != "web_fetch" {
+		var field string
+		switch calls[i].Function.Name {
+		case "web_fetch":
+			field = "items"
+		case "query_knowledge_graph":
+			field = "knowledge_base_ids"
+		default:
 			continue
 		}
 		var args map[string]json.RawMessage
@@ -443,14 +460,14 @@ func normalizeWebFetchItems(calls []types.LLMToolCall) {
 			continue
 		}
 		var wrapped string
-		if json.Unmarshal(args["items"], &wrapped) != nil {
+		if json.Unmarshal(args[field], &wrapped) != nil {
 			continue
 		}
 		var items []json.RawMessage
 		if json.Unmarshal([]byte(wrapped), &items) != nil || len(items) == 0 {
 			continue
 		}
-		args["items"] = json.RawMessage(wrapped)
+		args[field] = json.RawMessage(wrapped)
 		if encoded, err := json.Marshal(args); err == nil {
 			calls[i].Function.Arguments = string(encoded)
 		}

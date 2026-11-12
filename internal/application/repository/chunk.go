@@ -928,6 +928,79 @@ func (r *chunkRepository) ListAllFAQChunksWithMetadataByKnowledgeBaseID(
 	return allChunks, nil
 }
 
+// FindExactFAQQuestions searches current enabled FAQ entries without relying on vector recall.
+func (r *chunkRepository) FindExactFAQQuestions(ctx context.Context, target *types.SearchTarget, question string) ([]*types.Chunk, error) {
+	if strings.TrimSpace(question) == "" {
+		return nil, fmt.Errorf("empty FAQ question")
+	}
+	db, err := r.visibleFAQQuery(ctx, target)
+	if err != nil || db == nil {
+		return nil, err
+	}
+	question = strings.TrimSpace(question)
+	switch r.db.Name() {
+	case "mysql":
+		encoded, err := json.Marshal(question)
+		if err != nil {
+			return nil, err
+		}
+		db = db.Where("(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.standard_question')) = ? OR JSON_CONTAINS(metadata, ?, '$.similar_questions'))", question, string(encoded))
+	case "postgres":
+		db = db.Where("(metadata->>'standard_question' = ? OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(COALESCE(metadata->'similar_questions', '[]'::jsonb)) elem WHERE elem.value = ?))", question, question)
+	default:
+		db = db.Where("(json_extract(metadata, '$.standard_question') = ? OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(metadata, '$.similar_questions'), '[]')) WHERE value = ?))", question, question)
+	}
+	var chunks []*types.Chunk
+	if err := db.Find(&chunks).Error; err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+// GetVisibleFAQByID rechecks the selected entry under the same scope used for retrieval.
+func (r *chunkRepository) GetVisibleFAQByID(ctx context.Context, target *types.SearchTarget, id string) (*types.Chunk, error) {
+	db, err := r.visibleFAQQuery(ctx, target)
+	if err != nil || db == nil {
+		return nil, err
+	}
+	var chunk types.Chunk
+	err = db.Where("id = ?", id).Take(&chunk).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &chunk, nil
+}
+
+func (r *chunkRepository) visibleFAQQuery(ctx context.Context, target *types.SearchTarget) (*gorm.DB, error) {
+	if target == nil || target.TenantID == 0 || target.KnowledgeBaseID == "" {
+		return nil, fmt.Errorf("invalid FAQ search target")
+	}
+	if target.Type == types.SearchTargetTypeKnowledge && len(target.KnowledgeIDs) == 0 {
+		return nil, nil
+	}
+	if len(target.ScopeTagIDs) > 0 && len(target.TagIDs) == 0 {
+		return nil, fmt.Errorf("FAQ tag scope is not resolved")
+	}
+	db := r.db.WithContext(ctx).Model(&types.Chunk{}).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND chunk_type = ? AND is_enabled = ? AND status IN ?",
+			target.TenantID, target.KnowledgeBaseID, types.ChunkTypeFAQ, true,
+			[]int{int(types.ChunkStatusDefault), int(types.ChunkStatusIndexed)}).
+		// Exact search and publication must agree: an entry the final check
+		// rejects would otherwise be matched, scope-checked and dropped every turn.
+		Where("COALESCE(index_status, '') NOT IN ?", []string{"processing", "failed"}).
+		Where("EXISTS (SELECT 1 FROM knowledges k WHERE k.id = chunks.knowledge_id AND k.tenant_id = chunks.tenant_id AND k.knowledge_base_id = chunks.knowledge_base_id AND k.deleted_at IS NULL AND k.enable_status = ?)", "enabled")
+	if len(target.KnowledgeIDs) > 0 {
+		db = db.Where("knowledge_id IN ?", target.KnowledgeIDs)
+	}
+	if len(target.TagIDs) > 0 {
+		db = db.Where("tag_id IN ?", target.TagIDs)
+	}
+	return db, nil
+}
+
 // FindFAQChunkWithDuplicateQuestion finds a single FAQ chunk whose standard_question or
 // similar_questions overlap with the given question list.
 // Uses dialect-specific JSON queries (MySQL / PostgreSQL / SQLite).

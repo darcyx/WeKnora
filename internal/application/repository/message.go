@@ -293,7 +293,7 @@ func (r *messageRepository) UpdateMessage(ctx context.Context, message *types.Me
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&types.Message{}).Where(
 			"id = ? AND session_id = ?", message.ID, message.SessionID,
-		).Omit("context_checkpoint").Updates(message).Error; err != nil {
+		).Omit("context_checkpoint", "execution_context").Updates(message).Error; err != nil {
 			return err
 		}
 		// Updates skips zero values; written on its own so a resumed or

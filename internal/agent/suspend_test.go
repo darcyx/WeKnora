@@ -60,11 +60,15 @@ type suspendFixture struct {
 
 func newSuspendFixture(t *testing.T, firstName string, parallel bool) *suspendFixture {
 	t.Helper()
+	firstArgs := `{"q":"a"}`
+	if kbToolNames[firstName] {
+		firstArgs = `{"q":"a","retrieval":{"action":"initial","goal_quote":"test query","fact":"test fact"}}`
+	}
 	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{{
 		ResponseType: types.ResponseTypeAnswer,
 		Content:      "checking first",
 		ToolCalls: []types.LLMToolCall{
-			{ID: "call-a", Type: "function", Function: types.FunctionCall{Name: firstName, Arguments: `{"q":"a"}`}},
+			{ID: "call-a", Type: "function", Function: types.FunctionCall{Name: firstName, Arguments: firstArgs}},
 			{
 				ID: "call-b", Type: "function",
 				Function: types.FunctionCall{Name: suspendingToolName, Arguments: `{"path":"/etc"}`},

@@ -159,3 +159,17 @@ func TestWikiReadPageDedupesRequestedSlugs(t *testing.T) {
 
 	assertWellFormedPages(t, result.Output, 1)
 }
+
+func TestWikiReadSingleAmbiguousSlugDoesNotSuggestFewerSlugs(t *testing.T) {
+	pages := map[string]*types.WikiPage{}
+	var kbs []string
+	for i := 0; i < 5; i++ {
+		kb := fmt.Sprintf("kb-%d", i)
+		kbs = append(kbs, kb)
+		pages[wikiPageKey(kb, "index")] = newBulkyWikiPage(kb, "index", 4000)
+	}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: pages}, nil, NewWikiScopesFromKBIDs(kbs), NewWikiRouteResolver())
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 2000), tool, []string{"index"})
+	assert.NotContains(t, result.Output, "fewer slugs")
+	assert.Contains(t, result.Output, "knowledge_base_ids")
+}

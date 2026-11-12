@@ -47,6 +47,7 @@ export interface CustomAgentConfig {
   rerank_model_id?: string;         // ReRank 模型 ID
   temperature?: number;
   max_completion_tokens?: number;   // 0 = 跟随系统默认（快速问答 2048；智能推理 4096，绑沙箱可写文件时 24576）。大于 0 为自定义上限
+  max_tool_output_chars?: number;   // 0 = 跟随工具输出预算默认值
   thinking?: boolean;                      // 是否启用思考模式（支持扩展思考的模型）
   // 思考强度：off | auto | minimal | low | medium | high | xhigh | max。
   // 为空时退回 thinking 布尔值（true == auto，false == off）。
@@ -55,6 +56,7 @@ export interface CustomAgentConfig {
 
   // ===== Agent模式设置 =====
   max_iterations?: number;          // 最大迭代次数；-1 表示不限制
+  planning_enabled?: boolean;       // 复杂查询先拆解成步骤计划再进 ReAct 循环
   llm_call_timeout?: number;        // LLM调用超时时间（秒）
   allowed_tools?: string[] | null;  // 允许的工具；null/未设置 = 后端默认工具，[] = 不使用内置工具
   reflection_enabled?: boolean;     // 是否启用反思

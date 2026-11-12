@@ -196,7 +196,7 @@ func runAskNDJSON(ctx context.Context, opts *AskOptions, sessionID string, svc A
 }
 
 // runAskText handles the --format text path. It renders the same
-// projection as JSON immediately for both terminals and pipes.
+// projection as JSON. Editable answer segments are committed once for append-only output.
 func runAskText(ctx context.Context, opts *AskOptions, sessionID string, autoCreated bool, svc AskService) error {
 	req := &sdk.AgentQARequest{
 		Query:        opts.Query,
@@ -207,8 +207,22 @@ func runAskText(ctx context.Context, opts *AskOptions, sessionID string, autoCre
 
 	projector := sse.NewProjector(opts.Verbose, opts.Reference, "")
 	renderer := sse.NewTextRenderer(iostreams.IO.Out, opts.Verbose)
+	var answer sse.AgentAccumulator
+	var editable bool
 	cb := func(r *sdk.AgentStreamResponse) error {
+		if r == nil || projector.Done() {
+			return nil
+		}
 		event, include := projector.Agent(r)
+		if id, _ := r.Data["event_id"].(string); id != "" && r.ResponseType == sdk.AgentResponseTypeAnswer {
+			editable = true
+		}
+		if editable {
+			answer.Append(r)
+			if r.ResponseType == sdk.AgentResponseTypeAnswer {
+				return nil
+			}
+		}
 		if !include {
 			return nil
 		}
@@ -216,6 +230,13 @@ func runAskText(ctx context.Context, opts *AskOptions, sessionID string, autoCre
 	}
 
 	streamErr := svc.AgentQAStreamWithRequest(ctx, sessionID, req, cb)
+	if editable {
+		if text := answer.Answer(); text != "" {
+			if err := renderer.Write(sse.ProjectedEvent{ResponseType: "answer", Content: text, Done: true}); err != nil {
+				return err
+			}
+		}
+	}
 	if streamErr != nil {
 		if autoCreated {
 			fmt.Fprintf(iostreams.IO.Err, "session: %s (resume with --session %s)\n", sessionID, sessionID)

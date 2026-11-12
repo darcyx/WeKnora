@@ -66,6 +66,21 @@ func TestAgentConfigCarriesMaxCompletionTokens(t *testing.T) {
 	require.Equal(t, 64000, agentConfig.MaxCompletionTokens)
 }
 
+func TestAgentConfigCarriesPlanningPreference(t *testing.T) {
+	svc := &sessionService{cfg: &config.Config{}, webSearchProviderRepo: &sharedAgentWebSearchRepo{}}
+	for _, enabled := range []bool{false, true} {
+		req := &types.QARequest{
+			Session: &types.Session{ID: "session-1", TenantID: 1},
+			CustomAgent: &types.CustomAgent{TenantID: 1, Config: types.CustomAgentConfig{
+				MaxIterations: 5, PlanningEnabled: enabled,
+			}},
+		}
+		cfg, err := svc.buildAgentConfig(t.Context(), req, &types.Tenant{ID: 1}, 1)
+		require.NoError(t, err)
+		require.Equal(t, enabled, cfg.PlanningEnabled)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }
 
 // An unset MCP mode runs as "all" for the owner, but the share scope shows it
@@ -89,4 +104,19 @@ func TestAgentConfigUnsetMCPModeIsNoneForSharedRuns(t *testing.T) {
 			require.Empty(t, agentConfig.MCPSelectionMode, "the owner's own runs keep the default")
 		}
 	}
+}
+
+// The agent path used to ignore the agent's fallback settings entirely.
+func TestAgentConfigCarriesFallbackSettings(t *testing.T) {
+	svc := &sessionService{cfg: &config.Config{}, webSearchProviderRepo: &sharedAgentWebSearchRepo{}}
+	req := &types.QARequest{
+		Session: &types.Session{ID: "session-1", TenantID: 1},
+		CustomAgent: &types.CustomAgent{TenantID: 1, Config: types.CustomAgentConfig{
+			MaxIterations: 5, FallbackStrategy: "fixed", FallbackResponse: "暂无相关信息",
+		}},
+	}
+	cfg, err := svc.buildAgentConfig(t.Context(), req, &types.Tenant{ID: 1}, 1)
+	require.NoError(t, err)
+	require.Equal(t, "fixed", cfg.FallbackStrategy)
+	require.Equal(t, "暂无相关信息", cfg.FallbackResponse)
 }

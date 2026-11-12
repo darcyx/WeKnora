@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/agent/collaboration"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	appconfig "github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
@@ -48,6 +50,11 @@ func (s *sessionService) AgentQA(
 	req *types.QARequest,
 	eventBus *event.EventBus,
 ) error {
+	if s.cfg != nil && s.cfg.Agent != nil && s.cfg.Agent.QATotalTimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.Agent.QATotalTimeoutSeconds)*time.Second)
+		defer cancel()
+	}
 	sessionID := req.Session.ID
 	if req.Session.Kind == types.SessionKindAgentDelegated {
 		b := collaboration.FromContext(ctx)
@@ -62,12 +69,6 @@ func (s *sessionService) AgentQA(
 	// bind script execution to a per-session MicroVM instance.
 	ctx = types.WithSessionID(ctx, sessionID)
 	ctx = types.WithRunMode(ctx, req.Mode)
-	sessionJSON, err := json.Marshal(req.Session)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal session, session ID: %s, error: %v", sessionID, err)
-		return fmt.Errorf("failed to marshal session: %w", err)
-	}
-
 	// customAgent is required for AgentQA (handler has already done permission check for shared agent)
 	if req.CustomAgent == nil {
 		logger.Warnf(ctx, "Custom agent not provided for session: %s", sessionID)
@@ -76,8 +77,8 @@ func (s *sessionService) AgentQA(
 
 	// Resolve retrieval tenant using shared helper
 	agentTenantID := s.resolveRetrievalTenantID(ctx, req)
-	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query: %s, session: %s",
-		sessionID, agentTenantID, req.Query, string(sessionJSON))
+	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query length: %d",
+		sessionID, agentTenantID, len([]rune(req.Query)))
 
 	var tenantInfo *types.Tenant
 	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
@@ -197,15 +198,22 @@ func (s *sessionService) AgentQA(
 					req.CustomAgent.ID)
 			}
 		} else if rerankModelID == "" {
-			logger.Warnf(ctx, "No rerank model configured for custom agent %s, but knowledge_search tool is enabled", req.CustomAgent.ID)
-			return errors.New("rerank model is not configured: please set rerank_model_id on the agent")
+			// A missing rerank model degrades ranking quality, it does not make
+			// the knowledge base unreadable: search_knowledge keeps the
+			// retrieval order without one. Failing the whole turn here turned an
+			// optional component into a hard start-up gate for every question.
+			logger.Warnf(ctx, "No rerank model configured for custom agent %s; knowledge_search will keep retrieval order",
+				req.CustomAgent.ID)
 		}
 
 		if rerankModelID != "" {
-			rerankModel, err = s.modelService.GetRerankModel(ctx, rerankModelID)
-			if err != nil {
-				logger.Warnf(ctx, "Failed to get rerank model: %v", err)
-				return fmt.Errorf("failed to get rerank model: %w", err)
+			// A local error keeps the turn's own error value untouched: a
+			// degraded rerank must not leak into a later `if err != nil`.
+			model, getErr := s.modelService.GetRerankModel(ctx, rerankModelID)
+			if getErr != nil {
+				logger.Warnf(ctx, "Failed to get rerank model %s, searching without reranking: %v", rerankModelID, getErr)
+			} else {
+				rerankModel = model
 			}
 		}
 	} else {
@@ -221,18 +229,34 @@ func (s *sessionService) AgentQA(
 	var llmContext []chat.Message
 	if agentConfig.MultiTurnEnabled {
 		budget := agent.HistoryTokenBudget(agentConfig)
-		llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
-			ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory,
-		)
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
+				ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory,
+			)
+			if err == nil {
+				break
+			}
+			logger.Warnf(ctx, "Failed to load agent history (attempt %d/2): %v", attempt+1, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
-			logger.Warnf(ctx, "Failed to load agent history from DB: %v, continuing without history", err)
-			llmContext = []chat.Message{}
+			return fmt.Errorf("failed to load conversation history; please retry: %w", err)
 		}
 		logger.Infof(ctx, "Loaded %d history messages from DB (budget=%d tokens, token scale=%.2f)",
 			len(llmContext), budget, agentConfig.ContextTokenScale)
 	} else {
 		logger.Infof(ctx, "Multi-turn disabled for this agent, running without history")
 		llmContext = []chat.Message{}
+	}
+
+	// FAQ matching belongs to the incoming question, before restoring the Agent's retrieval state.
+	if answered, err := s.tryAgentFAQ(ctx, req, agentConfig, eventBus, summaryModel, rerankModel, llmContext); answered || err != nil {
+		return err
 	}
 
 	// Hold the sandbox across this turn so an install that finishes while we
@@ -320,6 +344,13 @@ func (s *sessionService) AgentQA(
 		return err
 	}
 
+	if receiver, ok := engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
+		receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
+	}
+	if err := s.bindAgentRetrievalState(ctx, req, agentConfig, engine); err != nil {
+		return err
+	}
+
 	// Recall long-term memory for this turn. Like the RAG path this is a
 	// no-model read, and an agent may opt out of it entirely.
 	memoryCtx := types.ApplyAgentMemoryPreference(ctx, agentConfig.MemoryEnabled)
@@ -344,6 +375,9 @@ func (s *sessionService) AgentQA(
 	// through it. Nil (IM/embed) keeps the old behaviour untouched.
 	if req.SteerSink != nil {
 		engine.SetSteerSink(req.SteerSink)
+		if receiver, ok := engine.(interface{ SetSteerFAQ(agent.SteerFAQFunc) }); ok {
+			receiver.SetSteerFAQ(s.steerFAQ(req, agentConfig, eventBus, summaryModel, rerankModel, llmContext))
+		}
 	}
 
 	engine.SetRunMode(req.Mode)
@@ -415,6 +449,9 @@ func (s *sessionService) AgentQA(
 	// Execute agent with streaming (asynchronously)
 	// Events will be emitted to EventBus and handled by the Handler layer
 	logger.Info(ctx, "Executing agent with streaming")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if req.Resume != nil {
 		_, err = engine.Resume(ctx, sessionID, req.AssistantMessageID, llmContext,
 			req.Resume.Snapshot, req.Resume.Prompt)
@@ -422,17 +459,8 @@ func (s *sessionService) AgentQA(
 		_, err = engine.Execute(ctx, sessionID, req.AssistantMessageID, agentQuery, llmContext, agentImageURLs)
 	}
 	if err != nil {
+		// The engine has already emitted EventError for this failure.
 		logger.Errorf(ctx, "Agent execution failed: %v", err)
-		// Emit error event to the EventBus used by this agent
-		eventBus.Emit(ctx, event.Event{
-			Type:      event.EventError,
-			SessionID: sessionID,
-			Data: event.ErrorData{
-				Error:     err.Error(),
-				Stage:     "agent_execution",
-				SessionID: sessionID,
-			},
-		})
 	}
 	// Return empty - events will be handled by Handler via EventBus subscription
 	return nil
@@ -512,6 +540,29 @@ func resumableAgentRequest(ctx context.Context, req *types.QARequest) types.Resu
 
 // buildAgentConfig creates a runtime AgentConfig from the QARequest's custom agent configuration,
 // tenant info, and resolved knowledge bases / search targets.
+// hardIterationCap reads the workspace's absolute round ceiling for agents
+// that declare unlimited iterations.
+func hardIterationCap(cfg *appconfig.Config) int {
+	if cfg == nil || cfg.Agent == nil {
+		return 0 // AgentConfig.HardIterationLimit applies its default.
+	}
+	return cfg.Agent.HardIterationCap()
+}
+
+// Only explicit, standalone documentation definition/navigation requests qualify.
+var resourceNavigationQuestion = regexp.MustCompile(`^(?:(?:服务端|客户端|SDK|PCSDK|接口|开发|接入|项目)文档(?:是什么|在哪里|在哪|入口在哪|入口在哪里)|什么是(?:服务端|客户端|SDK|PCSDK|接口|开发|接入|项目)文档)[？?。]?$`)
+
+func eligibleResourceNavigation(req *types.QARequest, cfg *types.AgentConfig) bool {
+	if req == nil || cfg == nil || req.ReasoningEffort != "" || cfg.PlanningEnabled ||
+		(cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "minimal") || req.Resume != nil || req.RunNote != "" ||
+		req.Session == nil || req.Session.Kind == types.SessionKindAgentDelegated || len(req.SkillNames) > 0 || len(req.MCPServiceIDs) > 0 ||
+		len(req.ImageURLs) > 0 || req.ImageDescription != "" || len(req.Attachments) > 0 || req.QuotedContext != "" ||
+		req.PageContext != nil || req.LocalBrowserEnabled || req.WebSearchEnabled {
+		return false
+	}
+	return resourceNavigationQuestion.MatchString(strings.TrimSpace(req.Query))
+}
+
 func (s *sessionService) buildAgentConfig(
 	ctx context.Context,
 	req *types.QARequest,
@@ -526,6 +577,7 @@ func (s *sessionService) buildAgentConfig(
 	customAgent := req.CustomAgent
 	agentConfig := &types.AgentConfig{
 		MaxIterations:                 customAgent.Config.MaxIterations,
+		PlanningEnabled:               customAgent.Config.PlanningEnabled,
 		Temperature:                   customAgent.Config.Temperature,
 		WebSearchEnabled:              customAgent.Config.WebSearchEnabled && req.WebSearchEnabled,
 		LocalBrowserEnabled:           req.LocalBrowserEnabled,
@@ -541,8 +593,12 @@ func (s *sessionService) buildAgentConfig(
 		ReasoningEffort:               customAgent.Config.ReasoningEffort,
 		CitationEnabled:               customAgent.Config.CitationEnabled,
 		RetrieveKBOnlyWhenMentioned:   customAgent.Config.RetrieveKBOnlyWhenMentioned,
+		FallbackStrategy:              customAgent.Config.FallbackStrategy,
+		FallbackResponse:              customAgent.Config.FallbackResponse,
 		LLMCallTimeout:                customAgent.Config.LLMCallTimeout,
 		MaxCompletionTokens:           customAgent.Config.MaxCompletionTokens,
+		MaxToolOutputChars:            customAgent.Config.MaxToolOutputChars,
+		EmbeddingTopK:                 customAgent.Config.EmbeddingTopK,
 		RetainRetrievalHistory:        customAgent.Config.RetainRetrievalHistory,
 		AppInfo:                       req.AppInfo,
 		SharedAgentReadOnly:           req.SharedAgentReadOnly,
@@ -553,8 +609,13 @@ func (s *sessionService) buildAgentConfig(
 		// Only read-only tools overlap (agenttools.CanRunConcurrently);
 		// anything else is a barrier that runs alone, in model order.
 		ParallelToolCalls: true,
+		// An agent may declare unlimited rounds (smart-reasoning). The absolute
+		// ceiling keeps an unstable model that keeps changing its arguments from
+		// running until the user cancels; 0 in config means the default.
+		HardMaxIterations: hardIterationCap(s.cfg),
 	}
 	applyRequestReasoningEffort(req.ReasoningEffort, &agentConfig.Thinking, &agentConfig.ReasoningEffort)
+	agentConfig.ResourceNavigationFastAnswer = eligibleResourceNavigation(req, agentConfig)
 	// An unset MCP mode means "all" at runtime, but the share scope and the
 	// agent UI both present it as none. A shared run must not hand receivers
 	// every MCP service (with the owner's credentials) that its owner believes

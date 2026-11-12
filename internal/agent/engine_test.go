@@ -337,10 +337,25 @@ func withMaxContextTokens(n int) testEngineOption {
 	}
 }
 
+func withPlanningEnabled(enabled bool) testEngineOption {
+	return func(cfg *types.AgentConfig) {
+		cfg.PlanningEnabled = enabled
+	}
+}
+
 func TestWithinIterationBudgetUnlimited(t *testing.T) {
+	// Unlimited for the model, bounded for the run: the no-progress guards only
+	// recognise identical calls, so an absolute ceiling backstops them.
 	unlimited := newTestEngine(t, &mockChat{}, withMaxIterations(types.UnlimitedMaxIterations))
 	require.True(t, unlimited.withinIterationBudget(0))
-	require.True(t, unlimited.withinIterationBudget(10_000))
+	require.True(t, unlimited.withinIterationBudget(types.DefaultHardIterations-1))
+	require.False(t, unlimited.withinIterationBudget(types.DefaultHardIterations),
+		"an unlimited run still has an absolute ceiling")
+	unlimited.config.HardMaxIterations = 5
+	require.False(t, unlimited.withinIterationBudget(5), "a configured ceiling is honoured")
+	unlimited.config.HardMaxIterations = -1
+	require.True(t, unlimited.withinIterationBudget(10_000),
+		"a negative ceiling keeps the run intentionally unbounded")
 	require.Equal(t, "unlimited", unlimited.maxIterationsDisplay())
 
 	capped := newTestEngine(t, &mockChat{}, withMaxIterations(3))
@@ -698,6 +713,9 @@ func TestRedactHistoryKBResultsKeepsTurnID(t *testing.T) {
 	require.Len(t, redacted, 1)
 	require.NotEqual(t, "stale chunk", redacted[0].Content)
 	require.Equal(t, "turn-a", redacted[0].TurnID)
+	require.NotContains(t, redacted[0].Content, "Please perform a fresh search")
+	require.Contains(t, redacted[0].Content, "only if the current answer needs it")
+	require.Contains(t, redacted[0].Content, "does not reset retrieval state or budgets")
 }
 
 // History loads up to the whole window, past the compaction threshold, so the
@@ -760,15 +778,16 @@ func TestClampCompletionBudgetToContext(t *testing.T) {
 			clampCompletionBudgetToContext(999999))
 }
 
-func TestBuildSystemPromptUsesInternalCitationSetting(t *testing.T) {
-	model := &mockChat{}
-	enabledEngine := newTestEngine(t, model)
-	require.Contains(t, enabledEngine.buildSystemPrompt(context.Background()), "Source citations are enabled")
-
-	disabledEngine := newTestEngine(t, model, withCitationsEnabled(false))
-	prompt := disabledEngine.buildSystemPrompt(context.Background())
-	require.Contains(t, prompt, "Source citations are disabled")
-	require.NotContains(t, prompt, "Source citations are enabled")
+func TestBuildSystemPromptLeavesReferenceRulesToCustomPrompt(t *testing.T) {
+	const referenceRule = "参考来源仅列实际使用且有有效链接的文档，按文档去重。"
+	for _, enabled := range []bool{true, false} {
+		engine := newTestEngine(t, &mockChat{}, withCitationsEnabled(enabled))
+		engine.systemPromptTemplate = referenceRule
+		prompt := engine.buildSystemPrompt(context.Background())
+		require.Contains(t, prompt, referenceRule)
+		require.NotContains(t, prompt, "Source citations are")
+		require.NotContains(t, prompt, "These rules supersede")
+	}
 }
 
 func TestBuildSystemPromptUsesHostWorkspace(t *testing.T) {

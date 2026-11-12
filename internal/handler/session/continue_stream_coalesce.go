@@ -35,7 +35,8 @@ func coalesceReplayEvents(events []interfaces.StreamEvent) []interfaces.StreamEv
 		}
 	}
 	for _, evt := range events {
-		mergeable := deltaResponseTypes[evt.Type] && !evt.Done
+		replace, _ := evt.Data["replace"].(bool)
+		mergeable := deltaResponseTypes[evt.Type] && !evt.Done && !replace
 		if open {
 			last := &out[len(out)-1]
 			if mergeable && last.Type == evt.Type && last.ID == evt.ID {

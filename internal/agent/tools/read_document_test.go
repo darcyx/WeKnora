@@ -574,6 +574,26 @@ func TestReadDocumentQueryMatchesEveryWordInAnyOrder(t *testing.T) {
 	}
 }
 
+func TestReadDocumentQueryFallsBackToChunksMatchingMostWords(t *testing.T) {
+	tool, repo := newReadDocumentFixture(5)
+	repo.ordered[1].Content = "支付回调地址需要加入白名单"
+	repo.ordered[3].Content = "请提供服务器出口IP"
+	res, err := tool.Execute(context.Background(), json.RawMessage(`{"id":"doc-1","query":"支付回调 白名单 出口IP"}`))
+	if err != nil || !res.Success {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if res.Data["match_count"] != 1 || res.Data["terms_matched"] != 2 || res.Data["query_terms"] != 3 {
+		t.Fatalf("no chunk holds every word, so the chunks holding the most words match: %+v", res.Data)
+	}
+	rows := res.Data["chunks"].([]map[string]interface{})
+	if rows[1]["chunk_id"] != "chunk-1" || rows[1]["role"] != "match" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if !strings.Contains(res.Output, "2 of 3") {
+		t.Fatalf("a partial match must say so: %s", res.Output)
+	}
+}
+
 func TestReadDocumentQueryWithoutMatchesKeepsHeader(t *testing.T) {
 	tool, _ := newReadDocumentFixture(3)
 	res, err := tool.Execute(context.Background(), json.RawMessage(`{"id":"doc-1","query":"absent"}`))

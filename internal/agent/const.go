@@ -74,6 +74,15 @@ const (
 	// calls allowed before the model is asked to switch tools or strategies.
 	maxConsecutiveFailedToolCalls = 3
 
+	// maxRepeatedIdenticalToolCalls is how many times the same successful tool
+	// call may repeat with identical arguments before the model is nudged to
+	// stop re-running it. The failed-call guard above only trips on failures;
+	// a call that keeps succeeding (for example re-issuing the same search
+	// query) is a stuck loop too, but it resets the failure streak on every
+	// success and so was previously invisible to the guards. Each repeat still
+	// costs one full LLM round plus the tool's own work.
+	maxRepeatedIdenticalToolCalls = 3
+
 	// maxConsecutiveLengthRounds is how many rounds in a row may be cut off at
 	// the completion-token cap before the loop gives up. A truncated answer
 	// already ends the turn (analyzeResponse Case 2), so reaching this limit
@@ -94,6 +103,24 @@ const truncatedAnswerFallback = "Sorry, this answer kept hitting the model's per
 // stalledAnswerFallback is delivered when a no-progress guard stopped the turn
 // and the round that tripped it produced no text.
 const stalledAnswerFallback = "I'm sorry, I was unable to generate a response. Please try again."
+
+// configuredFallback is the agent's fixed no-answer response, or "" when the
+// agent leaves the fallback to the model.
+func (e *AgentEngine) configuredFallback() string {
+	if e == nil || e.config == nil || e.config.FallbackStrategy != string(types.FallbackStrategyFixed) {
+		return ""
+	}
+	return strings.TrimSpace(e.config.FallbackResponse)
+}
+
+// fallbackAnswer is the stalled-turn answer: the configured fixed response
+// when one is set, otherwise stalledAnswerFallback.
+func (e *AgentEngine) fallbackAnswer() string {
+	if fixed := e.configuredFallback(); fixed != "" {
+		return fixed
+	}
+	return stalledAnswerFallback
+}
 
 // Empty model output is a runtime recovery condition, not new user steering.
 const emptyResponseRetryNotice = "<runtime_event>\n" +

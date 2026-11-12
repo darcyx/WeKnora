@@ -806,3 +806,13 @@ func TestChatStream_EOFWithoutFinishReasonIsIncomplete(t *testing.T) {
 		})
 	}
 }
+
+func TestEffectiveThinkingParamsAllowlist(t *testing.T) {
+	params := effectiveThinkingParams(map[string]any{
+		"enable_thinking": true, "thinking_budget": float64(4096), "reasoning_effort": "low",
+		"chat_template_kwargs": map[string]any{"enable_thinking": false, "private": "secret"},
+		"thinking":             map[string]any{"private": "secret"}, "messages": "secret",
+	})
+	assert.Equal(t, map[string]interface{}{"enable_thinking": true, "thinking_budget": float64(4096), "reasoning_effort": "low", "chat_template_kwargs.enable_thinking": false}, params)
+	assert.Empty(t, effectiveThinkingParams(map[string]any{"reasoning_effort": "secret", "thinking_budget": "secret"}))
+}

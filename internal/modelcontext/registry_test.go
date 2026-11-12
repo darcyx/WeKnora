@@ -383,6 +383,11 @@ func TestRegistryDecodesCanonicalArgumentsForEveryBuiltInReferenceTool(t *testin
 			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
 		},
 		{
+			"knowledge graph with double-encoded KB handles", "query_knowledge_graph",
+			`{"knowledge_base_ids":"[\"kb://1\"]","query":"topic"}`,
+			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
+		},
+		{
 			"data analysis SQL", "data_analysis",
 			`{"knowledge_id":"doc://1","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'doc://1'"}`,
 			`{"knowledge_id":"doc-real","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'weknora://doc/doc-real'"}`,
@@ -532,14 +537,23 @@ func TestMCPBridgeKeepsExternalSchemasAndArgumentsOpaque(t *testing.T) {
 	}
 }
 
-func TestCitationPolicyDoesNotSuppressRequestedResourcesOrBreakOutputFormat(t *testing.T) {
-	disabled := NewRegistry(false).ProtocolPrompt()
-	require.Contains(t, disabled, "Source citations are disabled")
-	require.Contains(t, disabled, "a URL explicitly requested by the user")
-	require.Contains(t, disabled, "downloadable deliverables")
-	require.NotContains(t, disabled, "Do not output <ref>, <kb>, <web>, raw source URLs")
-	enabled := NewRegistry(true).ProtocolPrompt()
-	require.Contains(t, enabled, "do not break a required schema")
+func TestReferencePresentationBelongsToPrompt(t *testing.T) {
+	require.Equal(t, NewRegistry(true).ProtocolPrompt(), NewRegistry(false).ProtocolPrompt())
+	for _, enabled := range []bool{true, false} {
+		registry := NewRegistry(enabled)
+		prompt := registry.ProtocolPrompt()
+		require.NotContains(t, prompt, "Source citations are")
+		require.NotContains(t, prompt, "参考来源")
+		require.NotContains(t, prompt, "These rules supersede")
+		rawURL := "https://example.com/document"
+		handle := registry.RegisterWeb(rawURL, "文档")
+		answer := `参考来源
+- <a href="` + handle + `" target="_blank">文档</a>`
+		want := `参考来源
+- <a href="` + rawURL + `" target="_blank">文档</a>`
+		require.Equal(t, want, registry.DecodeOutputText(answer))
+		require.Equal(t, want, registry.DecodeOutputText(want))
+	}
 }
 
 func TestRegistryDecodesReadDocumentIDAgainstBothHandleTables(t *testing.T) {

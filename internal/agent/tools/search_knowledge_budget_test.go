@@ -36,3 +36,17 @@ func TestFormatWithinBudgetKeepsLargestRankedPrefix(t *testing.T) {
 		t.Fatalf("unexpected ranked rows: %v", rows)
 	}
 }
+
+func TestFormatWithinBudgetListsOmittedDocumentsWithinBudget(t *testing.T) {
+	tool := &SearchKnowledgeTool{}
+	results := []*searchResultWithMeta{
+		{SearchResult: &types.SearchResult{ID: "c1", KnowledgeID: "d1", KnowledgeTitle: "first", Content: strings.Repeat("x", 500)}, KnowledgeBaseID: "kb"},
+		{SearchResult: &types.SearchResult{ID: "c2", KnowledgeID: "d2", KnowledgeTitle: "second", Content: strings.Repeat("secret", 2000)}, KnowledgeBaseID: "kb"},
+	}
+	ctx := WithOutputBudget(context.Background(), 2500)
+	result, omitted := tool.formatWithinBudget(ctx, results, []string{"kb"}, "q", SearchModeHybrid)
+	rows, ok := result.Data["omitted_candidates"].([]map[string]interface{})
+	if omitted != 1 || !ok || len(rows) != 1 || rows[0]["knowledge_id"] != "d2" || !strings.Contains(result.Output, `title="second"`) || strings.Contains(result.Output, "secret") || utf8.RuneCountInString(result.Output) > OutputBudget(ctx)*4/5 {
+		t.Fatalf("omitted=%d data=%v output=%s", omitted, rows, result.Output)
+	}
+}

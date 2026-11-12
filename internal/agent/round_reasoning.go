@@ -1,0 +1,100 @@
+package agent
+
+import (
+	"context"
+	"os"
+	"strings"
+
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+
+	"github.com/Tencent/WeKnora/internal/models/api"
+	"github.com/Tencent/WeKnora/internal/models/chat"
+)
+
+// skipPreEvidenceThinkingEnv opts in to running tool rounds without extended
+// thinking until the current question has a successful retrieval. Off by
+// default: it trades query-planning depth for ~4s per round, so enable it only
+// where an eval shows answers hold up.
+const skipPreEvidenceThinkingEnv = "WEKNORA_AGENT_SKIP_PRE_EVIDENCE_THINKING"
+
+// roundReasoningEffort is the configured level for this round. With the opt-in
+// set, a round that may call tools and has no retrieved result for the current
+// question yet runs with thinking off; it mostly picks searches, and the round
+// that sees results keeps the configured level.
+func (e *AgentEngine) roundReasoningEffort(ctx context.Context, tools []chat.Tool) chat.ReasoningEffort {
+	configured := chat.SanitizeReasoningEffort(ctx, e.config.ReasoningEffort, "agent config")
+	if len(tools) == 0 || e.retrieval == nil || !agentOptIn(skipPreEvidenceThinkingEnv) ||
+		e.retrievedForCurrentQuestion() {
+		return configured
+	}
+	return api.ReasoningOff
+}
+
+// agentOptIn reports whether an experimental agent latency switch is set to true.
+func agentOptIn(env string) bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv(env)), "true")
+}
+
+// retrievedForCurrentQuestion reports whether any retrieval for the current
+// user message completed successfully. An empty result still counts: the model
+// has something to reason about.
+func (e *AgentEngine) retrievedForCurrentQuestion() bool {
+	state := e.retrieval.snapshot()
+	question := state.questionID()
+	for _, attempt := range state.Attempts {
+		if attempt.Completed && attempt.Outcome == retrievalSuccess && attempt.QuestionID == question {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *AgentEngine) resourceNavigationHasOneWiki(messages []chat.Message) bool {
+	if !e.config.ResourceNavigationFastAnswer || e.retrieval == nil || len(e.pinnedSkills) > 0 || len(e.pinnedMCPServices) > 0 {
+		return false
+	}
+	calls, users := 0, 0
+	for _, message := range messages {
+		if message.Role == "user" {
+			users++
+		}
+		for _, call := range message.ToolCalls {
+			if call.Function.Name != agenttools.ToolWikiReadPage {
+				return false
+			}
+			calls++
+		}
+	}
+	if calls != 1 || users != 1 {
+		return false
+	}
+	state := e.retrieval.snapshot()
+	var wiki *retrievalAttempt
+	for i := range state.Attempts {
+		a := &state.Attempts[i]
+		if a.FAQOnly {
+			if a.Outcome != retrievalSuccess || len(a.Failures) > 0 {
+				return false
+			}
+			continue
+		}
+		if wiki != nil || a.QuestionID != state.questionID() || a.Tool != agenttools.ToolWikiReadPage || !a.Completed || a.Outcome != retrievalSuccess || len(a.Failures) > 0 {
+			return false
+		}
+		wiki = a
+	}
+	if wiki == nil || strings.Count(wiki.Content, "<wiki_page>") != 1 || strings.Contains(wiki.Content, "<omitted_pages") || strings.Contains(wiki.Content, "[output truncated:") || strings.Contains(wiki.Content, "(body omitted:") {
+		return false
+	}
+	for _, warning := range []string{"占位", "未终审", "未审核", "未经审核", "待审核", "待确认"} {
+		if strings.Contains(wiki.Content, warning) {
+			return false
+		}
+	}
+	_, body, ok := strings.Cut(wiki.Content, "<content>")
+	if !ok {
+		return false
+	}
+	body, _, ok = strings.Cut(body, "</content>")
+	return ok && strings.TrimSpace(body) != ""
+}

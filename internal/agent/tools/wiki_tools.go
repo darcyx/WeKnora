@@ -22,7 +22,7 @@ import (
 // to get a sense of the wiki's shape; any deeper exploration should go
 // through wiki_search. Keeping the cap small bounds the content envelope
 // served to the LLM, which is the main reason this synthesis exists.
-const wikiIndexAgentTopK = 20
+const wikiIndexAgentTopK = 5
 
 // renderIndexOverviewForAgent formats a WikiIndexResponse as a compact
 // markdown block suitable for embedding inside the <content> tag that
@@ -323,7 +323,7 @@ const (
 	// link section, and wikiLinkSummaryMaxRunes bounds each one. A hub page can
 	// carry dozens of links, and inlining every full summary used to spend more
 	// of the output budget than the page bodies the caller asked for.
-	wikiMaxLinkSummaries    = 20
+	wikiMaxLinkSummaries    = 3
 	wikiLinkSummaryMaxRunes = 150
 
 	// wikiMinPageBody is the smallest body slice worth rendering. When the
@@ -471,16 +471,17 @@ func NewWikiReadPageTool(
 		BaseTool: NewBaseTool(
 			ToolWikiReadPage,
 			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, and links.
-Use this to read specific wiki pages when you know their slug (e.g. "entity/acme-corp", "concept/rag").
-Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned.`,
+Use the exact slug from the wiki directory or the target of a returned [[slug|title]] link.
+Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned. If the intended knowledge base is known, pass knowledge_base_ids to return only pages from those allowed knowledge bases; duplicates of the slug in other allowed knowledge bases are still reported as a note.`,
 			json.RawMessage(`{
   "type": "object",
   "properties": {
     "slugs": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "List of wiki page slugs to read (e.g. ['entity/acme-corp', 'index'])"
-    }
+      "description": "Wiki page slugs, preserving their original paths; use 'index' for the index overview"
+    },
+    "knowledge_base_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional known knowledge bases within the allowed scope"}
   },
   "required": ["slugs"]
 }`),
@@ -501,8 +502,9 @@ func seenLinkKey(kbID, slug string) string {
 
 func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	var params struct {
-		Slug  any `json:"slug"`
-		Slugs any `json:"slugs"`
+		Slug             any      `json:"slug"`
+		Slugs            any      `json:"slugs"`
+		KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return &types.ToolResult{Success: false, Error: "Invalid parameters: " + err.Error()}, nil
@@ -518,6 +520,26 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 	if len(slugsToFetch) == 0 {
 		return &types.ToolResult{Success: false, Error: "Missing 'slugs' parameter"}, nil
 	}
+
+	// knowledge_base_ids only narrows which pages are rendered. Lookups still
+	// cover every legal scope so a duplicate slug elsewhere is reported, not hidden.
+	scopes := t.scopes
+	var requested map[string]bool
+	if len(params.KnowledgeBaseIDs) > 0 {
+		requested = make(map[string]bool, len(params.KnowledgeBaseIDs))
+		for _, id := range params.KnowledgeBaseIDs {
+			requested[id] = true
+		}
+		inScope := false
+		for _, scope := range t.scopes {
+			inScope = inScope || requested[scope.KnowledgeBaseID]
+		}
+		if !inScope {
+			return &types.ToolResult{Success: false, Error: "No requested knowledge bases are in the allowed wiki scope"}, nil
+		}
+	}
+	// slug -> allowed KBs (outside knowledge_base_ids) that also hold the slug.
+	alsoIn := make(map[string][]string)
 
 	var pending []pendingWikiPage
 	var errs []string
@@ -626,13 +648,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 			page *types.WikiPage
 			kbID string
 		}
-		cachedScopes := t.routes.scopesForSlug(slug, t.scopes)
+		cachedScopes := t.routes.scopesForSlug(slug, scopes)
 		// Provenance is an ordering hint, never an authority boundary. Always
 		// inspect every legal scope so a cached hit cannot hide a duplicate slug
 		// in another Wiki KB and make the model act on an apparently unique page.
 		effectiveScopes := append(
 			append([]WikiScope(nil), cachedScopes...),
-			scopesOutsideKBs(t.scopes, cachedScopes)...,
+			scopesOutsideKBs(scopes, cachedScopes)...,
 		)
 
 		lookupScopes := func(scopes []WikiScope) {
@@ -673,6 +695,10 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 					filteredOut[slug] = append(filteredOut[slug], actualKBID)
 					continue
 				}
+				if requested != nil && !requested[actualKBID] {
+					alsoIn[slug] = append(alsoIn[slug], actualKBID)
+					continue
+				}
 
 				hits = append(hits, struct {
 					page *types.WikiPage
@@ -698,6 +724,10 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 					"Wiki page '%s' exists in %v but none of its source documents are within the scope pinned by the user",
 					slug, kbs,
 				))
+			} else if kbs := alsoIn[slug]; len(kbs) > 0 {
+				errs = append(errs, fmt.Sprintf(
+					"Wiki page '%s' not found in requested knowledge_base_ids; it exists in allowed KB %v", slug, kbs,
+				))
 			} else if !lookupFailed[slug] {
 				errs = append(errs, fmt.Sprintf("Wiki page '%s' not found", slug))
 			}
@@ -717,15 +747,27 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 
 	finalOutput, truncatedSlugs, omittedSlugs := renderWikiPagesWithinBudget(pending, OutputBudget(ctx))
 	if len(omittedSlugs) > 0 {
+		hint := "Read the needed page again with knowledge_base_ids limited to its known allowed knowledge base."
+		if len(slugsToFetch) > 1 {
+			hint = "Call wiki_read_page again with fewer slugs, or limit knowledge_base_ids to the known allowed knowledge base."
+		}
 		finalOutput += fmt.Sprintf(
 			"\n\n<omitted_pages reason=\"output budget exceeded\">\n%s\n</omitted_pages>"+
 				"\n<hint>These pages were resolved but not rendered. "+
-				"Call wiki_read_page again with fewer slugs to read them.</hint>",
-			strings.Join(omittedSlugs, "\n"),
+				"%s</hint>",
+			strings.Join(omittedSlugs, "\n"), hint,
 		)
 	}
 	if len(errs) > 0 {
 		finalOutput += fmt.Sprintf("\n\n<errors>\n%s\n</errors>", strings.Join(errs, "\n"))
+	}
+	for _, slug := range slugsToFetch {
+		if kbs := alsoIn[slug]; len(kbs) > 0 && len(foundKBs[slug]) > 0 {
+			finalOutput += fmt.Sprintf(
+				"\n<note>Ambiguous slug: '%s' also exists in allowed KB %v, not rendered because of knowledge_base_ids.</note>",
+				slug, kbs,
+			)
+		}
 	}
 
 	// Surface ambiguous slugs so the caller (and logs) can see when a slug
@@ -745,6 +787,7 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 			"ambiguous_slugs": ambiguous,
 			"truncated_slugs": truncatedSlugs,
 			"omitted_slugs":   omittedSlugs,
+			"unrequested_kbs": alsoIn,
 		},
 	}, nil
 }
@@ -797,7 +840,7 @@ func NewWikiSearchTool(
     },
     "limit": {
       "type": "integer",
-      "description": "Maximum pages to return per knowledge base (default 10, max 50)",
+      "description": "Maximum pages to return across all selected knowledge bases per query (default 10, max 50)",
       "minimum": 1,
       "maximum": 50
     }
@@ -944,14 +987,8 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 					))
 					continue
 				}
-				actualKBID := kbID
 				kept++
-				allHits = append(allHits, searchHit{page: p, kbID: actualKBID})
-				t.routes.rememberPage(p, actualKBID)
-				foundKBs[p.Slug] = append(foundKBs[p.Slug], actualKBID)
-				// Register neighbour slugs so links surfaced from this
-				// page's body can be routed to the same KB by the frontend.
-				registerLinkedSlugs(foundKBs, p, actualKBID)
+				allHits = append(allHits, searchHit{page: p, kbID: kbID})
 			}
 		}
 		if len(allHits) == 0 {
@@ -967,10 +1004,21 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 			continue
 		}
 
+		sort.SliceStable(allHits, func(i, j int) bool {
+			a, b := allHits[i].page, allHits[j].page
+			if a.MatchRank != b.MatchRank {
+				return a.MatchRank > b.MatchRank
+			}
+			return a.UpdatedAt.After(b.UpdatedAt)
+		})
+		allHits = allHits[:min(params.Limit, len(allHits))]
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "<search_results count=\"%d\" query=\"%s\">\n", len(allHits), query)
 		for _, h := range allHits {
 			p := h.page
+			t.routes.rememberPage(p, h.kbID)
+			foundKBs[p.Slug] = append(foundKBs[p.Slug], h.kbID)
+			registerLinkedSlugs(foundKBs, p, h.kbID)
 			key := seenLinkKey(h.kbID, p.Slug)
 			t.mu.Lock()
 			seen := t.seenSlugs[key]

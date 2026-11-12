@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"errors"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -45,6 +46,9 @@ const wikiWriteIngestRowIdentityLossLimit = 0.20
 // one spelling of a row against another.
 var wikiWriteEmphasisMarkers = strings.NewReplacer("*", "", "_", "", "`", "")
 
+// Both the wiki and GFM-escaped spellings occur in generated tables.
+var wikiWriteLabeledLink = regexp.MustCompile(`\[\[[^\s\[\]|\\]+\\?\|([^\[\]|\r\n]+)\]\]`)
+
 // normalizeWikiWriteCell makes two spellings of the same cell compare equal:
 // the full-width space becomes an ordinary one, emphasis/code markers are
 // dropped, whitespace runs collapse, and the result is lower-cased. Formatting
@@ -84,6 +88,10 @@ func wikiWriteHeaderWidth(line []byte) int {
 // table structure also keeps headers, prose and code examples out of the guard.
 // Each row still names its normalized first non-empty cell.
 func wikiWriteTableRowIdentities(content string) []string {
+	// Compare the displayed label before GFM can treat the link pipe as a cell boundary.
+	if strings.Contains(content, "[[") {
+		content = wikiWriteLabeledLink.ReplaceAllString(content, "${1}")
+	}
 	source := []byte(content)
 	document := goldmark.New(goldmark.WithExtensions(extension.Table)).Parser().Parse(text.NewReader(source))
 	identities := make([]string, 0, 8)

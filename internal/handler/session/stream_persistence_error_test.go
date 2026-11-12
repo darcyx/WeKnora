@@ -86,17 +86,19 @@ func TestStreamStopsAfterMessagePersistenceError(t *testing.T) {
 	}
 }
 
-func TestStreamKeepsOtherErrorsUntilCompletion(t *testing.T) {
+func TestStreamKeepsNonTerminalEventsUntilCompletion(t *testing.T) {
 	cases := []struct {
 		name string
 		kind types.ResponseType
 		done bool
 		data map[string]interface{}
 	}{
-		{"execution", types.ResponseTypeError, true, map[string]interface{}{"stage": "agent_execution"}},
-		{"retrieval", types.ResponseTypeError, true, map[string]interface{}{"stage": "retrieval"}},
-		{"nil metadata", types.ResponseTypeError, true, nil},
-		{"missing stage", types.ResponseTypeError, true, map[string]interface{}{"error": "failed"}},
+		// Done belongs to the error's terminal state, not merely its delivery.
+		{"execution", types.ResponseTypeError, false, map[string]interface{}{"stage": "agent_execution"}},
+		{"retrieval", types.ResponseTypeError, false, map[string]interface{}{"stage": "retrieval"}},
+		{"nil metadata", types.ResponseTypeError, false, nil},
+		{"missing stage", types.ResponseTypeError, false, map[string]interface{}{"error": "failed"}},
+		{"legacy tool error", types.ResponseTypeError, true, map[string]interface{}{"tool_call_id": "lookup"}},
 		{"unfinished", types.ResponseTypeError, false, map[string]interface{}{"stage": "message_persistence"}},
 		{"tool result", types.ResponseTypeToolResult, true, map[string]interface{}{"stage": "message_persistence"}},
 	}

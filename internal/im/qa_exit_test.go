@@ -108,6 +108,13 @@ func TestIMQAAgentReturnClosesReply(t *testing.T) {
 					Data: event.AgentFinalAnswerData{Content: "final answer", Done: true},
 				},
 			}},
+			{name: "revised segments", want: "kept final", events: []event.Event{
+				{ID: "a", Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Content: "kept "}},
+				{ID: "b", Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Content: "draft"}},
+				{ID: "c", Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Content: "withdrawn"}},
+				{ID: "b", Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Content: "final", Replace: true}},
+				{ID: "c", Type: event.EventAgentFinalAnswer, Data: event.AgentFinalAnswerData{Replace: true}},
+			}},
 			{name: "normal completion", want: "final answer", events: []event.Event{
 				{
 					Type: event.EventAgentFinalAnswer,
@@ -164,6 +171,10 @@ func TestIMQACompleteBeforeError(t *testing.T) {
 				defer cancel()
 				releaseError := make(chan struct{})
 				result := startQAExitHandler(ctx, stream, true, func(ctx context.Context, bus *event.EventBus) error {
+					if err := bus.Emit(ctx, event.Event{Type: event.EventAgentFinalAnswer,
+						Data: event.AgentFinalAnswerData{Done: true}}); err != nil {
+						return err
+					}
 					if err := bus.Emit(ctx, event.Event{
 						Type: event.EventAgentComplete, Data: event.AgentCompleteData{},
 					}); err != nil {

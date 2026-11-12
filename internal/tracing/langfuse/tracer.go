@@ -3,6 +3,7 @@ package langfuse
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -23,6 +24,10 @@ type Trace struct {
 	// metadata holds the metadata set at StartTrace so Finish can merge (not
 	// overwrite) the finish-time metadata into it before serializing.
 	metadata map[string]interface{}
+	// annotations are mid-request metadata (e.g. first_answer_ms) recorded by
+	// goroutines other than the one that calls Finish; guarded by mu.
+	mu          sync.Mutex
+	annotations map[string]interface{}
 }
 
 // Generation represents a single model invocation (LLM / embedding / VLM / ASR).
@@ -135,12 +140,28 @@ func (t *Trace) Finish(output interface{}, metadata map[string]interface{}) {
 	if t == nil || t.manager == nil || !t.manager.Enabled() || t.span == nil {
 		return
 	}
+	t.mu.Lock()
+	annotations := t.annotations
+	t.mu.Unlock()
 	attrs := []attribute.KeyValue{jsonAttr(attrTraceOutput, output)}
-	if merged := mergeMetadata(t.metadata, metadata); merged != nil {
+	if merged := mergeMetadata(mergeMetadata(t.metadata, annotations), metadata); merged != nil {
 		attrs = append(attrs, jsonAttr(attrTraceMetadata, merged))
 	}
 	t.span.SetAttributes(attrs...)
 	t.span.End()
+}
+
+// Annotate records one metadata key that Finish merges into the trace, so
+// code deep in a request (e.g. the SSE stream handler) can attach timings to
+// the root trace without owning its lifecycle. Safe for concurrent use; a
+// no-op on a disabled trace. Keys set after Finish are dropped.
+func (t *Trace) Annotate(key string, value interface{}) {
+	if t == nil || t.span == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.annotations = mergeMetadata(t.annotations, map[string]interface{}{key: value})
 }
 
 // ResumeTrace reconstructs a *Trace handle from an externally-provided W3C

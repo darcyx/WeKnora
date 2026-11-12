@@ -82,6 +82,7 @@ type AgentConfig struct {
 	RerankModelID               string                    `json:"rerank_model_id"`
 	Temperature                 float64                   `json:"temperature"`
 	MaxCompletionTokens         int                       `json:"max_completion_tokens"`
+	MaxToolOutputChars          int                       `json:"max_tool_output_chars,omitempty"`
 	Thinking                    *bool                     `json:"thinking"`
 	ReasoningEffort             string                    `json:"reasoning_effort,omitempty"`
 	CitationEnabled             *bool                     `json:"citation_enabled"`

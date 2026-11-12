@@ -3,6 +3,8 @@ package modelcontext
 import (
 	"strings"
 	"testing"
+
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 func TestAnnotateSearchNotes(t *testing.T) {
@@ -93,5 +95,17 @@ func TestMatchAddsToContent(t *testing.T) {
 	}
 	if !matchAddsToContent("anything", "") {
 		t.Fatal("a snippet-only row keeps its snippet")
+	}
+}
+
+func TestOmittedCandidatesExposeDocumentHandlesWithoutContent(t *testing.T) {
+	r := newSourceRegistry()
+	result := &types.ToolResult{Success: true, Output: "unused", Data: map[string]interface{}{
+		"display_type": "search_results", "mode": "hybrid", "results": []map[string]interface{}{{"chunk_id": "11111111-1111-1111-1111-111111111111", "knowledge_id": "22222222-2222-2222-2222-222222222222", "content": "known"}},
+		"omitted_for_budget": 1, "omitted_candidates": []map[string]interface{}{{"knowledge_id": "33333333-3333-3333-3333-333333333333", "knowledge_base_id": "44444444-4444-4444-4444-444444444444", "title": "next"}},
+	}}
+	out := r.ModelOutput(result)
+	if !strings.Contains(out, `view="candidate_only"`) || !strings.Contains(out, `title="next"`) || !strings.Contains(out, `id="doc://2"`) || strings.Contains(out, `id="33333333-3333-3333-3333-333333333333"`) {
+		t.Fatalf("unexpected output: %s", out)
 	}
 }

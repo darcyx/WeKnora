@@ -142,3 +142,58 @@ func TestSharedImageCompletionWaitsForPersistedReferences(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentExecutionFailurePersistsBeforeClosingStream(t *testing.T) {
+	for _, answer := range []string{"", "partial answer"} {
+		t.Run("prior answer "+answer, func(t *testing.T) {
+			messages := &imageCompletionMessages{}
+			stream := &imageCompletionStream{}
+			h := &Handler{messageService: messages, streamManager: stream}
+			ctx := types.WithExecutionTenant(t.Context(), 1)
+			runCtx, cancel := context.WithCancel(ctx)
+			bus := event.NewEventBus()
+			msg := &types.Message{ID: "m", SessionID: "s", Content: answer}
+			handler := h.setupStreamHandler(runCtx, "s", "m", "r", 1, time.Now(), msg, bus)
+			if answer != "" {
+				require.NoError(t, bus.Emit(ctx, event.Event{Type: event.EventAgentComplete,
+					Data: event.AgentCompleteData{MessageID: "m"}}))
+			}
+			cancel()
+			require.NoError(t, bus.Emit(ctx, event.Event{Type: event.EventError,
+				Data: event.ErrorData{Stage: "agent_execution", Error: "model unavailable"}}))
+			for _, frame := range stream.events {
+				require.False(t, endsQAStream(frame))
+			}
+			h.completeStreamAssistantMessage(ctx, &sseStreamContext{assistantMessage: msg, streamHandler: handler}, "query", "u")
+			require.NotNil(t, messages.saved)
+			require.True(t, messages.saved.IsCompleted)
+			if answer == "" {
+				require.Equal(t, "model unavailable", messages.saved.Content)
+			} else {
+				require.Equal(t, answer, messages.saved.Content)
+			}
+			require.True(t, messages.saved.IsFallback)
+			var failures int
+			for _, frame := range stream.events {
+				if frame.Type == types.ResponseTypeError {
+					failures++
+				}
+			}
+			require.Equal(t, 1, failures)
+		})
+	}
+}
+
+func TestAgentStopLetsWorkerPersistPartialAnswer(t *testing.T) {
+	messages := &imageCompletionMessages{}
+	h := &Handler{messageService: messages}
+	ctx := types.WithExecutionTenant(t.Context(), 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	bus := event.NewEventBus()
+	msg := &types.Message{ID: "m", SessionID: "s"}
+	h.setupStopEventHandler(bus, "s", 1, msg, cancel, qaModeAgent)
+	require.NoError(t, bus.Emit(ctx, event.Event{Type: event.EventStop}))
+	require.ErrorIs(t, runCtx.Err(), context.Canceled)
+	require.Nil(t, messages.saved, "the worker is still collecting its partial answer")
+}

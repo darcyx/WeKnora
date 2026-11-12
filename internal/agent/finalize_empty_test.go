@@ -24,6 +24,8 @@ func TestMaxIterationsRejectsEmptyFinalSynthesis(t *testing.T) {
 			state := &types.AgentState{CurrentRound: 1, RoundSteps: []types.AgentStep{{Thought: "Collected evidence"}}}
 			_, err := engine.executeLoop(t.Context(), state, "Summarize", emptyMessages(), nil, "session", "message")
 			require.Error(t, err, "an empty final synthesis must not be reported as a successful answer")
+			require.Contains(t, err.Error(), "no visible answer")
+			require.True(t, state.IsComplete, "the error path must still finish the turn")
 			require.NotEmpty(t, state.FinalAnswer,
 				"the existing synthesis error path must preserve a visible failure explanation")
 		})
