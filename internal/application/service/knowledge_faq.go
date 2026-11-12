@@ -1273,14 +1273,22 @@ func (s *knowledgeService) DeleteFAQEntries(ctx context.Context,
 		groups[chunk.KnowledgeID] = append(groups[chunk.KnowledgeID], chunk)
 		chunksToRemove = append(chunksToRemove, chunk)
 	}
-	// All entries and parent documents are authorized before any deletion.
+	// Keep authorized rows available for retry until their indexes are removed.
+	deletedSizes := make(map[string]int64, len(groups))
+	for id, chunks := range groups {
+		size, err := s.deleteFAQChunkVectors(ctx, kb, chunks)
+		if err != nil {
+			return err
+		}
+		deletedSizes[id] = size
+	}
 	for _, chunk := range chunksToRemove {
 		if err := s.chunkService.DeleteChunk(ctx, chunk.ID); err != nil {
 			return err
 		}
 	}
-	for id, chunks := range groups {
-		if err := s.deleteFAQChunkVectors(ctx, kb, knowledges[id], chunks); err != nil {
+	for id, size := range deletedSizes {
+		if err := s.deductFAQStorage(ctx, knowledges[id], size); err != nil {
 			return err
 		}
 	}

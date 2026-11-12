@@ -32,6 +32,9 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		result = &copyResult
 	}
 	displayType := stringValue(result.Data, "display_type")
+	if displayType == "search_results" && len(mapsValue(result.Data["stages"])) > 0 {
+		displayType = "search_stages"
+	}
 	if displayType == "web_fetch_results" {
 		return r.modelWebFetchOutput(mapsValue(result.Data["results"]), result.Output)
 	}
@@ -39,6 +42,18 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		return failedToolModelText(result.Output, result.Error)
 	}
 	switch displayType {
+	case "search_stages":
+		var stages []string
+		for _, stage := range mapsValue(result.Data["stages"]) {
+			success, _ := stage["success"].(bool)
+			data, _ := stage["data"].(map[string]interface{})
+			stages = append(stages, r.ModelOutput(&types.ToolResult{Success: success,
+				Output: stringValue(stage, "output"), Error: stringValue(stage, "error"), Data: data}))
+		}
+		if len(stages) == 0 {
+			return result.Output
+		}
+		return strings.Join(stages, "\n\n")
 	case "grep_results":
 		return r.modelKnowledgeOutput("keyword", mapsValue(result.Data["chunk_results"]), result.Output)
 	case "search_results":
@@ -196,6 +211,7 @@ type modelChunk struct {
 	docHandle  string
 	kbHandle   string
 	title      string
+	sourceURL  string
 	metadata   string
 	chunkType  string
 	index      int
@@ -253,6 +269,7 @@ func (r *sourceRegistry) modelChunksFromRows(mode string, rows []map[string]inte
 			docHandle:  r.RegisterDocument(knowledgeID),
 			kbHandle:   r.RegisterKnowledgeBase(kbID),
 			title:      title,
+			sourceURL:  firstNonEmpty(stringValue(row, "source_url"), stringValue(row, "url")),
 			metadata:   stringValue(row, "knowledge_metadata"),
 			chunkType:  chunkType,
 			index:      chunkIndex,
@@ -403,6 +420,8 @@ func graphTruncationNote(data map[string]interface{}, shownRelations int) string
 func annotateSearchNotes(output string, data map[string]interface{}) string {
 	omitted := intValue(data, "omitted_for_budget")
 	failures := stringSliceValue(data["partial_failures"])
+	stageFailures := stringSliceValue(data["stage_failures"])
+	rerankOutcome := stringValue(data, "rerank_outcome")
 	// retrieval_candidates is the candidate pool of the first ranked-filter
 	// stage that dropped anything (rerank, merge or FILTER_TOP_K), not the
 	// number of matches in the knowledge base, which retrieval never computes
@@ -411,10 +430,14 @@ func annotateSearchNotes(output string, data map[string]interface{}) string {
 	shown := intValue(data, "retrieval_shown")
 	candidates := intValue(data, "retrieval_candidates")
 	truncated := shown > 0 && candidates > shown
-	if (omitted <= 0 && len(failures) == 0 && !truncated) || !strings.HasSuffix(output, "</retrieval>") {
+	if (omitted <= 0 && len(failures) == 0 && len(stageFailures) == 0 && !truncated && rerankOutcome == "") || !strings.HasSuffix(output, "</retrieval>") {
 		return output
 	}
 	var b strings.Builder
+	if rerankOutcome != "" {
+		fmt.Fprintf(&b, "  <rerank outcome=\"%s\">Ranking or filtering was degraded. Retained passages may still be used, "+
+			"but this does not establish that no answer exists.</rerank>\n", escapeAttr(rerankOutcome))
+	}
 	if omitted > 0 {
 		fmt.Fprintf(&b, "  <omitted count=\"%d\" reason=\"output_budget\">Lower-ranked results were left out to "+
 			"fit the output size. Narrow the query or lower limit to see them.</omitted>\n", omitted)
@@ -434,6 +457,9 @@ func annotateSearchNotes(output string, data map[string]interface{}) string {
 	for _, failure := range failures {
 		fmt.Fprintf(&b, "  <partial_failure>%s — these knowledge bases were not searched.</partial_failure>\n",
 			escapeText(failure))
+	}
+	for _, failure := range stageFailures {
+		fmt.Fprintf(&b, "  <stage_failure>%s</stage_failure>\n", escapeText(failure))
 	}
 	return strings.TrimSuffix(output, "</retrieval>") + b.String() + "</retrieval>"
 }
@@ -458,7 +484,7 @@ func annotateWebSearchNotes(output string, data map[string]interface{}) string {
 }
 
 func viewForRow(row map[string]interface{}, mode string) string {
-	if stringValue(row, "content") != "" {
+	if stringValue(row, "content") != "" || len(stringSliceValue(row["faq_answers"])) > 0 {
 		return "full"
 	}
 	if mode == "deep_read" {
@@ -478,6 +504,9 @@ func (r *sourceRegistry) modelKnowledgeChunksOutput(data map[string]interface{},
 		if stringValue(row, "knowledge_title") == "" {
 			row["knowledge_title"] = title
 		}
+		if stringValue(row, "source_url") == "" && stringValue(row, "url") == "" {
+			row["source_url"] = firstNonEmpty(stringValue(data, "source_url"), stringValue(data, "url"))
+		}
 	}
 	var info map[string]interface{}
 	if raw, ok := data["document"].(map[string]interface{}); ok {
@@ -492,7 +521,11 @@ func (r *sourceRegistry) modelKnowledgeChunksOutput(data map[string]interface{},
 		docHandle := r.RegisterDocument(knowledgeID)
 		var b strings.Builder
 		b.WriteString("<retrieval type=\"knowledge\" mode=\"deep_read\">\n")
-		fmt.Fprintf(&b, "  <document id=\"%s\" title=\"%s\">\n", escapeAttr(docHandle), escapeAttr(title))
+		fmt.Fprintf(&b, "  <document id=\"%s\" title=\"%s\"", escapeAttr(docHandle), escapeAttr(title))
+		if sourceURL := firstNonEmpty(stringValue(data, "source_url"), stringValue(data, "url")); sourceURL != "" {
+			fmt.Fprintf(&b, " source_url=\"%s\"", escapeAttr(sourceURL))
+		}
+		b.WriteString(">\n")
 		writeDocumentInfo(&b, info)
 		if query := stringValue(data, "query"); query != "" {
 			fmt.Fprintf(&b, "    <matches query=\"%s\" count=\"0\" />\n", escapeAttr(query))
@@ -587,13 +620,14 @@ func writeDocumentInfo(b *strings.Builder, info map[string]interface{}) {
 
 func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]interface{}) string {
 	type docGroup struct {
-		handle   string
-		realID   string
-		kbHandle string
-		title    string
-		metadata string
-		chunks   []modelChunk
-		order    int
+		handle    string
+		realID    string
+		kbHandle  string
+		title     string
+		sourceURL string
+		metadata  string
+		chunks    []modelChunk
+		order     int
 	}
 	groupsByKey := make(map[string]*docGroup)
 	var groups []*docGroup
@@ -606,7 +640,7 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 		if group == nil {
 			group = &docGroup{
 				handle: chunk.docHandle, realID: chunk.docRealID, kbHandle: chunk.kbHandle, title: chunk.title,
-				metadata: chunk.metadata, order: chunk.inputOrder,
+				metadata: chunk.metadata, order: chunk.inputOrder, sourceURL: chunk.sourceURL,
 			}
 			groupsByKey[key] = group
 			groups = append(groups, group)
@@ -630,6 +664,9 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 		if group.title != "" {
 			fmt.Fprintf(&b, " title=\"%s\"", escapeAttr(group.title))
 		}
+		if group.sourceURL != "" {
+			fmt.Fprintf(&b, " source_url=\"%s\"", escapeAttr(group.sourceURL))
+		}
 		b.WriteString(">\n")
 		if group.metadata != "" {
 			fmt.Fprintf(&b, "    <metadata>%s</metadata>\n", escapeText(group.metadata))
@@ -652,7 +689,7 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 			// Deep reads keep the snippet: it locates the hit inside a long
 			// chunk. Search rows are chunk-sized, so an excerpt of the content
 			// shown beside it only repeats it.
-			if chunk.match != "" && (mode == "deep_read" || matchAddsToContent(chunk.match, chunk.content)) {
+			if chunk.match != "" && !(chunk.view == "full" && len(chunk.answers) > 0) && (mode == "deep_read" || matchAddsToContent(chunk.match, chunk.content)) {
 				fmt.Fprintf(&b, "      <match>%s</match>\n", escapeText(chunk.match))
 			}
 			if chunk.content != "" {

@@ -71,6 +71,7 @@ func (e *AgentEngine) drainSteerMessages(
 		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: types.SteerMessageContent(content)})
 		state.PendingSteerMessages = append(state.PendingSteerMessages, userMessageID)
 		e.recordSteerMessage(userMessageID, content)
+		e.pendingSteerFAQ = userMessageID
 		_ = e.eventBus.Emit(ctx, event.Event{
 			ID:        generateEventID("injected"),
 			Type:      event.EventUserMessageInjected,
@@ -89,6 +90,60 @@ func (e *AgentEngine) drainSteerMessages(
 			state.CurrentRound+1, injected)
 	}
 	return injected
+}
+
+// Only newly accepted inputs trigger FAQ evaluation. Replayed steps still provide context.
+type SteerFAQReply struct {
+	Answer string
+	Steps  []types.AgentStep
+	Usage  *types.TokenUsage
+}
+
+type SteerFAQFunc func(ctx context.Context, id, query string, dialogue []chat.Message) (SteerFAQReply, error)
+
+func (e *AgentEngine) SetSteerFAQ(check SteerFAQFunc) { e.steerFAQ = check }
+
+func (e *AgentEngine) finishSteerFAQ(ctx context.Context, state *types.AgentState, sessionID string) (bool, error) {
+	id := e.pendingSteerFAQ
+	e.pendingSteerFAQ = ""
+	if id == "" || e.steerFAQ == nil || e.collaborationOwnsFailure(ctx) {
+		return false, nil
+	}
+	var dialogue []chat.Message
+	appendUsers := func(ids []string) {
+		for _, previous := range ids {
+			if text := e.progress.userMessages[previous]; previous != id && text != "" {
+				dialogue = append(dialogue, chat.Message{Role: "user", Content: text})
+			}
+		}
+	}
+	for _, step := range state.RoundSteps {
+		appendUsers(step.UserMessagesBefore)
+		if step.IntermediateAnswer && !step.PlanReport && step.Thought != "" {
+			dialogue = append(dialogue, chat.Message{Role: "assistant", Content: step.Thought})
+		}
+	}
+	appendUsers(state.PendingSteerMessages)
+	reply, err := e.steerFAQ(ctx, id, e.progress.userMessages[id], dialogue)
+	if reply.Usage != nil {
+		state.AddUsage(*reply.Usage)
+		state.TurnUsage.Accumulate(*reply.Usage)
+	}
+	if err != nil || reply.Answer == "" {
+		return false, err
+	}
+	if err := e.eventBus.Emit(ctx, event.Event{ID: id + "-faq-answer", Type: event.EventAgentFinalAnswer,
+		SessionID: sessionID, Data: event.AgentFinalAnswerData{Content: reply.Answer, Done: true}}); err != nil {
+		return false, err
+	}
+	if len(reply.Steps) > 0 {
+		reply.Steps[0].UserMessagesBefore = state.PendingSteerMessages
+		state.PendingSteerMessages = nil
+		state.RoundSteps = append(state.RoundSteps, reply.Steps...)
+	}
+	state.KnowledgeRefs = nil
+	state.FinalAnswer, state.IsComplete = reply.Answer, true
+	return true, nil
 }
 
 func getString(evt map[string]interface{}, key string) string {

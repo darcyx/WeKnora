@@ -11,6 +11,53 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestWikiLinksSurviveSourceCompaction(t *testing.T) {
+	const kbID = "bcd12345-6789-4000-8000-0123456789ab"
+	const wikiURL = "https://example.org/knowledge-bases/" + kbID + "?tab=wiki&slug=overview"
+	registry := NewRegistry(false)
+	registry.RegisterKnowledgeBase(kbID)
+	registry.RegisterWeb("https://example.org/manual", "Manual")
+	input := `kb=` + kbID + ` source_url="` + wikiURL + `" [wiki](` + wikiURL + `) [manual](https://example.org/manual)`
+	encoded := registry.CompactKnownText(input)
+	require.Equal(t, `kb=kb://1 source_url="`+wikiURL+`" [wiki](`+wikiURL+`) [manual](url://1)`, encoded)
+	require.Equal(t, strings.Replace(input, "kb="+kbID, "kb=weknora://kb/"+kbID, 1), registry.DecodeOutputText(encoded))
+	output := registry.ModelToolResultForTool("search_knowledge", &types.ToolResult{
+		Success: true, Data: map[string]interface{}{"display_type": "search_results",
+			"results": []map[string]interface{}{{
+				"knowledge_base_id": kbID, "knowledge_id": "document-id", "chunk_id": "chunk-id",
+				"source_url": wikiURL, "content": "[wiki](" + wikiURL + ")",
+			}}},
+	})
+	require.Contains(t, output, `source_url="`+escapeAttr(wikiURL)+`"`)
+	require.Contains(t, output, "[wiki]("+escapeAttr(wikiURL)+")")
+}
+
+func TestSearchRerankDegradationReachesModelWithEvidence(t *testing.T) {
+	result := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results", "rerank_outcome": "model_error",
+		"results": []map[string]interface{}{{
+			"chunk_id": "chunk", "knowledge_id": "doc", "knowledge_base_id": "kb", "content": "retrieved fact",
+		}},
+	}}
+	output := newSourceRegistry().ModelOutput(result)
+	require.Contains(t, output, "retrieved fact")
+	require.Contains(t, output, `<rerank outcome="model_error">`)
+	require.Contains(t, output, "does not establish that no answer exists")
+}
+
+func TestSearchDecisionFailureDoesNotDiscardCompletedRetrieval(t *testing.T) {
+	result := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results", "stage_failures": []string{"FAQ applicability not confirmed"},
+		"results": []map[string]interface{}{{
+			"chunk_id": "source-chunk", "knowledge_id": "source-document", "knowledge_base_id": "source-kb", "content": "retrieved fact",
+		}},
+	}}
+	output := newSourceRegistry().ModelOutput(result)
+	require.Contains(t, output, "retrieved fact")
+	require.Contains(t, output, "FAQ applicability not confirmed")
+	require.NotContains(t, output, "these knowledge bases were not searched")
+}
+
 func TestCitationsInJSONStrings(t *testing.T) {
 	registry := NewRegistry(true)
 	ref := ChunkReference{
@@ -138,8 +185,6 @@ func TestRegistrySuppressesSourceCitationsWhenDisabled(t *testing.T) {
 	registry.RegisterChunk(ChunkReference{ChunkID: "chunk-1", DocumentTitle: "Doc"})
 	registry.RegisterWeb("https://example.com", "Example")
 
-	require.Contains(t, sourceProtocolPrompt(false), "Source citations are disabled")
-	require.NotContains(t, sourceProtocolPrompt(false), `Cite a knowledge chunk with exactly`)
 	require.Equal(t, "knowledge  web ", registry.ExpandText(
 		`knowledge <ref id="chunk://1"/> web <ref id="url://1"/>`,
 	))
@@ -660,4 +705,50 @@ func TestModelOutputWebFetchKeepsEveryPageAndAccurateContinuation(t *testing.T) 
 	require.Equal(t, 8, strings.Count(output, `<content truncated="true">文字`))
 	require.NotContains(t, output, `view="full"`)
 	require.Contains(t, output, `trust="untrusted"`)
+}
+
+func TestFAQFullAnswerAndObservationKeepChunkIdentity(t *testing.T) {
+	registry := NewRegistry(false)
+	result := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results",
+		"results": []map[string]interface{}{
+			{"chunk_id": "first-faq", "knowledge_id": "faq-doc", "knowledge_base_id": "kb", "chunk_type": "faq", "faq_question": "唯一吗", "faq_answers": []string{"账号标识全渠道唯一"}, "match_snippet": "账号标识..."},
+			{"chunk_id": "second-faq", "knowledge_id": "faq-doc", "knowledge_base_id": "kb", "chunk_type": "faq", "faq_question": "互通吗", "faq_answers": []string{"满足配置条件时可互通"}, "match_snippet": "满足配置..."},
+		},
+	}}
+	output := registry.ModelToolResultForTool("search_knowledge", result)
+	require.NotContains(t, output, "<match>")
+	require.Contains(t, output, `view="full"`)
+	require.Contains(t, output, "<answer>满足配置条件时可互通</answer>")
+	observation := registry.DecodeObservationText(output)
+	require.Contains(t, observation, `<chunk id="first-faq"`)
+	require.Contains(t, observation, `<chunk id="second-faq"`)
+	require.Contains(t, observation, `<document id="faq-doc"`)
+}
+
+func TestRetrievalReviewQuotesKeepObservationIdentity(t *testing.T) {
+	registry := NewRegistry(false)
+	registry.ModelToolResultForTool("search_knowledge", &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results",
+		"results":      []map[string]interface{}{{"chunk_id": "chunk-id", "knowledge_id": "document-id", "content": "evidence"}},
+	}})
+	for _, name := range []string{"review_retrieval", "search_knowledge", "read_document", "list_documents", "query_knowledge_graph", "wiki_search", "wiki_read_page"} {
+		t.Run(name, func(t *testing.T) {
+			review := map[string]any{"gap_id": "gap-1", "status": "satisfied", "quotes": []string{`<document id="doc://1"><chunk id="chunk://1">`}}
+			var args any = map[string]any{"retrieval": map[string]any{"review": review}}
+			if name == "review_retrieval" {
+				args = review
+			}
+			raw, err := json.Marshal(args)
+			require.NoError(t, err)
+			calls := []types.LLMToolCall{{Function: types.FunctionCall{Name: name, Arguments: string(raw)}}}
+			registry.DecodeToolCalls(calls)
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal([]byte(calls[0].Function.Arguments), &decoded))
+			if name != "review_retrieval" {
+				decoded = decoded["retrieval"].(map[string]any)["review"].(map[string]any)
+			}
+			require.Equal(t, `<document id="document-id"><chunk id="chunk-id">`, decoded["quotes"].([]any)[0])
+		})
+	}
 }

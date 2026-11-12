@@ -456,17 +456,8 @@ func (e *AgentEngine) analyzeResponse(
 			}
 		}
 
-		// Emit the final answer. The answer text reaches the UI by one of two
-		// paths:
-		//   (a) Already streamed live during the think phase — the common case
-		//       now that plain assistant content is routed straight to
-		//       EventAgentFinalAnswer (response.AnswerStreamed). Re-emitting the
-		//       full content here would render it twice and produce the
-		//       end-of-stream "jump from Thinking to Answer" the user reported,
-		//       so we only close the existing stream with a Done marker on the
-		//       same event ID.
-		//   (b) Not streamed live (e.g. the content only surfaced in the
-		//       accumulated result) — emit the full content, then Done.
+		// Reuse the body published after the round was classified as an answer.
+		// Otherwise publish it here; the caller owns the terminal Done marker.
 		var answerID string
 		if response.AnswerStreamed && response.AnswerEventID != "" {
 			answerID = response.AnswerEventID
@@ -708,8 +699,9 @@ func writeQuestionOrigin(sb *strings.Builder, origin *QuestionOriginInfo) {
 			escapeXMLAttr(d.KnowledgeID), escapeXMLAttr(title))
 	}
 	sb.WriteString("    <note>The user picked this question from suggestions generated from this source. " +
-		"Search it before answering: the question refers to that content even when it reads like " +
-		"general knowledge.</note>\n")
+		"Use applicable evidence from this source for factual claims, retrieving only missing evidence. " +
+		"Necessary clarification does not require a search; consult the source first if needed to " +
+		"identify the applicable branch or inputs.</note>\n")
 	sb.WriteString("  </question_origin>\n")
 }
 
@@ -845,8 +837,8 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 		}
 		if svc.Discoverable && len(svc.ToolNames) > 0 {
 			lines = append(lines, fmt.Sprintf(
-				"Use relevant available MCP functions for service @%s (server_id=%q) before "+
-					"answering. Their descriptions identify the service and original tool names; use "+
+				"Use relevant available MCP functions for service @%s (server_id=%q) for "+
+					"needed evidence or actions. Their descriptions identify the service and original tool names; use "+
 					"discover_mcp_tools if the service needs reconnection or authentication.",
 				sanitizeMustUseField(svc.Name), sanitizeMustUseField(svc.ID)))
 			continue
@@ -857,7 +849,7 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 				fmt.Sprintf(
 					"Use discover_mcp_tools(mode=\"list_tools\", server_id=%q) for the selected MCP "+
 						"service @%s. Describe the required tools, then use the offered functions or "+
-						"call_mcp_tool as available before answering; report connection or "+
+						"call_mcp_tool as available for needed evidence or actions; report connection or "+
 						"authentication failures if the service is unavailable.",
 					sanitizeMustUseField(svc.ID),
 					sanitizeMustUseField(svc.Name),
@@ -874,7 +866,7 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 			display = sanitizeMustUseField(svc.ID)
 		}
 		lines = append(lines, fmt.Sprintf(
-			"Must use MCP tools whose names start with %s (@%s) to answer the question below.",
+			"Must use MCP tools whose names start with %s (@%s) for needed evidence or actions.",
 			prefix, display,
 		))
 	}
@@ -884,7 +876,7 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 		}
 		name := sanitizeMustUseField(skill.Name)
 		lines = append(lines, fmt.Sprintf(
-			"Must call read_file(path=%q) for @Skill %q before answering.",
+			"Must call read_file(path=%q) for @Skill %q when carrying out its workflow.",
 			"skill://"+name+"/SKILL.md", name,
 		))
 	}
@@ -892,10 +884,7 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 		return ""
 	}
 	return "<must_use>\n" + strings.Join(lines, "\n") +
-		"\nThese selections do not replace research into the task's factual content or exclude other " +
-		"relevant available sources unless the user explicitly restricts them. Apply selections to the " +
-		"relevant parts of the task; an @mention does not authorize unrelated actions. Follow the " +
-		"user's current explicit restrictions if they narrow or cancel a selection.\n</must_use>"
+		"\nThese are task-scoped resource selections, not additional task instructions.\n</must_use>"
 }
 
 // sanitizeMustUseField strips newlines and angle brackets so an MCP/skill name
@@ -958,7 +947,7 @@ func commonStringPrefix(a, b string) string {
 func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	e.registerRuntimeReferences()
 	runtimeCtx := buildRuntimeContextBlock(
-		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName,e.appInfo)
+		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName, e.appInfo)
 	runtimeCtx = e.modelContext.EncodeKnownIssues(e.modelContext.CompactKnownText(runtimeCtx))
 	mustUse := buildMustUseBlock(e.pinnedMCPServices, e.pinnedSkills)
 	return composeUserTurnContent(runtimeCtx, mustUse, query)
@@ -1070,7 +1059,7 @@ func (e *AgentEngine) buildToolsForLLM() []chat.Tool {
 		})
 	}
 
-	return e.modelContext.EncodeTools(tools)
+	return e.modelContext.EncodeTools(e.retrievalTools(tools))
 }
 
 // appendToolResults adds tool results to the in-turn message history following
@@ -1089,6 +1078,7 @@ func (e *AgentEngine) appendToolResults(
 		step.ReasoningSignature != "" || len(step.ReasoningMetadata) > 0 {
 		assistantMsg := chat.Message{
 			Role:               "assistant",
+			TurnID:             e.retrievalTurnID,
 			Content:            step.Thought,
 			ReasoningContent:   step.ReasoningContent,
 			ReasoningSignature: step.ReasoningSignature,
@@ -1119,13 +1109,26 @@ func (e *AgentEngine) appendToolResults(
 
 	// Add tool result messages (role: "tool", following OpenAI format)
 	for _, toolCall := range step.ToolCalls {
-		resultContent := e.modelContext.ModelToolResultForTool(toolCall.Name, toolCall.Result)
+		// The answer becomes eligible only after the batch completes, so a
+		// preconstructed call cannot guess a future answer and unblock itself.
+		e.recordRetrievalUserAnswer(toolCall)
+		resultContent := previousRetrievalOmitted
+		if e.retrievalResultInScope(toolCall) {
+			resultContent = e.modelContext.ModelToolResultForTool(toolCall.Name, toolCall.Result)
+		}
+		if e.retrieval != nil && (kbToolNames[toolCall.Name] || toolCall.Name == reviewRetrievalTool) {
+			if toolCall.Result == nil || toolCall.Result.Data[retrievalDispatchBlocked] != true {
+				e.retrieval.restoreObservation(e.retrievalCallReference(toolCall.ID), e.modelContext.DecodeObservationText(resultContent), toolCall.Name)
+			}
+			// The next round supplies the current state once through RuntimeNotice.
+		}
 
 		toolMsg := chat.Message{
 			Role:       "tool",
 			Content:    resultContent,
 			ToolCallID: toolCall.ID,
 			Name:       toolCall.Name,
+			TurnID:     e.retrievalTurnID,
 		}
 
 		messages = append(messages, toolMsg)
@@ -1149,7 +1152,7 @@ func countTotalToolCalls(steps []types.AgentStep) int {
 
 // kbToolNames lists tools whose results contain knowledge base content that
 // may become stale across turns (KB can be switched, updated, or deleted).
-// Historical results from these tools are redacted to force fresh retrieval.
+// Historical results from these tools are redacted to prevent stale reuse.
 var kbToolNames = map[string]bool{
 	agenttools.ToolSearchKnowledge:     true,
 	agenttools.ToolReadDocument:        true,
@@ -1165,6 +1168,10 @@ var kbToolNames = map[string]bool{
 	agenttools.LegacyToolWikiReadSourceDoc:   true,
 }
 
+const previousRetrievalOmitted = "[Previous retrieval result omitted; it is not current evidence. Recover applicable evidence " +
+	"only if the current answer needs it and the existing retrieval state and budgets permit. " +
+	"Omission does not reset retrieval state or budgets or require a search before clarification.]"
+
 // redactHistoryKBResults replaces full KB tool results in historical context
 // with brief markers. This prevents the LLM from reusing stale retrieval data
 // when the knowledge base has been modified or switched between turns.
@@ -1174,7 +1181,7 @@ func redactHistoryKBResults(llmContext []chat.Message) []chat.Message {
 		if msg.Role == "tool" && kbToolNames[msg.Name] {
 			redacted = append(redacted, chat.Message{
 				Role:       msg.Role,
-				Content:    "[Previous retrieval result omitted — knowledge base may have changed. Please perform a fresh search.]",
+				Content:    previousRetrievalOmitted,
 				ToolCallID: msg.ToolCallID,
 				Name:       msg.Name,
 				TurnID:     msg.TurnID,
@@ -1220,6 +1227,15 @@ func (e *AgentEngine) buildMessagesWithLLMContext(
 		for _, msg := range sanitized {
 			if msg.Role == "system" {
 				continue
+			}
+			if e.retrieval != nil && e.config.RetainRetrievalHistory && msg.Role == "tool" &&
+				kbToolNames[msg.Name] {
+				ref := retrievalCallReference(msg.TurnID, msg.ToolCallID)
+				if msg.TurnID != "" && e.retrieval.observationInScope(ref, msg.Name) {
+					e.retrieval.restoreObservation(ref, e.modelContext.DecodeObservationText(msg.Content), msg.Name)
+				} else {
+					msg = redactHistoryKBResults([]chat.Message{msg})[0]
+				}
 			}
 			if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "tool" {
 				messages = append(messages, msg)

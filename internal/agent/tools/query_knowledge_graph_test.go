@@ -213,7 +213,9 @@ func TestQueryKnowledgeGraph_MissingKnowledgeBaseDoesNotPanic(t *testing.T) {
 
 	result, err := tool.Execute(context.Background(), args)
 	require.NoError(t, err)
-	require.True(t, result.Success)
+	require.False(t, result.Success, "a failed source is not a successful empty lookup")
+	require.NotEmpty(t, result.Error)
+	require.Len(t, result.RetrievalFailures, 1)
 	require.Contains(t, result.Output, "knowledge base kb-deleted not found")
 	errs, ok := result.Data["errors"].([]string)
 	require.True(t, ok)

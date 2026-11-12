@@ -554,13 +554,23 @@ func (r *sourceRegistry) CompactKnownText(text string) string {
 	pairs = append(pairs, r.docs.pairs()...)
 	pairs = append(pairs, r.kbs.pairs()...)
 	pairs = append(pairs, r.webs.pairs()...)
+	if len(pairs) == 0 {
+		return text
+	}
+	// A copied HTTP link must round-trip literally. Known web links already
+	// have a pair and win ties; other links shield the IDs in their paths.
+	for _, match := range httpURLRE.FindAllString(text, -1) {
+		link := trimURLDelimiters(match)
+		pairs = append(pairs, handlePair{value: link, handle: link})
+	}
 	sort.SliceStable(pairs, func(i, j int) bool { return len(pairs[i].value) > len(pairs[j].value) })
+	replacements := make([]string, 0, 2*len(pairs))
 	for _, item := range pairs {
 		if item.value != "" {
-			text = strings.ReplaceAll(text, item.value, item.handle)
+			replacements = append(replacements, item.value, item.handle)
 		}
 	}
-	return text
+	return strings.NewReplacer(replacements...).Replace(text)
 }
 
 var webPageHeaderRE = regexp.MustCompile(`<page id="(url://[1-9][0-9]*)"[^>]*>`)

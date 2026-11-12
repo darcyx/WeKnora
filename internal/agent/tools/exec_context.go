@@ -38,6 +38,10 @@ type ToolExecContext struct {
 	// Mode says whether the client can show and answer prompts; IM and
 	// MCP-server runs have no such surface.
 	Mode types.RunMode
+	// RetrievalTargets is the harness-validated failed sub-scope of a recovery,
+	// never a model argument or a replacement authorization grant.
+	RetrievalTargets  types.SearchTargets
+	RetrievalRecovery func(context.Context) (*types.ToolResult, error)
 }
 
 // Attended reports whether a client can answer prompts now.

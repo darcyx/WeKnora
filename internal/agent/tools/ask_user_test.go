@@ -43,7 +43,8 @@ func TestAskUserTool_NotInteractiveAsksInReply(t *testing.T) {
 		askCtx(&ToolExecContext{EventBus: event.NewEventBus()}), json.RawMessage(`{"question":"q"}`))
 	require.NoError(t, err)
 	assert.True(t, res.Success)
-	assert.Contains(t, res.Output, "Ask the user directly in your reply")
+	assert.Equal(t, "q", res.Output)
+	assert.NotNil(t, res.UserQuestion)
 	assert.Empty(t, asker.asked)
 }
 
@@ -56,33 +57,22 @@ func TestAskUserTool_RejectsInvalidQuestion(t *testing.T) {
 	assert.Contains(t, res.Error, "Invalid question")
 }
 
-func TestAskUserTool_ReturnsAnswer(t *testing.T) {
-	asker := &fakeAsker{answer: approval.Answer{PromptID: "p1", Answered: true, Response: types.AskUserPromptResponse{
-		Values: map[string]any{"replicas": float64(3), "env": "prod"},
-	}}}
-	meta := &ToolExecContext{
-		Mode: types.RunModeAttended, EventBus: event.NewEventBus(), SessionID: "s1", AssistantMessageID: "m1",
-		ToolCallID: "tc1", UserID: "user:u1",
-		Snapshot: func() ([]byte, int, error) { return []byte("state"), 1, nil },
+func TestAskUserToolRendersOptionsAndFormsWithoutWaiting(t *testing.T) {
+	for _, tc := range []struct{ args, text string }{
+		{`{"question":"选择平台","options":["Android","iOS"]}`, "选择平台\n- Android\n- iOS"},
+		{formArgs, "deploy where?\n- env: dev / prod\n- replicas"},
+		{`{"question":"补充材料","fields":[{"name":"order","label":"订单号","type":"text","required":true}]}`, "补充材料\n- 订单号"},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			asker := &fakeAsker{}
+			result, err := NewAskUserTool(asker).Execute(t.Context(), json.RawMessage(tc.args))
+			require.NoError(t, err)
+			require.True(t, result.Success)
+			require.Equal(t, tc.text, result.Output)
+			require.NotNil(t, result.UserQuestion)
+			require.Empty(t, asker.asked)
+		})
 	}
-	res, err := NewAskUserTool(asker).Execute(askCtx(meta), json.RawMessage(formArgs))
-	require.NoError(t, err)
-	require.True(t, res.Success)
-	assert.Equal(t, "The user answered.\nFields:\n- env: \"prod\"\n- replicas: 3", res.Output)
-	require.Len(t, asker.asked, 1)
-	assert.Equal(t, []byte("state"), asker.asked[0].Snapshot)
-	assert.Equal(t, "tc1", asker.asked[0].ToolCallID)
-	assert.Equal(t, "deploy where?", asker.asked[0].Question.Question)
-}
-
-func TestAskUserTool_Suspends(t *testing.T) {
-	suspension := &types.PromptSuspension{PromptID: "p1", Kind: types.AgentPromptKindAskUser}
-	asker := &fakeAsker{answer: approval.Answer{PromptID: "p1", Suspended: suspension}}
-	res, err := NewAskUserTool(asker).Execute(
-		askCtx(&ToolExecContext{Mode: types.RunModeAttended, EventBus: event.NewEventBus()}),
-		json.RawMessage(`{"question":"q"}`))
-	require.NoError(t, err)
-	assert.Same(t, suspension, res.Suspend)
 }
 
 func TestAskUserTool_ResumedUsesStoredAnswer(t *testing.T) {
@@ -103,22 +93,21 @@ func TestAskUserTool_ResumedUsesStoredAnswer(t *testing.T) {
 func TestAskUserTool_NoAnswer(t *testing.T) {
 	asker := &fakeAsker{answer: approval.Answer{PromptID: "p1", Reason: "the user declined to answer"}}
 	res, err := NewAskUserTool(asker).Execute(
-		askCtx(&ToolExecContext{Mode: types.RunModeAttended, EventBus: event.NewEventBus()}),
+		askCtx(&ToolExecContext{Answered: &types.AgentPrompt{Kind: types.AgentPromptKindAskUser}, EventBus: event.NewEventBus()}),
 		json.RawMessage(`{"question":"q"}`))
 	require.NoError(t, err)
 	assert.True(t, res.Success)
 	assert.Contains(t, res.Output, "did not answer (the user declined to answer)")
 }
 
-func TestAskUserUsesCallerTenantForSharedAgent(t *testing.T) {
+func TestAskUserDoesNotCreatePromptForSharedAgent(t *testing.T) {
 	asker := &fakeAsker{}
 	ctx := context.WithValue(t.Context(), types.TenantIDContextKey, uint64(1))
 	ctx = types.WithExecutionTenant(ctx, 2)
 	ctx = WithToolExecContext(ctx, &ToolExecContext{Mode: types.RunModeAttended, EventBus: event.NewEventBus()})
 	_, err := NewAskUserTool(asker).Execute(ctx, json.RawMessage(`{"question":"which?"}`))
 	require.NoError(t, err)
-	require.Len(t, asker.asked, 1)
-	require.Equal(t, uint64(1), asker.asked[0].TenantID)
+	require.Empty(t, asker.asked)
 }
 
 func TestAskUserRegistryValidatesSerializedOptions(t *testing.T) {
@@ -150,8 +139,9 @@ func TestAskUserRegistryValidatesSerializedOptions(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.valid, result.Success, result.Error)
 			if tc.valid {
-				require.Len(t, asker.asked, 1)
-				require.Len(t, asker.asked[0].Question.Options, tc.count)
+				require.Empty(t, asker.asked)
+				require.NotNil(t, result.UserQuestion)
+				require.Len(t, result.UserQuestion.Options, tc.count)
 			} else {
 				require.Empty(t, asker.asked, "invalid input must never create a prompt")
 				require.Contains(t, result.Error, "options")
@@ -171,4 +161,39 @@ func TestAskUserRejectsSerializedFormChoices(t *testing.T) {
 	require.False(t, result.Success)
 	require.Contains(t, result.Error, "one choice per string")
 	require.Empty(t, asker.asked)
+}
+
+func TestAskUserToolNeverWaitsForNewInput(t *testing.T) {
+	for _, mode := range []types.RunMode{types.RunModeAttended, types.RunModeDeferred, types.RunModeUnattended} {
+		t.Run(string(mode), func(t *testing.T) {
+			asker := &fakeAsker{answer: approval.Answer{Suspended: &types.PromptSuspension{PromptID: "should-not-exist"}}}
+			snapshots := 0
+			meta := &ToolExecContext{Mode: mode, EventBus: event.NewEventBus(), Snapshot: func() ([]byte, int, error) { snapshots++; return nil, 0, nil }}
+			result, err := NewAskUserTool(asker).Execute(askCtx(meta), json.RawMessage(`{"question":" 请提供订单号。 "}`))
+			require.NoError(t, err)
+			require.True(t, result.Success)
+			require.Equal(t, "请提供订单号。", result.Output)
+			require.Nil(t, result.Suspend)
+			require.Equal(t, "user_question", result.Data["display_type"], "must not reconstruct an interactive history card")
+			require.Empty(t, asker.asked)
+			require.Zero(t, snapshots)
+		})
+	}
+}
+
+func TestAskUserLegacyResumeWithoutHandlerFailsExplicitly(t *testing.T) {
+	result, err := NewAskUserTool(nil).Execute(askCtx(&ToolExecContext{Answered: &types.AgentPrompt{Kind: types.AgentPromptKindAskUser}}), json.RawMessage(`{"question":"q"}`))
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Contains(t, result.Error, "no answer handler")
+}
+
+func TestAskUserLegacyResumePreservesAnswerOwnershipSuspension(t *testing.T) {
+	suspended := &types.PromptSuspension{PromptID: "p1", Kind: types.AgentPromptKindAskUser, Detached: true}
+	asker := &fakeAsker{answer: approval.Answer{Suspended: suspended}}
+	result, err := NewAskUserTool(asker).Execute(askCtx(&ToolExecContext{Answered: &types.AgentPrompt{Kind: types.AgentPromptKindAskUser}}), json.RawMessage(`{"question":"q"}`))
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Same(t, suspended, result.Suspend)
+	require.Nil(t, result.UserQuestion)
 }

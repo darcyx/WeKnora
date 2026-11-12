@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/compaction"
@@ -39,6 +41,10 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// messages. Tool output must retain its role and call ID; never promote it
 	// into user instructions during error recovery or iteration-limit synthesis.
 	messages := append([]chat.Message(nil), conversation...)
+	if state.Plan != nil {
+		messages = append(messages, planFinalInstruction(state.Plan))
+	}
+	holdPlanAnswer := state.Plan != nil
 	runtimeNotice := "<runtime_event>{\"source\":\"runtime\",\"type\":\"final_synthesis\",\"message\":\"Tool " +
 		"execution has ended for this run. Respond to the current task, including the " +
 		"latest user corrections and source restrictions in the conversation. Base " +
@@ -86,7 +92,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			},
 			func(chunk *types.StreamResponse, _ string) {
 				// Defensive filter: only emit answer content, skip thinking chunks
-				if chunk.ResponseType == types.ResponseTypeThinking {
+				if holdPlanAnswer || chunk.ResponseType == types.ResponseTypeThinking {
 					return
 				}
 				_, answerContent := splitter.Feed(chunk.Content)
@@ -172,13 +178,42 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		return err
 	}
 	_, tail := splitter.Flush()
-	_ = e.eventBus.Emit(ctx, event.Event{
-		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true},
-	})
-
 	// Safety net: strip any residual <think> blocks that may have leaked through
 	fullAnswer := agenttools.StripThinkBlocks(llmResult.Content)
+	// Streamed text stays unless post-processing changed it; then replace it whole.
+	public, err := e.publicAnswer(ctx, fullAnswer, messages)
+	if err != nil {
+		return err
+	}
+	if holdPlanAnswer {
+		// An interrupted step can still produce its private report despite the final instruction.
+		if isPrivatePlanReport(public) {
+			public = stalledAnswerFallback
+		}
+		terminalContent = fullAnswer
+	}
+	if public != fullAnswer {
+		if answerStreamed {
+			_ = e.eventBus.Emit(ctx, event.Event{
+				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+				Data: event.AgentFinalAnswerData{Replace: true},
+			})
+		}
+		fullAnswer, terminalContent, tail = public, "", public
+	}
+	// With tools disabled some models still reply with only a tool call;
+	// never finish the turn with a blank answer.
+	if strings.TrimSpace(fullAnswer) == "" {
+		logger.Warnf(ctx, "[Agent][FinalAnswer] Empty synthesis (tool_calls=%d) - using fallback",
+			len(llmResult.ToolCalls))
+		fullAnswer = stalledAnswerFallback
+		terminalContent, tail = "", fullAnswer
+	}
+	_ = e.eventBus.Emit(ctx, event.Event{
+		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true, IsFallback: isRuntimeFallbackAnswer(fullAnswer)},
+	})
+
 	logger.Infof(ctx, "[Agent][FinalAnswer] Final answer generated: %d characters", len(fullAnswer))
 	common.PipelineInfo(ctx, "Agent", "final_answer_done", map[string]interface{}{
 		"session_id": sessionID,
@@ -278,6 +313,14 @@ func (e *AgentEngine) emitCompletionEvent(
 	steps := state.RoundSteps
 	if state.SuspendedStep != nil {
 		steps = append(append([]types.AgentStep(nil), steps...), *state.SuspendedStep)
+	}
+	if state.Plan != nil {
+		steps = slices.Clone(steps)
+		for i := range steps {
+			if steps[i].PlanReport || isPrivatePlanReport(steps[i].Thought) {
+				steps[i].Thought = ""
+			}
+		}
 	}
 	seen := e.takeBackgroundSeen()
 	if len(state.PendingSteerMessages) > 0 || len(state.PendingBackground) > 0 || len(seen) > 0 {

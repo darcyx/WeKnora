@@ -38,6 +38,13 @@ func (s *knowledgeBaseService) applyFAQPostProcessing(
 	if !isFAQ(kb) && !slices.ContainsFunc(scopeKBs, isFAQ) {
 		return chunks, nil
 	}
+	faqKBIDs := make(map[string]bool)
+	for _, k := range append([]*types.KnowledgeBase{kb}, scopeKBs...) {
+		if isFAQ(k) {
+			faqKBIDs[k.ID] = true
+		}
+	}
+	chunks = s.filterByNegativeQuestions(ctx, chunks, params.QueryText, faqKBIDs)
 
 	// Check if we need iterative retrieval for FAQ with separate indexing.
 	// Only use iterative retrieval if we don't have enough unique chunks
@@ -60,16 +67,8 @@ func (s *knowledgeBaseService) applyFAQPostProcessing(
 		)
 	}
 
-	// Filter by negative questions if not using iterative retrieval.
-	faqKBIDs := make(map[string]bool)
-	for _, k := range append([]*types.KnowledgeBase{kb}, scopeKBs...) {
-		if isFAQ(k) {
-			faqKBIDs[k.ID] = true
-		}
-	}
-	result := s.filterByNegativeQuestions(ctx, chunks, params.QueryText, faqKBIDs)
-	logger.Infof(ctx, "Result count after negative question filtering: %d", len(result))
-	return result, nil
+	logger.Infof(ctx, "Result count after negative question filtering: %d", len(chunks))
+	return chunks, nil
 }
 
 // iterativeRetrieveWithDeduplication performs iterative retrieval until enough unique chunks are found.
@@ -176,6 +175,11 @@ func (s *knowledgeBaseService) iterativeRetrieveWithDeduplication(ctx context.Co
 				for _, chunk := range newChunks {
 					chunkDataCache[chunk.ID] = chunk
 				}
+				for _, id := range newChunkIDs {
+					if chunkDataCache[id] == nil {
+						filteredOutChunks[id] = struct{}{}
+					}
+				}
 			}
 		}
 
@@ -281,8 +285,10 @@ func (s *knowledgeBaseService) filterByNegativeQuestions(ctx context.Context,
 	for _, chunk := range chunks {
 		chunkData, ok := chunkMap[chunk.ChunkID]
 		if !ok {
-			// Not an FAQ candidate (not looked up), or not found: keep it
-			filteredChunks = append(filteredChunks, chunk)
+			// Unqueried document hits stay; missing FAQ rows cannot consume result slots.
+			if chunk.KnowledgeBaseID != "" && !faqKBIDs[chunk.KnowledgeBaseID] {
+				filteredChunks = append(filteredChunks, chunk)
+			}
 			continue
 		}
 

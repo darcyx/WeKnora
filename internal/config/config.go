@@ -60,6 +60,10 @@ type AgentConfig struct {
 	// PromptExpireSeconds is how long a suspended prompt stays answerable.
 	// 0 means default 604800 (7 days); a negative value never expires.
 	PromptExpireSeconds int `yaml:"prompt_expire_seconds" json:"prompt_expire_seconds"`
+	// UnlimitedIterationCap bounds a run whose agent declares unlimited rounds
+	// (smart-reasoning). 0 means default 40; a negative value keeps such runs
+	// truly unbounded.
+	UnlimitedIterationCap int `yaml:"unlimited_iteration_cap" json:"unlimited_iteration_cap"`
 }
 
 // Defaults for suspendable agent prompts.
@@ -71,6 +75,18 @@ const (
 // PromptSuspend reports whether suspendable prompts may suspend their run.
 func (c *AgentConfig) PromptSuspend() bool {
 	return c == nil || c.PromptSuspendEnabled == nil || *c.PromptSuspendEnabled
+}
+
+// DefaultUnlimitedIterationCap is the absolute round ceiling applied to a run
+// whose agent declares unlimited iterations.
+const DefaultUnlimitedIterationCap = 40
+
+// HardIterationCap returns the configured absolute ceiling for unlimited runs.
+func (c *AgentConfig) HardIterationCap() int {
+	if c == nil || c.UnlimitedIterationCap == 0 {
+		return DefaultUnlimitedIterationCap
+	}
+	return c.UnlimitedIterationCap
 }
 
 // PromptHotWait returns the in-memory wait before a run is suspended.

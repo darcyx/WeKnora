@@ -252,14 +252,15 @@ func (t *ReadFileTool) readSkillResource(ctx context.Context, input ReadFileInpu
 			if !installed {
 				dir = "a session directory prepared automatically from this skill package"
 			}
-			fmt.Fprintf(&b, "Execution: shell_exec(skill_name=%q, command=...). "+
+			fmt.Fprintf(&b, "Only when the task requires script execution, use shell_exec(skill_name=%q, command=...). "+
+				"Applying these instructions alone does not require a shell command or environment inspection. "+
 				"Use $WEKNORA_SKILL_DIR for bundled scripts (resources: %s); "+
 				"cwd defaults to /workspace. "+
 				"Host skill resources are staged into the session automatically "+
 				"(host virtualenvs and node_modules are not copied). "+
 				"Deliverables belong in /workspace/output.\n\n", name, dir)
 		} else {
-			b.WriteString("Execution is unavailable: this agent has no sandbox shell. The skill instructions can be read; configuring a shell-capable sandbox is required to run scripts.\n\n")
+			b.WriteString("Execution is unavailable: this agent has no sandbox shell. The instructions can still be applied without running scripts; a shell-capable sandbox is required only for tasks that need scripts.\n\n")
 		}
 		b.WriteString(skill.Instructions)
 		files, err := t.skills.ListSkillFiles(ctx, name)

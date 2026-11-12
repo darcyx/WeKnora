@@ -31,7 +31,7 @@ func (e *AgentEngine) appendToolImages(
 	var blocks []imageBlock
 	var described []describedCall
 	for _, call := range step.ToolCalls {
-		if call.Result == nil || !call.Result.Success || len(call.Result.Images) == 0 {
+		if call.Result == nil || !call.Result.Success || len(call.Result.Images) == 0 || !e.retrievalResultInScope(call) {
 			continue
 		}
 		if e.config != nil && e.config.ChatModelSupportsVision {

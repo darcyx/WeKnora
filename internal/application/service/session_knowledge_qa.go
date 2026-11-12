@@ -475,7 +475,7 @@ func (s *sessionService) buildSearchTargets(
 	if len(kbIDsToFetch) > 0 {
 		kbs, kbFetchErr := s.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, kbIDsToFetch)
 		if kbFetchErr != nil {
-			logger.Warnf(ctx, "Failed to fetch knowledge bases for search targets: %v", kbFetchErr)
+			return nil, fmt.Errorf("load search knowledge bases: %w", kbFetchErr)
 		}
 		for _, kb := range kbs {
 			if kb != nil {
@@ -522,8 +522,7 @@ func (s *sessionService) buildSearchTargets(
 	if len(knowledgeIDs) > 0 {
 		knowledgeList, err := s.knowledgeService.GetKnowledgeBatchWithSharedAccess(ctx, tenantID, knowledgeIDs)
 		if err != nil {
-			logger.Warnf(ctx, "Failed to get knowledge batch for search targets: %v", err)
-			return targets, nil // Return what we have, don't fail
+			return nil, fmt.Errorf("load mentioned documents for search: %w", err)
 		}
 
 		// Group knowledge IDs by their KB, excluding those already covered by full KB search

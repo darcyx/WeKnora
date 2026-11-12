@@ -350,6 +350,15 @@ func outputFilesPrompt(result *types.ToolResult) string {
 	return "\nOutput files: `" + strings.Join(result.OutputFiles, "`, `") + "`"
 }
 
+// DecodeObservationText preserves distinct source identities in the internal ledger.
+// Public citation formatting may map several chunks to the same document link.
+func (r *Registry) DecodeObservationText(text string) string {
+	if r == nil {
+		return text
+	}
+	return r.sources.DecodeBareText(r.resources.DecodeText(text))
+}
+
 // DecodeOutputText applies the public citation policy to complete text. It is
 // primarily used by non-streaming cleanup/fallback paths.
 func (r *Registry) DecodeOutputText(text string) string {

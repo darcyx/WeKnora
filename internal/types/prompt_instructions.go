@@ -112,5 +112,4 @@ const SourcedAnswerOutputPrompt = `Answer presentation:
 - Preserve the complete Markdown image syntax and URL exactly when reusing a source image. ` +
 	`Use ASCII half-width parentheses as ![alt](url); never invent, shorten, or replace its URL.
 - Before finishing, silently verify that the answer follows the requested format, supports ` +
-	`its factual claims, and accurately distinguishes completed actions from remaining work. ` +
-	`Source citation formatting is controlled by the runtime protocol.`
+	`its factual claims, and accurately distinguishes completed actions from remaining work.`

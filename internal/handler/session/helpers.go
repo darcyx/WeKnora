@@ -445,7 +445,21 @@ func (h *Handler) writeAgentQueryEvent(
 			"session_id": sessionID,
 			"message_id": assistantMessageID,
 		})
-		// Non-fatal error, continue
+		return
+	}
+	if resume != nil {
+		return
+	}
+	status := "Thinking…"
+	if strings.HasPrefix(types.LanguageFromContextOrDefault(ctx), "zh") {
+		status = "思考中…"
+	}
+	id := assistantMessageID + "-thinking-start"
+	if err := h.streamManager.AppendEvent(ctx, sessionID, assistantMessageID, interfaces.StreamEvent{
+		ID: id, Type: types.ResponseTypeThinking, Content: status, Done: true, Timestamp: time.Now(),
+		Data: map[string]interface{}{"event_id": id},
+	}); err != nil {
+		logger.Warnf(ctx, "Failed to stream initial thinking status for message %s: %v", assistantMessageID, err)
 	}
 }
 

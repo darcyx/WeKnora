@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -320,6 +321,10 @@ func (e *AgentEngine) streamThinkingToEventBus(
 		PromptCacheKey:      sessionID,
 	}
 
+	if len(tools) == 0 && planInProgress(e.progress.state) {
+		opts.Format = json.RawMessage(planReportFormat)
+	}
+
 	pendingToolCalls := make(map[string]bool)
 	thinkingToolIDs := make(map[string]string) // tool_call_id -> event ID for thinking tool streams
 
@@ -334,8 +339,8 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	//   - splitter separates inline <think>…</think> reasoning from answer text
 	//     in the plain `content` channel (models that don't use reasoning_content).
 	//   - thinkingOpen tracks whether the thought stream still needs a Done marker.
-	//   - answerStreamed records that user-facing answer text was sent live to
-	//     the final-answer area, so the natural-stop branch only emits Done.
+	//   - answerStreamed records publication after the round's purpose is known,
+	//     so the natural-stop branch only emits Done.
 	splitter := agenttools.NewThinkStreamSplitter()
 	thinkingOpen := false
 	answerStreamed := false
@@ -366,7 +371,8 @@ func (e *AgentEngine) streamThinkingToEventBus(
 		}
 	}
 	emitAnswer := func(content string) {
-		if e.holdCollaborationAnswer {
+		if e.holdCollaborationAnswer || e.progress.state != nil && e.progress.state.Plan != nil &&
+			e.progress.state.Plan.Current < len(e.progress.state.Plan.Steps) {
 			return
 		}
 		if content == "" {
@@ -390,8 +396,9 @@ func (e *AgentEngine) streamThinkingToEventBus(
 			Type:      event.EventAgentFinalAnswer,
 			SessionID: sessionID,
 			Data: event.AgentFinalAnswerData{
-				Content: content,
-				Done:    false,
+				Content:    content,
+				Done:       false,
+				IsFallback: isRuntimeFallbackAnswer(content),
 			},
 		})
 	}
@@ -473,55 +480,27 @@ func (e *AgentEngine) streamThinkingToEventBus(
 				return
 			}
 
-			// Plain content channel. Streamed live to the answer area
-			// (optimistically rendered as the final answer). If the round turns
-			// out to call tools, this was a preamble; the subsequent tool-call
-			// events let the UI retract it from the answer area and relocate it
-			// into the steps. Split out any inline <think> reasoning so it goes
-			// to the thought area instead.
+			// A late tool call can make this content a preamble. Keep the body in
+			// streamLLMResult until the round ends; only reasoning is routed now.
 			if chunk.Content != "" {
-				thinkPart, answerPart := splitter.Feed(chunk.Content)
-				if splitter.TakeAnswerReset() && answerStreamed {
-					_ = e.eventBus.Emit(
-						ctx,
-						event.Event{
-							ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-							Data: event.AgentFinalAnswerData{Replace: true},
-						},
-					)
-					answerStreamed = false
-				}
+				thinkPart, _ := splitter.Feed(chunk.Content)
 				if thinkPart != "" {
 					thinkingOpen = true
 					emitThought(thinkPart, false)
 				}
-				emitAnswer(answerPart)
 			}
 			if chunk.Done {
-				thinkPart, answerPart := splitter.Flush()
+				thinkPart, _ := splitter.Flush()
 				if thinkPart != "" {
 					thinkingOpen = true
 					emitThought(thinkPart, false)
 				}
-				emitAnswer(answerPart)
 				closeThinking()
 			}
 		},
 	)
+	closeThinking()
 	if err != nil {
-		// A failed attempt may already have streamed answer text. The retry
-		// starts a new answer event, so leaving this draft live would make the
-		// final message concatenate the failed attempt with the recovered one.
-		// A user cancellation is the exception: there is no retry, and the
-		// partial text is the only answer the user has.
-		if ctx.Err() == nil && answerStreamed {
-			_ = e.eventBus.Emit(ctx, event.Event{
-				ID:        answerID,
-				Type:      event.EventAgentFinalAnswer,
-				SessionID: sessionID,
-				Data:      event.AgentFinalAnswerData{Replace: true},
-			})
-		}
 		logger.Errorf(ctx, "[Agent][Thinking] Iteration-%d failed: %v", iteration+1, err)
 		return nil, err
 	}
@@ -539,6 +518,28 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	finishReason := llmResult.FinishReason
 	if finishReason == "" {
 		finishReason = "stop"
+	}
+	publishAnswer := len(llmResult.ToolCalls) == 0 && ctx.Err() == nil &&
+		(isNaturalStopFinishReason(finishReason) || isLengthFinishReason(finishReason))
+	// An empty round is retried by the loop's empty-content guard, so nothing
+	// from it will ever be published. Running the answer gates on it anyway cost
+	// one boundary model call per empty round — the gate re-sends the whole
+	// system prompt — for text that is discarded.
+	activeStep := planInProgress(e.progress.state)
+	if publishAnswer && !activeStep && strings.TrimSpace(fullContent) != "" {
+		fullContent, err = e.publicAnswer(ctx, fullContent, messages)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if s := e.progress.state; s != nil && s.Plan != nil && !planInProgress(s) && isPrivatePlanReport(fullContent) {
+		fullContent = ""
+		if publishAnswer {
+			fullContent = stalledAnswerFallback
+		}
+	}
+	if publishAnswer && !e.clarificationLeavesIndependentWork(fullContent) {
+		emitAnswer(fullContent)
 	}
 
 	resp := &types.ChatResponse{

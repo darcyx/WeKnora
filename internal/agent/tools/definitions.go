@@ -11,8 +11,7 @@ const (
 	ToolCallMCPTool      = "call_mcp_tool"
 	ToolThinking         = "thinking"
 	ToolTodoWrite        = "todo_write"
-	// ToolAskUser asks the user a question through a card and waits for the
-	// answer; the run may suspend until it arrives.
+	// ToolAskUser asks for missing context and ends the turn without waiting.
 	ToolAskUser = "ask_user"
 	// ToolRequestSecureForm shows a secure credential card for the sandbox
 	// browser; the agent gets a handle, never the values.
@@ -122,7 +121,7 @@ func AvailableToolDefinitions() []AvailableTool {
 	return []AvailableTool{
 		{Name: ToolThinking, Label: "思考", Description: "动态和反思性的问题解决思考工具", Group: ToolGroupBase},
 		{Name: ToolTodoWrite, Label: "制定计划", Description: "创建结构化的研究计划", Group: ToolGroupBase},
-		{Name: ToolAskUser, Label: "向用户提问", Description: "需要用户补充信息或做选择时，弹出卡片等待回答", Group: ToolGroupBase},
+		{Name: ToolAskUser, Label: "向用户提问", Description: "需要用户补充信息或做选择时，直接追问并结束本轮", Group: ToolGroupBase},
 		{
 			Name:        ToolSearchConversations,
 			Label:       "回顾历史对话",

@@ -910,7 +910,9 @@ func TestApplyFAQPostProcessing_PropagatesError(t *testing.T) {
 		{Engine: buildBoundComposite(t, bad), BaseParams: vectorParams("q"), TopK: 50, KBIDs: []string{"kb-bad"}},
 		{Engine: buildBoundComposite(t, bad), BaseParams: vectorParams("q"), TopK: 50, KBIDs: []string{"kb-bad-2"}},
 	}
-	s := &knowledgeBaseService{}
+	s := &knowledgeBaseService{chunkRepo: &citedChunkRepo{byID: map[string][]*types.Chunk{
+		"c1": {{ID: "c1", TenantID: 1, KnowledgeBaseID: "kb-bad", ChunkType: types.ChunkTypeFAQ}},
+	}}}
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
 
 	// FAQ KB + iterative-retrieval trigger (chunks < MatchCount AND
@@ -1020,7 +1022,9 @@ func TestApplyFAQPostProcessing_TriggerJudgesEachList(t *testing.T) {
 		{Engine: buildBoundComposite(t, bad), BaseParams: vectorParams("q"), TopK: 5, KBIDs: []string{"kb-a"}},
 		{Engine: buildBoundComposite(t, bad), BaseParams: vectorParams("q"), TopK: 5, KBIDs: []string{"kb-b"}},
 	}
-	s := &knowledgeBaseService{chunkRepo: &tenantScopedFAQChunkRepo{}}
+	s := &knowledgeBaseService{chunkRepo: &citedChunkRepo{byID: map[string][]*types.Chunk{
+		"c1": {{ID: "c1", TenantID: 1, KnowledgeBaseID: "kb-a", ChunkType: types.ChunkTypeFAQ}},
+	}}}
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
 	kb := &types.KnowledgeBase{ID: "kb-a", Type: types.KnowledgeBaseTypeFAQ, TenantID: 1}
 	chunks := []*types.IndexWithScore{{ChunkID: "c1", Score: 0.5}}

@@ -3,6 +3,7 @@ package types
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"strings"
 )
 
 // SearchTargetType represents the type of search target
@@ -48,6 +49,24 @@ type SearchTarget struct {
 
 // SearchTargets is a list of search targets, pre-computed at request entry point
 type SearchTargets []*SearchTarget
+
+// Clone keeps runtime reservations independent of later scope changes.
+func (st SearchTargets) Clone() SearchTargets {
+	if st == nil {
+		return nil
+	}
+	cloned := make(SearchTargets, len(st))
+	for i, target := range st {
+		if target != nil {
+			value := *target
+			value.KnowledgeIDs = append([]string(nil), target.KnowledgeIDs...)
+			value.TagIDs = append([]string(nil), target.TagIDs...)
+			value.ScopeTagIDs = append([]string(nil), target.ScopeTagIDs...)
+			cloned[i] = &value
+		}
+	}
+	return cloned
+}
 
 // RecallThresholds returns the effective recall thresholds for this target.
 func (st *SearchTarget) RecallThresholds(vectorThreshold, keywordThreshold float64) (float64, float64) {
@@ -229,6 +248,8 @@ type SearchResult struct {
 
 	// KnowledgeCustomMetadata is user-authored context safe to expose to models.
 	KnowledgeCustomMetadata string `json:"knowledge_custom_metadata,omitempty"`
+	// Keep source-link fields structured; descriptive values may contain newlines.
+	KnowledgeCustomMetadataRaw JSON `json:"-" gorm:"-"`
 
 	// KnowledgeBaseID is the ID of the knowledge base this result belongs to
 	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
@@ -377,3 +398,18 @@ const (
 	// still reaches a model that can see it.
 	MetadataImageVectorMatch = "image_vector_match"
 )
+
+// DocumentReferenceURL selects an original link from the same document result.
+// A present but invalid source_url is not replaced with a different URL.
+func DocumentReferenceURL(metadata map[string]string, customMetadata JSON, source string) string {
+	var custom map[string]interface{}
+	_ = json.Unmarshal(customMetadata, &custom)
+	sourceURL, _ := custom["source_url"].(string)
+	fallbackURL, _ := custom["url"].(string)
+	for _, value := range []string{metadata["source_url"], sourceURL, metadata["url"], fallbackURL, source} {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}

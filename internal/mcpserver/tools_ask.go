@@ -329,6 +329,8 @@ func (s *Server) runQA(
 		answer   strings.Builder
 		final    string
 		refs     []*types.SearchResult
+		faqSteps []types.AgentStep
+		usage    *types.TokenUsage
 		qaErr    error
 		done     = make(chan struct{})
 		complete = make(chan struct{})
@@ -377,6 +379,19 @@ func (s *Server) runQA(
 			if len(completeRefs) > 0 {
 				refs = completeRefs
 			}
+		}
+		if steps, ok := data.AgentSteps.([]types.AgentStep); ok {
+			for _, step := range steps {
+				for _, call := range step.ToolCalls {
+					if call.ID == types.FAQClarificationToolCallID {
+						faqSteps = append(faqSteps, step)
+						break
+					}
+				}
+			}
+		}
+		if turnUsage, ok := data.Usage.(*types.TokenUsage); ok {
+			usage = turnUsage
 		}
 		mu.Unlock()
 		closeComplete()
@@ -457,6 +472,8 @@ func (s *Server) runQA(
 		text = final
 	}
 	collected := append([]*types.SearchResult(nil), refs...)
+	storedFAQSteps := append([]types.AgentStep(nil), faqSteps...)
+	storedUsage := usage
 	runErr := qaErr
 	mu.Unlock()
 
@@ -473,6 +490,8 @@ func (s *Server) runQA(
 	}
 	assistantMsg.Content = text
 	assistantMsg.IsCompleted = true
+	assistantMsg.AgentSteps = storedFAQSteps
+	assistantMsg.Usage = storedUsage
 	if len(collected) > 0 {
 		assistantMsg.KnowledgeReferences = types.References(collected)
 	}

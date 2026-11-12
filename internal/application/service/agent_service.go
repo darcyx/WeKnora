@@ -1476,10 +1476,7 @@ func (s *agentService) registerTools(
 		case tools.ToolTodoWrite:
 			toolToRegister = tools.NewTodoWriteTool()
 		case tools.ToolAskUser:
-			asker, ok := s.toolApprovalGate.(approval.UserAsker)
-			if !ok || asker == nil {
-				continue
-			}
+			asker, _ := s.toolApprovalGate.(approval.UserAsker)
 			toolToRegister = tools.NewAskUserTool(asker)
 		case tools.ToolSearchKnowledge:
 			toolToRegister = tools.NewSearchKnowledgeTool(

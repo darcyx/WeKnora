@@ -501,5 +501,50 @@ func TestSteerGuidanceAppliesToCustomAgentPrompt(t *testing.T) {
 	prompt := BuildSystemPromptWithOptions(nil, false, nil, "Custom agent instructions.")
 	assert.Contains(t, prompt, "Custom agent instructions.")
 	assert.Contains(t, prompt, steerGuidance)
-	assert.Contains(t, prompt, "Preserve unfinished objectives")
+	assert.Contains(t, prompt, "preserve unfinished objectives")
+}
+
+func TestAcceptedSteerChecksFAQOnceBeforeNextModelRound(t *testing.T) {
+	for _, hit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "hit", false: "miss"}[hit], func(t *testing.T) {
+			model := &mockChat{responses: []mockResponse{plannerResponse("请补充平台。"), planToolCall(agenttools.ToolSearchKnowledge), plannerResponse("文档回答")}}
+			engine := newTestEngine(t, model)
+			engine.toolRegistry = agenttools.NewToolRegistry()
+			search := newCountingTool(agenttools.ToolSearchKnowledge)
+			engine.toolRegistry.RegisterTool(search)
+			_, idle := engineCollaboration(t)
+			engine.SetCollaboration(idle)
+			engine.SetSteerSink(&delayedSteerSink{fakeSteerSink: fakeSteerSink{queued: []map[string]any{
+				steerEntry("s0", "支付时失败"), steerEntry("s1", "是 iOS"),
+			}}, hideUntil: 2})
+			checks := 0
+			engine.SetSteerFAQ(func(_ context.Context, id, query string, dialogue []chat.Message) (SteerFAQReply, error) {
+				checks++
+				require.Equal(t, "user-row-for-是 iOS", id)
+				require.Equal(t, "是 iOS", query)
+				require.Contains(t, dialogue, chat.Message{Role: "user", Content: "支付时失败"})
+				if hit {
+					return SteerFAQReply{Answer: "FAQ 原文"}, nil
+				}
+				return SteerFAQReply{}, nil
+			})
+			var complete []event.AgentCompleteData
+			engine.eventBus.On(event.EventAgentComplete, func(_ context.Context, e event.Event) error {
+				complete = append(complete, e.Data.(event.AgentCompleteData))
+				return nil
+			})
+			state, err := engine.Execute(t.Context(), "s", "m", "SDK 支付失败", nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, checks)
+			require.Len(t, complete, 1)
+			want, rounds, searches := "文档回答", 3, 1
+			if hit {
+				want, rounds, searches = "FAQ 原文", 1, 0
+			}
+			require.Equal(t, want, state.FinalAnswer)
+			require.Equal(t, want, complete[0].FinalAnswer)
+			require.Equal(t, searches, search.calls)
+			require.Len(t, model.calls, rounds)
+		})
+	}
 }

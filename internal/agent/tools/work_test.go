@@ -145,6 +145,17 @@ func TestWorkWaitZeroReadsOnceInDetail(t *testing.T) {
 	require.Equal(t, []string{"sj_1"}, marks.seen)
 }
 
+func TestWorkWaitAcceptsSerializedIDArrayThroughRegistry(t *testing.T) {
+	h := &fakeWorkHandler{detailed: map[string]string{"sj_1": interfaces.WorkStateSucceeded}}
+	wait, _ := newTestWorkWait(h, &recordingMarks{}, nil)
+	registry := NewToolRegistry()
+	registry.RegisterTool(wait)
+	res, err := registry.ExecuteTool(t.Context(), ToolWorkWait, json.RawMessage(`{"work_ids":"[\"sj_1\"]","wait_sec":0}`))
+	require.NoError(t, err)
+	require.True(t, res.Success, res.Error)
+	require.Equal(t, "sj_1", decodeWork(t, res.Output).Items[0].WorkID)
+}
+
 func TestWorkWaitAllWaitsForEveryID(t *testing.T) {
 	h := &fakeWorkHandler{
 		cheap: map[string][]string{

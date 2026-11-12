@@ -7,19 +7,21 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/agent/approval"
-	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-const askUserDescription = `Ask the user a question and wait for the answer before continuing.
+const askUserDescription = `Ask the user for missing context, then end this turn immediately. The user answers in their next message.
 
 Use it only when you cannot proceed without information or a decision that only the user can provide, such as:
 - choosing between options that lead to different work;
 - details that are missing and cannot be found with other tools;
 - confirming a consequential choice.
 
-Do not use it for anything you can look up, infer reasonably, or that you could simply ask at the end of your answer.
-Ask one focused question at a time.
+Do not ask for information already supplied in the conversation or project context.
+When the relevant branches or required fields must first be discovered in documents, read those documents before asking.
+Ask only what changes the answer or next step; do not guess which branch applies.
+Complete any independent parts of the request before calling this tool. Do not place dependent tool calls after it.
+Ask one focused question, grouping necessary materials for the same task.
 
 Shapes of a question:
 - free text: only "question";
@@ -31,8 +33,8 @@ Options and field labels are shown to the user as written, and the chosen text c
 them in the user's language as a person would say them ("No authentication", "API key"), never as internal ids
 ("api_key"), and offer only choices the next step accepts. Leave out a field you can fill yourself.
 
-The user may take a long time, decline, or not answer at all; then you are told so and must decide how to continue
-without the answer.`
+This tool returns the question for publication without waiting, opening an interactive card, or creating a suspended run.
+Do not call another tool or generate a second version of the question after it. Continue when the user sends their next message.`
 
 var askUserSchema = json.RawMessage(fmt.Sprintf(`{
   "type": "object",
@@ -65,7 +67,7 @@ var askUserSchema = json.RawMessage(fmt.Sprintf(`{
 }`, types.AskUserMaxQuestionLen, types.AskUserMaxOptions, types.AskUserMaxOptionLen,
 	types.AskUserMaxFields, types.AskUserMaxNameLen))
 
-// AskUserTool asks the user a question through a card in the conversation.
+// AskUserTool requests missing context and ends the turn without waiting.
 type AskUserTool struct {
 	BaseTool
 	asker approval.UserAsker
@@ -87,55 +89,16 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (*types
 	}
 	meta, _ := ToolExecFromContext(ctx)
 	resumed := meta != nil && meta.Answered != nil && meta.Answered.Kind == types.AgentPromptKindAskUser
-	if !resumed && (!meta.Attended() || meta.EventBus == nil || t.asker == nil) {
-		return &types.ToolResult{
-			Success: true,
-			Output: "This conversation cannot show an interactive question. Ask the user directly in your " +
-				"reply, then end your turn; their next message will be the answer.",
-		}, nil
+	if !resumed {
+		return AskUserQuestion(question), nil
 	}
-
-	var answer approval.Answer
-	if resumed {
-		answer = t.asker.ResumeAnswer(ctx, meta.Answered, meta.EventBus)
-	} else {
-		waitCtx := ctx
-		if meta.ApprovalCtx != nil {
-			waitCtx = meta.ApprovalCtx
-		}
-		var snapshot []byte
-		var snapshotVersion int
-		if meta.Snapshot != nil {
-			var err error
-			if snapshot, snapshotVersion, err = meta.Snapshot(); err != nil {
-				logger.Warnf(ctx, "[Tool][AskUser] capture run state: %v", err)
-				snapshot = nil
-			}
-		}
-		tenantID := types.CallerFromContext(ctx).TenantID
-		var err error
-		answer, err = t.asker.AskUser(waitCtx, approval.AskRequest{
-			TenantID:           tenantID,
-			UserID:             meta.UserID,
-			SessionID:          meta.SessionID,
-			AssistantMessageID: meta.AssistantMessageID,
-			RequestID:          meta.RequestID,
-			ToolCallID:         meta.ToolCallID,
-			EventBus:           meta.EventBus,
-			Question:           question,
-			Snapshot:           snapshot,
-			SnapshotVersion:    snapshotVersion,
-		})
-		if err != nil {
-			return &types.ToolResult{Success: false, Error: fmt.Sprintf("Asking the user failed: %v", err)}, nil
-		}
+	// Consume answers from runs suspended before ask_user became non-blocking.
+	if t.asker == nil {
+		return &types.ToolResult{Success: false, Error: "Cannot consume the stored user answer: no answer handler"}, nil
 	}
+	answer := t.asker.ResumeAnswer(ctx, meta.Answered, meta.EventBus)
 	if answer.Suspended != nil {
-		return &types.ToolResult{
-			Success: false,
-			Error:   "waiting for the user to answer",
-			Suspend: answer.Suspended,
-		}, nil
+		return &types.ToolResult{Success: false, Error: "waiting for the user to answer", Suspend: answer.Suspended}, nil
 	}
 	data := map[string]interface{}{
 		"display_type": "ask_user",
@@ -159,6 +122,32 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (*types
 	}
 	data["answer"] = answer.Response
 	return &types.ToolResult{Success: true, Output: formatAskUserAnswer(question, answer.Response), Data: data}, nil
+}
+
+// AskUserQuestion validates and renders a non-blocking clarification.
+func AskUserQuestion(question types.AskUserPromptRequest) *types.ToolResult {
+	if err := question.Validate(); err != nil {
+		return &types.ToolResult{Success: false, Error: fmt.Sprintf("Invalid question: %v", err)}
+	}
+	var text strings.Builder
+	text.WriteString(question.Question)
+	for _, option := range question.Options {
+		fmt.Fprintf(&text, "\n- %s", option)
+	}
+	for _, field := range question.Fields {
+		label := field.Label
+		if label == "" {
+			label = field.Name
+		}
+		fmt.Fprintf(&text, "\n- %s", label)
+		if len(field.Options) > 0 {
+			fmt.Fprintf(&text, ": %s", strings.Join(field.Options, " / "))
+		}
+	}
+	return &types.ToolResult{
+		Success: true, Output: text.String(), UserQuestion: &question,
+		Data: map[string]interface{}{"display_type": "user_question", "question": question, "answered": false},
+	}
 }
 
 func formatAskUserAnswer(q types.AskUserPromptRequest, a types.AskUserPromptResponse) string {

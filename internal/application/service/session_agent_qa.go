@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/agent/collaboration"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	appconfig "github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
@@ -62,12 +63,6 @@ func (s *sessionService) AgentQA(
 	// bind script execution to a per-session MicroVM instance.
 	ctx = types.WithSessionID(ctx, sessionID)
 	ctx = types.WithRunMode(ctx, req.Mode)
-	sessionJSON, err := json.Marshal(req.Session)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal session, session ID: %s, error: %v", sessionID, err)
-		return fmt.Errorf("failed to marshal session: %w", err)
-	}
-
 	// customAgent is required for AgentQA (handler has already done permission check for shared agent)
 	if req.CustomAgent == nil {
 		logger.Warnf(ctx, "Custom agent not provided for session: %s", sessionID)
@@ -76,8 +71,8 @@ func (s *sessionService) AgentQA(
 
 	// Resolve retrieval tenant using shared helper
 	agentTenantID := s.resolveRetrievalTenantID(ctx, req)
-	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query: %s, session: %s",
-		sessionID, agentTenantID, req.Query, string(sessionJSON))
+	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query length: %d",
+		sessionID, agentTenantID, len([]rune(req.Query)))
 
 	var tenantInfo *types.Tenant
 	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
@@ -197,15 +192,22 @@ func (s *sessionService) AgentQA(
 					req.CustomAgent.ID)
 			}
 		} else if rerankModelID == "" {
-			logger.Warnf(ctx, "No rerank model configured for custom agent %s, but knowledge_search tool is enabled", req.CustomAgent.ID)
-			return errors.New("rerank model is not configured: please set rerank_model_id on the agent")
+			// A missing rerank model degrades ranking quality, it does not make
+			// the knowledge base unreadable: search_knowledge keeps the
+			// retrieval order without one. Failing the whole turn here turned an
+			// optional component into a hard start-up gate for every question.
+			logger.Warnf(ctx, "No rerank model configured for custom agent %s; knowledge_search will keep retrieval order",
+				req.CustomAgent.ID)
 		}
 
 		if rerankModelID != "" {
-			rerankModel, err = s.modelService.GetRerankModel(ctx, rerankModelID)
-			if err != nil {
-				logger.Warnf(ctx, "Failed to get rerank model: %v", err)
-				return fmt.Errorf("failed to get rerank model: %w", err)
+			// A local error keeps the turn's own error value untouched: a
+			// degraded rerank must not leak into a later `if err != nil`.
+			model, getErr := s.modelService.GetRerankModel(ctx, rerankModelID)
+			if getErr != nil {
+				logger.Warnf(ctx, "Failed to get rerank model %s, searching without reranking: %v", rerankModelID, getErr)
+			} else {
+				rerankModel = model
 			}
 		}
 	} else {
@@ -221,12 +223,23 @@ func (s *sessionService) AgentQA(
 	var llmContext []chat.Message
 	if agentConfig.MultiTurnEnabled {
 		budget := agent.HistoryTokenBudget(agentConfig)
-		llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
-			ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory,
-		)
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
+				ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory,
+			)
+			if err == nil {
+				break
+			}
+			logger.Warnf(ctx, "Failed to load agent history (attempt %d/2): %v", attempt+1, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
-			logger.Warnf(ctx, "Failed to load agent history from DB: %v, continuing without history", err)
-			llmContext = []chat.Message{}
+			return fmt.Errorf("failed to load conversation history; please retry: %w", err)
 		}
 		logger.Infof(ctx, "Loaded %d history messages from DB (budget=%d tokens, token scale=%.2f)",
 			len(llmContext), budget, agentConfig.ContextTokenScale)
@@ -317,6 +330,13 @@ func (s *sessionService) AgentQA(
 	)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create agent engine: %v", err)
+		return err
+	}
+
+	if receiver, ok := engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
+		receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
+	}
+	if err := s.bindAgentRetrievalState(ctx, req, agentConfig, engine); err != nil {
 		return err
 	}
 
@@ -422,17 +442,8 @@ func (s *sessionService) AgentQA(
 		_, err = engine.Execute(ctx, sessionID, req.AssistantMessageID, agentQuery, llmContext, agentImageURLs)
 	}
 	if err != nil {
+		// The engine has already emitted EventError for this failure.
 		logger.Errorf(ctx, "Agent execution failed: %v", err)
-		// Emit error event to the EventBus used by this agent
-		eventBus.Emit(ctx, event.Event{
-			Type:      event.EventError,
-			SessionID: sessionID,
-			Data: event.ErrorData{
-				Error:     err.Error(),
-				Stage:     "agent_execution",
-				SessionID: sessionID,
-			},
-		})
 	}
 	// Return empty - events will be handled by Handler via EventBus subscription
 	return nil
@@ -512,6 +523,15 @@ func resumableAgentRequest(ctx context.Context, req *types.QARequest) types.Resu
 
 // buildAgentConfig creates a runtime AgentConfig from the QARequest's custom agent configuration,
 // tenant info, and resolved knowledge bases / search targets.
+// hardIterationCap reads the workspace's absolute round ceiling for agents
+// that declare unlimited iterations.
+func hardIterationCap(cfg *appconfig.Config) int {
+	if cfg == nil || cfg.Agent == nil {
+		return 0 // AgentConfig.HardIterationLimit applies its default.
+	}
+	return cfg.Agent.HardIterationCap()
+}
+
 func (s *sessionService) buildAgentConfig(
 	ctx context.Context,
 	req *types.QARequest,
@@ -526,6 +546,7 @@ func (s *sessionService) buildAgentConfig(
 	customAgent := req.CustomAgent
 	agentConfig := &types.AgentConfig{
 		MaxIterations:                 customAgent.Config.MaxIterations,
+		PlanningEnabled:               customAgent.Config.PlanningEnabled,
 		Temperature:                   customAgent.Config.Temperature,
 		WebSearchEnabled:              customAgent.Config.WebSearchEnabled && req.WebSearchEnabled,
 		LocalBrowserEnabled:           req.LocalBrowserEnabled,
@@ -553,6 +574,10 @@ func (s *sessionService) buildAgentConfig(
 		// Only read-only tools overlap (agenttools.CanRunConcurrently);
 		// anything else is a barrier that runs alone, in model order.
 		ParallelToolCalls: true,
+		// An agent may declare unlimited rounds (smart-reasoning). The absolute
+		// ceiling keeps an unstable model that keeps changing its arguments from
+		// running until the user cancels; 0 in config means the default.
+		HardMaxIterations: hardIterationCap(s.cfg),
 	}
 	applyRequestReasoningEffort(req.ReasoningEffort, &agentConfig.Thinking, &agentConfig.ReasoningEffort)
 	// An unset MCP mode means "all" at runtime, but the share scope and the

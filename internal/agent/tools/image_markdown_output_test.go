@@ -29,7 +29,7 @@ func TestLLMToolOutputsUseMarkdownImages(t *testing.T) {
 	}
 
 	readOutput := (&ReadDocumentTool{}).buildOutput(
-		&types.Knowledge{ID: "knowledge-1", Title: "测试文档"}, 1, []readChunkRow{{chunk: chunk}}, "",
+		&types.Knowledge{ID: "knowledge-1", Title: "测试文档"}, 1, []readChunkRow{{chunk: chunk}}, "", "",
 	)
 	enrichedOutput := enrichChunkContent(chunk)
 	for name, output := range map[string]string{

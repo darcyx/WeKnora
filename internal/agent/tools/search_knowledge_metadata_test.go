@@ -60,3 +60,16 @@ func TestWriteKnowledgeMetadataHeaderOmitsEmptySection(t *testing.T) {
 	}})
 	require.Empty(t, output.String())
 }
+
+func TestDocumentReferenceLinksSurviveSearchAndRead(t *testing.T) {
+	knowledge := &types.Knowledge{ID: "doc", Title: "说明", Source: "https://fallback.example/doc", CustomMetadata: types.JSON(`{"source_url":"https://docs.example/original","url":"https://docs.example/secondary"}`)}
+	result := (&SearchKnowledgeTool{}).formatOutput(t.Context(), []*searchResultWithMeta{{SearchResult: &types.SearchResult{
+		ID: "chunk", KnowledgeID: knowledge.ID, KnowledgeTitle: knowledge.Title, KnowledgeSource: knowledge.Source, KnowledgeCustomMetadata: knowledge.CustomMetadataText(), KnowledgeCustomMetadataRaw: knowledge.CustomMetadata, Content: "正文",
+	}}}, nil, "查询", "search")
+	row := result.Data["results"].([]map[string]interface{})[0]
+	require.Equal(t, "https://docs.example/original", row["source_url"])
+	data := (&ReadDocumentTool{}).buildData(knowledge, 1, []readChunkRow{{chunk: &types.Chunk{ID: "chunk", KnowledgeID: "doc", Content: "正文"}}})
+	require.Equal(t, row["source_url"], data["source_url"])
+	require.Equal(t, knowledge.Source, types.DocumentReferenceURL(nil, types.JSON(`{"description":"说明\nsource_url: https://wrong.example"}`), knowledge.Source))
+	require.Equal(t, "https://docs.example/secondary", types.DocumentReferenceURL(map[string]string{"url": "https://docs.example/secondary"}, nil, knowledge.Source))
+}

@@ -147,6 +147,50 @@ func finalSynthesisChunks(chunks ...types.StreamResponse) <-chan types.StreamRes
 	return ch
 }
 
+func TestInterruptedPlanSynthesisPublishesOnlyTheUserAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name, first, last, want string
+		ended                   bool
+	}{
+		{"evidence", "请按", "文档配置。", "请按文档配置。", false},
+		{"business explanation", "订单回调示例 ", `{"status":"blocked","order_id":"A7"}`, `订单回调示例 {"status":"blocked","order_id":"A7"}`, true},
+		{"business payload", `{"status":"blocked",`, `"order_id":"A7","result":"订单暂停"}`, `{"status":"blocked","order_id":"A7","result":"订单暂停"}`, true},
+		{"user JSON", `{"channel":`, `"iOS"}`, `{"channel":"iOS"}`, true},
+		{"internal step report", `{"status":"blocked",`, `"result":"gap-1: search rejected"}`, stalledAnswerFallback, false},
+		{"ended plan", `{"status":"blocked",`, `"result":"gap-1"}`, stalledAnswerFallback, true},
+		{"incomplete result-first report", `{"result":`, `"gap-1`, stalledAnswerFallback, true},
+		{"truncated report", `{"status":"blo`, `cked","result":"gap-1`, stalledAnswerFallback, false},
+		{"report with trailing prose", `{"result":"gap-1",`, `"status":"blocked"} 请重试。`, stalledAnswerFallback, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &finalSynthesisChat{}
+			engine := newTestEngine(t, model)
+			recorder := &truncationRecorder{}
+			recorder.attach(engine.eventBus)
+			plan := &types.ExecutionPlan{Steps: []types.ExecutionPlanStep{{Description: "查 iOS 内购配置"}}}
+			messages := []chat.Message{{Role: "user", Content: "App Store iOS 内购"}, planInstruction(plan)}
+			if tc.ended {
+				completePlanStep(plan, `{"status":"blocked","result":"gap-1"}`)
+			}
+			state := &types.AgentState{Plan: plan}
+			model.synthesize = func(_ context.Context, _ []chat.Message, _ *chat.ChatOptions) (<-chan types.StreamResponse, error) {
+				return finalSynthesisChunks(
+					types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Content: tc.first},
+					types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Content: tc.last, Done: true, FinishReason: "stop"},
+				), nil
+			}
+			require.NoError(t, engine.streamFinalAnswerToEventBus(t.Context(), "App Store iOS 内购", state, "session", messages))
+			require.Len(t, model.finals, 1)
+			require.Contains(t, model.finals[0][len(model.finals[0])-1].Content, "The step-report JSON format no longer applies")
+			require.Equal(t, tc.want, state.FinalAnswer)
+			events := recorder.snapshot()
+			require.Len(t, events, 1)
+			require.True(t, events[0].Done)
+			require.Equal(t, tc.want, events[0].Content)
+		})
+	}
+}
+
 func TestStreamFinalAnswer_DisablesThinking(t *testing.T) {
 	for _, configured := range []string{"unset", "disabled", "enabled"} {
 		t.Run(configured, func(t *testing.T) {
@@ -173,6 +217,30 @@ func TestStreamFinalAnswer_DisablesThinking(t *testing.T) {
 			require.Equal(t, "Final summary.", state.FinalAnswer)
 		})
 	}
+}
+
+// Seen in production: with tools disabled the model replied with only a
+// hallucinated tool call, which used to finish the turn with a blank answer.
+func TestStreamFinalAnswer_ToolCallOnlyFallsBack(t *testing.T) {
+	model := &finalSynthesisChat{}
+	engine := newTestEngine(t, model, withMaxIterations(8))
+	var fallback bool
+	engine.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
+		fallback = fallback || ev.Data.(event.AgentFinalAnswerData).IsFallback
+		return nil
+	})
+	model.synthesize = func(context.Context, []chat.Message, *chat.ChatOptions) (<-chan types.StreamResponse, error) {
+		return finalSynthesisChunks(types.StreamResponse{
+			ResponseType: types.ResponseTypeToolCall, FinishReason: "tool_calls", Done: true,
+			ToolCalls: []types.LLMToolCall{{ID: "c1", Type: "function",
+				Function: types.FunctionCall{Name: "read_skill", Arguments: "{}"}}},
+		}), nil
+	}
+	state := &types.AgentState{CurrentRound: 8}
+	_, err := engine.executeLoop(t.Context(), state, "Summarize", emptyMessages(), nil, "session", "message")
+	require.NoError(t, err)
+	require.Equal(t, stalledAnswerFallback, state.FinalAnswer)
+	require.True(t, fallback)
 }
 
 func finalSynthesisInputTokens(e *AgentEngine, messages []chat.Message, opts *chat.ChatOptions) int {

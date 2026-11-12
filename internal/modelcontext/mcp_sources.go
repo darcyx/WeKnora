@@ -16,8 +16,19 @@ const maxMCPSourceCandidates = 50
 
 var (
 	mcpJSONStringRE = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
-	mcpURLRE        = regexp.MustCompile("https?://[^\\s<>\"'`\\\\，。；！？、（）【】]+")
+	httpURLRE       = regexp.MustCompile("(?i)https?://[^\\s<>\"'`\\\\，。；！？、（）【】]+")
 )
+
+func trimURLDelimiters(match string) string {
+	link := strings.TrimRight(match, ".,;!?")
+	// Retain balanced URL parentheses such as /wiki/Function_(mathematics).
+	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}, {"{", "}"}} {
+		for strings.HasSuffix(link, pair[1]) && strings.Count(link, pair[1]) > strings.Count(link, pair[0]) {
+			link = strings.TrimSuffix(link, pair[1])
+		}
+	}
+	return link
+}
 
 func (r *Registry) mcpSourceCandidates(output string) string {
 	if !r.sources.citationsEnabled {
@@ -34,15 +45,8 @@ func (r *Registry) mcpSourceCandidates(output string) string {
 	})
 	seen := make(map[string]bool)
 	var rows strings.Builder
-	for _, match := range mcpURLRE.FindAllString(scan, -1) {
-		rawURL := strings.TrimRight(html.UnescapeString(match), ".,;!?")
-		// Strip Markdown/prose closing delimiters, retaining balanced URL
-		// parentheses such as /wiki/Function_(mathematics).
-		for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}, {"{", "}"}} {
-			for strings.HasSuffix(rawURL, pair[1]) && strings.Count(rawURL, pair[1]) > strings.Count(rawURL, pair[0]) {
-				rawURL = strings.TrimSuffix(rawURL, pair[1])
-			}
-		}
+	for _, match := range httpURLRE.FindAllString(scan, -1) {
+		rawURL := trimURLDelimiters(html.UnescapeString(match))
 		parsed, err := url.Parse(rawURL)
 		if err != nil || parsed.Hostname() == "" || parsed.User != nil ||
 			(parsed.Scheme != "https" && parsed.Scheme != "http") {

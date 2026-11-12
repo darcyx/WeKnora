@@ -82,11 +82,25 @@ type AgentEngine struct {
 	// contextRewrites counts compactions and tool-result trims. Either one
 	// changes messages an earlier request already sent, so the next request
 	// cannot be compared with that one for calibration.
-	contextRewrites int
-	modelContext    *modelcontext.Registry // single request-local boundary for every model handle
+	contextRewrites          int
+	modelContext             *modelcontext.Registry // single request-local boundary for every model handle
+	retrieval                *retrievalControl
+	retrievalGateMu          sync.Mutex
+	retrievalGuard           bool
+	runtimeRetrieval         bool
+	retrievalSearchGapID     string
+	retrievalSearchInputID   string
+	retrievalProjectReviewed string
+	retrievalHistory         []string
+	retrievalPrevious        json.RawMessage
+	retrievalSave            func(context.Context, json.RawMessage) error
+	retrievalTurnID          string
+	retrievalUserMessage     struct{ id, text string }
 	// steerSink, when set, lets users append messages into the running turn.
 	// Drained at every round boundary; nil disables mid-run injection.
 	steerSink         types.SteerSink
+	steerFAQ          SteerFAQFunc
+	pendingSteerFAQ   string
 	allowSteerOverrun bool // one extra ReAct round after a loop-end inject past MaxIterations
 	steerOverruns     int  // how many times this turn has already used the extra round
 	// backgroundRun, when set, supplies background-work notices and reminders
@@ -384,7 +398,12 @@ func (e *AgentEngine) Execute(
 	sessionID, messageID, query string,
 	llmContext []chat.Message,
 	imageURLs ...[]string,
-) (*types.AgentState, error) {
+) (_ *types.AgentState, err error) {
+	defer func() {
+		if err != nil {
+			e.emitExecutionError(ctx, sessionID, err)
+		}
+	}()
 	logger.Infof(ctx, "[Agent] Starting execution: session=%s, message=%s, query_len=%d, context_msgs=%d",
 		sessionID, messageID, len(query), len(llmContext))
 	// Ensure tools are cleaned up after execution
@@ -444,6 +463,11 @@ func (e *AgentEngine) Execute(
 		// never has to look past its first page for one.
 		TurnUsage: types.TokenUsage{ContextTokenScale: e.config.ContextTokenScale},
 	}
+	if e.config.FAQPreflightUsage != nil {
+		state.AddUsage(*e.config.FAQPreflightUsage)
+		state.TurnUsage.Accumulate(*e.config.FAQPreflightUsage)
+	}
+	defer func() { finishAgentSpan(agentSpan, state, err) }()
 
 	// Build system prompt using progressive RAG prompt
 	// If skills are enabled, include skills metadata (Level 1 - Progressive Disclosure)
@@ -456,6 +480,14 @@ func (e *AgentEngine) Execute(
 		imgs = imageURLs[0]
 	}
 	e.beginTurn(query, imgs, state)
+	e.setRetrievalHistory(llmContext)
+	if e.retrieval != nil {
+		e.retrievalTurnID = messageID
+	}
+	e.recordRetrievalUserMessage()
+	if err := e.initializeRetrievalContinuation(ctx); err != nil {
+		return nil, err
+	}
 	messages := e.buildMessagesWithLLMContext(systemPrompt, query, sessionID, llmContext, imgs)
 	if e.toolRegistry != nil {
 		e.toolRegistry.RememberMCPHistory(messages)
@@ -472,21 +504,17 @@ func (e *AgentEngine) Execute(
 		"tool_count": len(tools),
 		"tools":      toolListStr,
 	})
-
-	_, err := e.executeLoop(ctx, state, query, messages, tools, sessionID, messageID)
-	if err != nil {
-		logger.Errorf(ctx, "[Agent] Execution failed: %v", err)
-		e.eventBus.Emit(ctx, event.Event{
-			ID:        generateEventID("error"),
-			Type:      event.EventError,
-			SessionID: sessionID,
-			Data: event.ErrorData{
-				Error:     err.Error(),
-				Stage:     "agent_execution",
-				SessionID: sessionID,
-			},
+	if plan, ok := e.maybePlan(ctx, query, messages, state); ok {
+		state.Plan = plan
+		messages = append(messages, planInstruction(plan))
+		e.emitPlanProgress(ctx, plan, sessionID, state.CurrentRound)
+		common.PipelineInfo(ctx, "Agent", "plan_injected", map[string]interface{}{
+			"session_id": sessionID, "steps": len(plan.Steps),
 		})
-		finishAgentSpan(agentSpan, state, err)
+	}
+
+	_, err = e.executeLoop(ctx, state, query, messages, tools, sessionID, messageID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -498,8 +526,17 @@ func (e *AgentEngine) Execute(
 		"steps":      len(state.RoundSteps),
 		"complete":   state.IsComplete,
 	})
-	finishAgentSpan(agentSpan, state, nil)
 	return state, nil
+}
+
+func (e *AgentEngine) emitExecutionError(ctx context.Context, sessionID string, err error) {
+	logger.Errorf(ctx, "[Agent] Execution failed: %v", err)
+	if emitErr := e.eventBus.Emit(ctx, event.Event{
+		ID: generateEventID("error"), Type: event.EventError, SessionID: sessionID,
+		Data: event.ErrorData{Error: err.Error(), Stage: "agent_execution", SessionID: sessionID},
+	}); emitErr != nil {
+		logger.Warnf(ctx, "[Agent] Failed to emit execution error: %v", emitErr)
+	}
 }
 
 // finishAgentSpan records the final outcome of an agent execution onto the
@@ -544,13 +581,20 @@ func truncateRunes(s string, n int) string {
 }
 
 // withinIterationBudget reports whether another ReAct round is allowed.
-// A negative MaxIterations is unlimited: the loop still stops on a natural
-// finish, user cancel, empty-response retries, or a repeated-content stall.
+// A negative MaxIterations is unlimited for the *model*, but not unbounded for
+// the run: HardIterationLimit is an absolute ceiling, because the no-progress
+// guards only recognise identical calls and a model that keeps changing its
+// arguments can otherwise run until the user cancels. The loop additionally
+// stops on a natural finish, user cancel, empty-response retries, or a
+// repeated-content stall.
 func (e *AgentEngine) withinIterationBudget(round int) bool {
 	if e.config == nil {
 		return false
 	}
 	if e.config.UnlimitedIterations() {
+		if limit := e.config.HardIterationLimit(); limit >= 0 {
+			return round < limit
+		}
 		return true
 	}
 	return round < e.config.MaxIterations
@@ -561,9 +605,10 @@ func (e *AgentEngine) withinIterationBudget(round int) bool {
 // completion-token cutoffs, and identical failed tool calls.
 type loopGuards struct {
 	// emptyRetries counts nudges sent after a stop with no content.
-	emptyRetries         int
-	pendingRuntimeNotice string
-	childAnswerRevised   bool
+	independentWorkRetried bool
+	emptyRetries           int
+	pendingRuntimeNotice   string
+	childAnswerRevised     bool
 	// consecutiveSameContent counts plain rounds that repeated the previous
 	// plain round verbatim, an identical lack of content included.
 	consecutiveSameContent int
@@ -580,6 +625,14 @@ type loopGuards struct {
 	failedToolCallSignature    string
 	consecutiveFailedToolCalls int
 	failedToolCallNudged       bool
+	// repeatedToolCallSignature, repeatedToolCallCount and
+	// repeatedToolCallNudged track identical *successful* calls across rounds.
+	// This is the complement of the failed-call guard: a call that keeps
+	// succeeding resets the failure streak, so a model that re-runs the same
+	// search query round after round would otherwise never be nudged.
+	repeatedToolCallSignature string
+	repeatedToolCallCount     int
+	repeatedToolCallNudged    bool
 }
 
 // recordFailedToolCall tracks consecutive failures of the same model-facing
@@ -619,6 +672,47 @@ func (g *loopGuards) resetFailedToolCallStreak() {
 	g.failedToolCallNudged = false
 }
 
+// recordRepeatedToolCall tracks identical successful tool calls across rounds.
+// It only follows calls that succeeded, so it never overlaps with the
+// failed-call guard: that one resets on success, this one resets on failure or
+// on a different call. When the same call (name + arguments) succeeds three
+// times in a row it reports the tool name and asks the caller to nudge the
+// model, because re-issuing an identical call returns identical information.
+func (g *loopGuards) recordRepeatedToolCall(call types.ToolCall) (string, int, bool) {
+	if call.Result == nil || !call.Result.Success {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	if call.Name == "" {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	args, err := json.Marshal(call.Args)
+	if err != nil {
+		g.resetRepeatedToolCallStreak()
+		return "", 0, false
+	}
+	signature := call.Name + "\x00" + string(args)
+	if signature != g.repeatedToolCallSignature {
+		g.repeatedToolCallSignature = signature
+		g.repeatedToolCallCount = 1
+		g.repeatedToolCallNudged = false
+	} else {
+		g.repeatedToolCallCount++
+	}
+	if g.repeatedToolCallCount >= maxRepeatedIdenticalToolCalls && !g.repeatedToolCallNudged {
+		g.repeatedToolCallNudged = true
+		return call.Name, g.repeatedToolCallCount, true
+	}
+	return "", g.repeatedToolCallCount, false
+}
+
+func (g *loopGuards) resetRepeatedToolCallStreak() {
+	g.repeatedToolCallSignature = ""
+	g.repeatedToolCallCount = 0
+	g.repeatedToolCallNudged = false
+}
+
 // closeAnswerStream emits the Done:true marker for an answer that is actually
 // finishing. Loop-end inject skips this so the client does not drop isReplying
 // while the engine continues. truncated rides along on the marker because an
@@ -650,14 +744,30 @@ func (e *AgentEngine) finishStalledTurn(
 	sessionID string,
 	response *types.ChatResponse,
 	truncated bool,
+	query string,
+	conversation []chat.Message,
 ) {
 	// Text that arrived alongside tool calls is a preamble — "let me look that
 	// up" — from a round that meant to keep working. Presenting it as the final
 	// answer would show an opening line and call the turn finished, so the
 	// fallback speaks for it instead.
 	answer := response.Content
-	if len(response.ToolCalls) > 0 {
+	if len(response.ToolCalls) > 0 || planInProgress(state) || state.Plan != nil && isPrivatePlanReport(answer) {
 		answer = ""
+	}
+	// The guard stopped a model that produced no usable text, but this turn may
+	// already hold evidence. Synthesizing from it is what every other
+	// stop path does; apologising here threw the evidence away. Truncated
+	// rounds keep their explicit fallback so the cut-off stays visible.
+	if strings.TrimSpace(answer) == "" && !truncated && countTotalToolCalls(state.RoundSteps) > 0 {
+		logger.Infof(ctx, "[Agent] Stalled without text but %d tool call(s) hold evidence; synthesizing the answer",
+			countTotalToolCalls(state.RoundSteps))
+		if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, conversation); err == nil {
+			state.IsComplete = true
+			return
+		} else {
+			logger.Warnf(ctx, "[Agent] Synthesis after stall failed, using the fallback: %v", err)
+		}
 	}
 	answerID := ""
 	if response.AnswerStreamed && answer != "" {
@@ -680,9 +790,10 @@ func (e *AgentEngine) finishStalledTurn(
 			Type:      event.EventAgentFinalAnswer,
 			SessionID: sessionID,
 			Data: event.AgentFinalAnswerData{
-				Content:   answer,
-				Done:      false,
-				Truncated: truncated,
+				Content:    answer,
+				Done:       false,
+				Truncated:  truncated,
+				IsFallback: isRuntimeFallbackAnswer(answer),
 			},
 		})
 	}
@@ -771,6 +882,7 @@ func (e *AgentEngine) executeLoop(
 	}
 
 	guards := &loopGuards{}
+
 loop:
 	for e.withinIterationBudget(state.CurrentRound) || e.allowSteerOverrun {
 		e.allowSteerOverrun = false
@@ -826,6 +938,9 @@ loop:
 	// A suspended run has not finished either; it resumes once the user
 	// answers, so no answer is synthesized for it.
 	if !state.IsComplete && ctx.Err() == nil && state.Suspended == nil {
+		if done, err := e.finishSteerFAQ(ctx, state, sessionID); done || err != nil {
+			return state, err
+		}
 		if e.collaboration != nil && e.collaboration.Child == nil && e.collaborationOwnsFailure(ctx) {
 			return state, fmt.Errorf("parent iteration budget exhausted; remaining delegated work was cancelled")
 		}
@@ -936,6 +1051,9 @@ func (e *AgentEngine) runReActIteration(
 	// updated (the injected text counts as new delta tokens for the next
 	// call), so the very next LLM call sees the user's addition.
 	e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+	if done, err := e.finishSteerFAQ(ctx, state, sessionID); done || err != nil {
+		return iterOutcomeBreak, err
+	}
 	if e.collaboration != nil {
 		events, err := e.collaboration.Poll(ctx)
 		if err != nil {
@@ -947,7 +1065,7 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, err
 		}
 	}
-	if guards.childAnswerRevised {
+	if guards.childAnswerRevised || planInProgress(state) && state.Plan.ReportRetries > 0 {
 		tools = nil
 	}
 	// Background-work context rides the same boundary for the same reasons,
@@ -969,6 +1087,7 @@ func (e *AgentEngine) runReActIteration(
 	e.lastSentMsgCount = len(*messagesPtr)
 	runtimeNotice := guards.pendingRuntimeNotice
 	guards.pendingRuntimeNotice = ""
+	runtimeNotice += e.retrievalStatePrompt()
 	resp, err := e.callLLMWithRetry(ctx, messagesPtr, tools, state, query, state.CurrentRound, sessionID, runtimeNotice)
 	if err != nil {
 		retErr = err
@@ -1009,6 +1128,10 @@ func (e *AgentEngine) runReActIteration(
 		}
 	}
 	response = resp
+	if planInProgress(state) && response.FinishReason == "content_filter" {
+		// The provider can return a partial private report alongside the terminal reason.
+		response.Content = ""
+	}
 	e.logContextDrift(ctx, round, currentTokens, response.Usage)
 	// Calibration needs only a prompt count; some providers report no total.
 	e.calibrateEstimator(ctx, round, *messagesPtr, tools, response.Usage, state)
@@ -1062,7 +1185,7 @@ func (e *AgentEngine) runReActIteration(
 			if e.collaborationOwnsFailure(ctx) {
 				return iterOutcomeBreak, fmt.Errorf("collaboration stopped after repeated output truncation")
 			}
-			e.finishStalledTurn(ctx, state, sessionID, response, true)
+			e.finishStalledTurn(ctx, state, sessionID, response, true, query, *messagesPtr)
 			return iterOutcomeBreak, nil
 		}
 	} else {
@@ -1094,7 +1217,7 @@ func (e *AgentEngine) runReActIteration(
 			if e.collaborationOwnsFailure(ctx) {
 				return iterOutcomeBreak, fmt.Errorf("collaboration stopped after repeated responses without progress")
 			}
-			e.finishStalledTurn(ctx, state, sessionID, response, false)
+			e.finishStalledTurn(ctx, state, sessionID, response, false, query, *messagesPtr)
 			return iterOutcomeBreak, nil
 		}
 	} else {
@@ -1136,6 +1259,58 @@ func (e *AgentEngine) runReActIteration(
 			state.RoundSteps = append(state.RoundSteps, step)
 		}
 		return iterOutcomeBreak, nil
+	}
+	if planInProgress(state) && state.Plan.ReportRetries > 0 && len(response.ToolCalls) > 0 {
+		e.failToolCalls(ctx, response, &step, state.CurrentRound, sessionID, "Tool calls are not allowed while repairing a step report.")
+		state.RoundSteps = append(state.RoundSteps, step)
+		*messagesPtr = e.appendToolResults(*messagesPtr, step)
+		state.Plan.ReportRetries = 0
+		completePlanStep(state.Plan, `{"status":"blocked","result":"The step report could not be repaired without another tool call."}`)
+		*messagesPtr = append(*messagesPtr, planFinalInstruction(state.Plan))
+		return iterOutcomeNext, nil
+	}
+	if state.Plan != nil && state.Plan.Current < len(state.Plan.Steps) &&
+		(isNaturalStopFinishReason(response.FinishReason) || isLengthFinishReason(response.FinishReason)) &&
+		len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
+		step.IntermediateAnswer = true
+		step.PlanReport = true
+		state.RoundSteps = append(state.RoundSteps, step)
+		*messagesPtr = append(*messagesPtr, chat.Message{Role: "assistant", Content: response.Content,
+			ReasoningContent: response.ReasoningContent, ReasoningSignature: response.ReasoningSignature,
+			ReasoningMetadata: response.ReasoningMetadata})
+		waiting, err := e.waitPlanCollaboration(ctx, state, messagesPtr)
+		if err != nil {
+			return iterOutcomeBreak, err
+		}
+		if !waiting {
+			content := response.Content
+			if isLengthFinishReason(response.FinishReason) {
+				content = `{"status":"blocked","result":"The step response was truncated."}`
+			}
+			if !isLengthFinishReason(response.FinishReason) && !validPlanReport(content) && state.Plan.ReportRetries == 0 {
+				state.Plan.ReportRetries++
+			} else {
+				state.Plan.ReportRetries = 0
+				content = checkPlanToolResults(state, content)
+				completePlanStep(state.Plan, content)
+				if state.Plan.Current < len(state.Plan.Steps) {
+					state.Plan.Steps[state.Plan.Current].StartStep = len(state.RoundSteps)
+				}
+			}
+		}
+		nextRound := state.CurrentRound + 1
+		if e.withinIterationBudget(nextRound) || e.steerOverruns < maxSteerOverruns {
+			injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+			injected += e.injectBackground(ctx, state, messagesPtr, true)
+			if injected > 0 && !e.withinIterationBudget(nextRound) {
+				e.steerOverruns++
+				e.allowSteerOverrun = true
+			}
+		}
+		*messagesPtr = append(*messagesPtr, planInstruction(state.Plan))
+		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound+1)
+		guards.sawPlainRound = false
+		return iterOutcomeNext, nil
 	}
 
 	// A delegated deliverable must not silently become a partial success. Give
@@ -1184,11 +1359,19 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, nil
 		}
 		buttonsRan = true
-		if toolCallsSucceeded(step.ToolCalls) {
+		if !planInProgress(state) && toolCallsSucceeded(step.ToolCalls) {
 			answer := *response
 			answer.ToolCalls, answer.FinishReason = nil, "stop"
 			analyzed = &answer
 		}
+	}
+	if !guards.independentWorkRetried && len(tools) > 0 && len(response.ToolCalls) == 0 && isNaturalStopFinishReason(response.FinishReason) &&
+		!planInProgress(state) && e.withinIterationBudget(state.CurrentRound+1) && e.clarificationLeavesIndependentWork(analyzed.Content) {
+		guards.independentWorkRetried = true
+		guards.pendingRuntimeNotice = "An independent part of the user request remains. Use its registered gap to retrieve or record existing evidence, then include its answer or precise limitation alongside the clarification. Keep dependent work stopped."
+		state.PendingSteerMessages = step.UserMessagesBefore
+		state.PendingBackground = step.BackgroundInjections
+		return iterOutcomeContinue, nil
 	}
 	verdict := e.analyzeResponse(ctx, analyzed, step, state.CurrentRound, sessionID, roundStart)
 	if verdict.isDone {
@@ -1225,8 +1408,9 @@ func (e *AgentEngine) runReActIteration(
 				Type:      event.EventAgentFinalAnswer,
 				SessionID: sessionID,
 				Data: event.AgentFinalAnswerData{
-					Content: fallback,
-					Done:    false,
+					Content:    fallback,
+					Done:       false,
+					IsFallback: true,
 				},
 			})
 			_ = e.eventBus.Emit(ctx, event.Event{
@@ -1292,6 +1476,9 @@ func (e *AgentEngine) runReActIteration(
 					KnowledgeRefs:           state.KnowledgeRefs,
 					CurrentRound:            state.CurrentRound + 1,
 					TurnUsage:               state.TurnUsage,
+					Plan:                    state.Plan,
+					Retrieval:               e.retrievalSnapshot(),
+					RetrievalTurnID:         e.retrievalTurnID,
 				}
 				intermediate := verdict.step
 				intermediate.IntermediateAnswer = true
@@ -1350,23 +1537,10 @@ func (e *AgentEngine) runReActIteration(
 		return iterOutcomeBreak, nil
 	}
 
-	// This round is non-terminal (it will execute tools and loop again). Any
-	// plain assistant text streamed live to the answer area this round was a
-	// preamble (e.g. "let me search the knowledge base…"), not the final
-	// answer. No explicit retraction signal is emitted: the agent only ends by
-	// stopping naturally with plain text and no tool calls, so the upcoming
-	// tool-call events are themselves the authoritative "that wasn't the final
-	// answer" marker. Both the stream handler and the UI treat any answer text
-	// preceding a tool call in the same stream as a preamble and relocate it
-	// into the steps tree. The preamble is still preserved as this round's
-	// Thought.
-	// A tool-bearing response is an intermediate user update. Publish it on its
-	// own channel, never as reasoning or as part of the final deliverable.
-	// Page buttons that failed leave their answer text live, since the stream
-	// handler and the client keep text before a page button; retract it the
-	// same way.
+	// Non-terminal content stays on the step for replay. Where progress is
+	// supported, publish it on that channel rather than the final answer.
 	progress := agenttools.StripThinkBlocks(response.Content)
-	if (buttonsRan || e.collaboration != nil && e.collaboration.Child == nil) && strings.TrimSpace(progress) != "" {
+	if !planInProgress(state) && (buttonsRan || e.collaboration != nil && e.collaboration.Child == nil) && strings.TrimSpace(progress) != "" {
 		step.Progress = progress
 		progressID := response.AnswerEventID
 		if progressID == "" {
@@ -1389,17 +1563,53 @@ func (e *AgentEngine) runReActIteration(
 	var (
 		failedToolName     string
 		failedToolAttempts int
+		repeatedToolName   string
+		repeatedToolCount  int
 	)
 	for _, toolCall := range step.ToolCalls {
+		if e.retrieval != nil && (kbToolNames[toolCall.Name] || toolCall.Name == reviewRetrievalTool) {
+			continue
+		}
 		if name, attempts, shouldNudge := guards.recordFailedToolCall(toolCall); shouldNudge {
 			failedToolName = name
 			failedToolAttempts = attempts
+		}
+		if name, count, shouldNudge := guards.recordRepeatedToolCall(toolCall); shouldNudge {
+			repeatedToolName = name
+			repeatedToolCount = count
 		}
 	}
 
 	state.RoundSteps = append(state.RoundSteps, step)
 	*messagesPtr = e.appendToolResults(*messagesPtr, step)
 	*messagesPtr = e.appendToolImages(ctx, *messagesPtr, step)
+	if finished, err := e.finishUserQuestion(ctx, state, step, messagesPtr, sessionID, assistantMessageID); finished || err != nil {
+		return iterOutcomeBreak, err
+	}
+	if question := e.reviewedGoalQuestion(state, step); question != "" && e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID) == 0 {
+		if err := ctx.Err(); err != nil {
+			return iterOutcomeBreak, err
+		}
+		if err := e.eventBus.Emit(ctx, event.Event{ID: generateEventID("clarification"), Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+			Data: event.AgentFinalAnswerData{Content: question, Done: true}}); err != nil {
+			return iterOutcomeBreak, err
+		}
+		state.FinalAnswer, state.IsComplete = question, true
+		return iterOutcomeBreak, nil
+	}
+	if e.onlyRejectedRetrievals(step) {
+		if e.retrieval.takeDecisionCorrection() {
+			*messagesPtr = append(*messagesPtr, chat.Message{Role: "system", Content: e.retrievalCorrectionGuidance(step)})
+		} else {
+			*messagesPtr = append(*messagesPtr, chat.Message{Role: "system", Content: "Retrieval decision correction is exhausted. No further retrieval is allowed in this run. " +
+				"Use only available evidence, ask for necessary information, or state the unresolved limitation. Do not present an unfinished task as completed."})
+			if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, *messagesPtr); err != nil {
+				return iterOutcomeBreak, err
+			}
+			state.IsComplete = true
+			return iterOutcomeBreak, nil
+		}
+	}
 	if failedToolName != "" {
 		logger.Warnf(ctx, "[Agent][Round-%d] Repeated failed call to %q (%d attempts); "+
 			"asking the model to change strategy", round, failedToolName, failedToolAttempts)
@@ -1408,6 +1618,17 @@ func (e *AgentEngine) runReActIteration(
 				"Do not call it again with those arguments. Switch to a different tool "+
 				"or use another approach to complete the task.",
 			failedToolName, failedToolAttempts,
+		)
+		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: guidance})
+	}
+	if repeatedToolName != "" {
+		logger.Warnf(ctx, "[Agent][Round-%d] Repeated identical successful call to %q (%d times); "+
+			"asking the model to stop re-running it", round, repeatedToolName, repeatedToolCount)
+		guidance := fmt.Sprintf(
+			"The tool %q has been called %d times with identical arguments and returned a result "+
+				"each time. Re-running it will return the same information. Use the results already "+
+				"obtained to answer, or change the query/arguments to gather new evidence.",
+			repeatedToolName, repeatedToolCount,
 		)
 		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: guidance})
 	}

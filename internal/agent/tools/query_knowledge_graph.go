@@ -286,7 +286,8 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		chunksTotal         int // valid in-scope evidence before the display cap
 		validationLimited   bool
 		candidatesValidated int
-		warnings            []string // failures of one source while the other returned results
+		warnings            []error // failures of one source while the other completed
+		failures            []types.RetrievalFailure
 		err                 error
 	}
 
@@ -322,7 +323,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			// Get knowledge base to check graph configuration
 			kb, err := t.knowledgeService.GetKnowledgeBaseByIDOnly(ctx, id)
 			if err != nil {
-				res.err = fmt.Errorf("failed to get knowledge base: %v", err)
+				res.err = fmt.Errorf("failed to get knowledge base: %w", err)
 				return
 			}
 			if kb == nil {
@@ -337,10 +338,21 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 				return
 			}
 
-			var errs []string
+			var errs []error
+			completedSources := 0
 			lookup, err := t.queryGraph(ctx, id, terms)
 			if err != nil {
-				errs = append(errs, fmt.Sprintf("graph query failed: %v", err))
+				errs = append(errs, fmt.Errorf("graph query failed: %w", err))
+				res.failures = append(res.failures, t.isolatedGraphFailure(id, "graph", err, func(ctx context.Context) ([]*types.SearchResult, []*types.GraphRelation, error) {
+					lookup, err := t.queryGraph(ctx, id, terms)
+					var relations []*types.GraphRelation
+					if lookup.graph != nil {
+						relations = lookup.graph.Relation
+					}
+					return lookup.chunks, relations, err
+				}))
+			} else {
+				completedSources++
 			}
 			graphResults, graph := lookup.chunks, lookup.graph
 			res.chunksShown, res.chunksTotal = lookup.chunksShown, lookup.chunksTotal
@@ -354,7 +366,16 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			// with no text index returns nothing here rather than an error.
 			textResults, err := t.knowledgeService.HybridSearch(ctx, id, searchParams)
 			if err != nil {
-				errs = append(errs, fmt.Sprintf("text search failed: %v", err))
+				errs = append(errs, fmt.Errorf("text search failed: %w", err))
+				res.failures = append(res.failures, t.isolatedGraphFailure(id, "graph_text", err, func(ctx context.Context) ([]*types.SearchResult, []*types.GraphRelation, error) {
+					rows, err := t.knowledgeService.HybridSearch(ctx, id, searchParams)
+					if err == nil && t.scopeEnforced {
+						rows, err = filterSearchResultsInSearchTargets(ctx, t.searchTargets, id, rows, t.scopeKnowledgeService)
+					}
+					return rows, nil, err
+				}))
+			} else {
+				completedSources++
 			}
 			if t.scopeEnforced {
 				if textResults, err = filterSearchResultsInSearchTargets(
@@ -365,8 +386,8 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 				}
 			}
 			res.graphResults, res.textResults, res.relations = graphResults, textResults, relations
-			if len(errs) > 0 && len(graphResults) == 0 && len(textResults) == 0 {
-				res.err = errors.New(strings.Join(errs, "; "))
+			if len(errs) > 0 && completedSources == 0 && len(graphResults) == 0 && len(textResults) == 0 {
+				res.err = errors.Join(errs...)
 			} else {
 				res.warnings = errs
 			}
@@ -379,6 +400,8 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	// order), then text hits by score.
 	seenChunks := make(map[string]bool)
 	var errs []string
+	var failures []types.RetrievalFailure
+	failedKBs := 0
 	graphConfigs := make(map[string]graphConfigSummary)
 	kbCounts := make(map[string]int)
 	var graphHits, textHits []*types.SearchResult
@@ -390,12 +413,17 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 
 	for _, kbID := range input.KnowledgeBaseIDs {
 		result := kbResults[kbID]
+		failures = append(failures, result.failures...)
 		if result.err != nil {
 			errs = append(errs, fmt.Sprintf("KB %s: %v", kbID, result.err))
+			if len(result.failures) == 0 {
+				failures = append(failures, types.RetrievalFailure{KnowledgeBaseIDs: []string{kbID}, Cause: result.err})
+			}
+			failedKBs++
 			continue
 		}
 		for _, warning := range result.warnings {
-			errs = append(errs, fmt.Sprintf("KB %s: %s", kbID, warning))
+			errs = append(errs, fmt.Sprintf("KB %s: %v", kbID, warning))
 		}
 
 		if result.kb != nil && result.kb.ExtractConfig != nil {
@@ -461,6 +489,9 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		// The model reads an empty result from Output alone, so failures
 		// must be stated here or they read as "the graph has no such entity".
 		output := "No relevant graph information found."
+		if failedKBs == len(kbIDs) {
+			output = "Knowledge graph lookup failed; this is not evidence that the requested information is absent."
+		}
 		if len(errs) > 0 {
 			output += " Some knowledge bases could not be queried: " + strings.Join(errs, "; ") + "."
 		}
@@ -480,11 +511,11 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			"display_type":       "graph_query_results",
 		}
 		truncation.addToData(data)
-		return &types.ToolResult{
-			Success: true,
-			Output:  output,
-			Data:    data,
-		}, nil
+		result := &types.ToolResult{Success: failedKBs < len(kbIDs), Output: output, Data: data, RetrievalFailures: failures}
+		if !result.Success {
+			result.Error = output
+		}
+		return result, nil
 	}
 
 	// Format output with enhanced graph information
@@ -589,6 +620,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			"knowledge_id":      result.KnowledgeID,
 			"knowledge_base_id": result.KnowledgeBaseID,
 			"knowledge_title":   result.KnowledgeTitle,
+			"source_url":        types.DocumentReferenceURL(result.Metadata, result.KnowledgeCustomMetadataRaw, result.KnowledgeSource),
 			"match_type":        FormatMatchType(result.MatchType),
 		})
 	}
@@ -613,9 +645,10 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	truncation.addToData(data)
 
 	return &types.ToolResult{
-		Success: true,
-		Output:  output,
-		Data:    data,
+		Success:           true,
+		Output:            output,
+		Data:              data,
+		RetrievalFailures: failures,
 	}, nil
 }
 
@@ -741,7 +774,7 @@ func (t *QueryKnowledgeGraphTool) graphEvidenceBatch(
 			knowledgeIDs = append(knowledgeIDs, c.KnowledgeID)
 		}
 	}
-	titles, err := t.knowledgeTitles(ctx, knowledgeIDs)
+	documents, err := t.evidenceDocuments(ctx, knowledgeIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -753,15 +786,20 @@ func (t *QueryKnowledgeGraphTool) graphEvidenceBatch(
 		}
 		// A chunk can outlive its soft-deleted document. Only documents returned
 		// by the shared-access lookup can establish valid evidence.
-		if _, exists := titles[c.KnowledgeID]; !exists {
+		document, exists := documents[c.KnowledgeID]
+		if !exists {
 			continue
 		}
 		results = append(results, &types.SearchResult{
-			ID:              c.ID,
-			KnowledgeID:     c.KnowledgeID,
-			KnowledgeBaseID: c.KnowledgeBaseID,
-			KnowledgeTitle:  titles[c.KnowledgeID],
-			MatchType:       types.MatchTypeGraph,
+			ID:                         c.ID,
+			KnowledgeID:                c.KnowledgeID,
+			KnowledgeBaseID:            c.KnowledgeBaseID,
+			KnowledgeTitle:             document.Title,
+			Metadata:                   document.GetMetadata(),
+			KnowledgeSource:            document.Source,
+			KnowledgeCustomMetadata:    document.CustomMetadataText(),
+			KnowledgeCustomMetadataRaw: document.CustomMetadata,
+			MatchType:                  types.MatchTypeGraph,
 		})
 	}
 	if t.scopeEnforced {
@@ -807,13 +845,13 @@ func (t *QueryKnowledgeGraphTool) graphEvidenceResults(
 	return results, nil
 }
 
-// knowledgeTitles returns the titles of the knowledge IDs that still exist.
+// evidenceDocuments returns the accessible documents backing graph evidence.
 // Missing document services fail closed rather than accepting unchecked chunks.
-func (t *QueryKnowledgeGraphTool) knowledgeTitles(ctx context.Context, ids []string) (map[string]string, error) {
-	titles := make(map[string]string, len(ids))
+func (t *QueryKnowledgeGraphTool) evidenceDocuments(ctx context.Context, ids []string) (map[string]*types.Knowledge, error) {
+	documents := make(map[string]*types.Knowledge, len(ids))
 	ids = dedupNonEmptyStrings(ids)
 	if len(ids) == 0 {
-		return titles, nil
+		return documents, nil
 	}
 	if t.scopeKnowledgeService == nil {
 		return nil, fmt.Errorf("knowledge service is unavailable for graph evidence validation")
@@ -825,10 +863,10 @@ func (t *QueryKnowledgeGraphTool) knowledgeTitles(ctx context.Context, ids []str
 	}
 	for _, k := range knowledges {
 		if k != nil {
-			titles[k.ID] = k.Title
+			documents[k.ID] = k
 		}
 	}
-	return titles, nil
+	return documents, nil
 }
 
 // relationsBackedBy checks the actual endpoint instances against scoped evidence.

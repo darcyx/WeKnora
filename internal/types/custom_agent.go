@@ -201,6 +201,10 @@ type CustomAgentConfig struct {
 	// default). A negative value is unlimited: the loop runs until the model
 	// stops, the user cancels, or another guard fires.
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
+	// PlanningEnabled turns on the engine-driven plan-and-execute decomposition
+	// that runs before the ReAct loop. Defaults to false (off): the loop runs
+	// as before. When true, a planner decides whether to decompose the task.
+	PlanningEnabled bool `yaml:"planning_enabled" json:"planning_enabled" extensions:"x-agent,x-agent-detail"`
 	// Timeout for a single LLM call in seconds (0 = use global default)
 	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
 	// Allowed tools (only for agent type)

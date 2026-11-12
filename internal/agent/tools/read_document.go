@@ -174,7 +174,8 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args json.RawMessage) (*
 		matchers = []*regexp.Regexp{compiled}
 	default:
 		// Models write keyword queries ("sunflower f(n,k)"), not exact
-		// phrases, so each word is matched on its own and all must appear.
+		// phrases, so each word is matched on its own; readByQuery prefers
+		// chunks holding all of them.
 		for _, term := range strings.Fields(query) {
 			matchers = append(matchers, regexp.MustCompile("(?i)"+regexp.QuoteMeta(term)))
 		}
@@ -340,7 +341,7 @@ func (t *ReadDocumentTool) readPage(
 	}
 	return &types.ToolResult{
 		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, ""),
+		Output:  t.buildOutput(knowledge, total, rows, "", ""),
 		Data:    data,
 	}, nil
 }
@@ -396,20 +397,35 @@ func (t *ReadDocumentTool) readAroundChunk(
 	}
 	return &types.ToolResult{
 		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, ""),
+		Output:  t.buildOutput(knowledge, total, rows, "", ""),
 		Data:    data,
 	}, nil
 }
 
-// readByQuery scans the document in order from offset and returns chunks
-// matched by every matcher, with one chunk of context on each side, capped at
-// readDocumentMaxMatches and the output budget. A truncated result carries
-// next_offset, the reading-order position of the first match it left out;
-// without it matches past the cap could only be reached by paging the whole
-// document.
+// readByQuery returns the chunks matched by every matcher. When no chunk holds
+// every query word, it falls back to the chunks holding the most of them, so a
+// keyword list spread across a document still reads something.
 func (t *ReadDocumentTool) readByQuery(
 	ctx context.Context, knowledge *types.Knowledge, query string, matchers []*regexp.Regexp, offset int,
 ) (*types.ToolResult, error) {
+	res, bestTerms, err := t.scanByQuery(ctx, knowledge, query, matchers, offset, len(matchers))
+	if err != nil || bestTerms == 0 || bestTerms == len(matchers) {
+		return res, err
+	}
+	res, _, err = t.scanByQuery(ctx, knowledge, query, matchers, offset, bestTerms)
+	return res, err
+}
+
+// scanByQuery scans the document in order from offset and returns chunks
+// matched by at least minTerms matchers, with one chunk of context on each
+// side, capped at readDocumentMaxMatches and the output budget. A truncated
+// result carries next_offset, the reading-order position of the first match it
+// left out; without it matches past the cap could only be reached by paging
+// the whole document. It also reports the most matchers any scanned chunk hit.
+func (t *ReadDocumentTool) scanByQuery(
+	ctx context.Context, knowledge *types.Knowledge, query string, matchers []*regexp.Regexp, offset, minTerms int,
+) (*types.ToolResult, int, error) {
+	bestTerms := 0
 	var rows []readChunkRow
 	emitted := make(map[string]bool)
 	matchCount := 0
@@ -454,7 +470,7 @@ scan:
 	for {
 		chunks, pageTotal, err := t.listChunks(ctx, knowledge, page, readDocumentScanPageSize)
 		if err != nil {
-			return &types.ToolResult{Success: false, Error: err.Error()}, err
+			return &types.ToolResult{Success: false, Error: err.Error()}, 0, err
 		}
 		total = pageTotal
 		if len(chunks) == 0 {
@@ -473,7 +489,9 @@ scan:
 			if q := faqStandardQuestion(c); q != "" {
 				haystack += "\n" + q
 			}
-			if matchesAll(matchers, haystack) {
+			terms := countMatches(matchers, haystack)
+			bestTerms = max(bestTerms, terms)
+			if terms >= minTerms {
 				snippet := extractChunkMatchSnippet(c, matchers)
 				cost := chunkCost(c, content) + escapedRunes(snippet)
 				// Keep the first match even if it is oversized so the cursor advances.
@@ -514,11 +532,17 @@ scan:
 	if nextOffset >= 0 {
 		data["next_offset"] = nextOffset
 	}
+	queryNote := ""
+	if minTerms < len(matchers) {
+		data["terms_matched"] = minTerms
+		data["query_terms"] = len(matchers)
+		queryNote = fmt.Sprintf("No chunk contains every query word; matches contain %d of %d.", minTerms, len(matchers))
+	}
 	return &types.ToolResult{
 		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, query),
+		Output:  t.buildOutput(knowledge, total, rows, query, queryNote),
 		Data:    data,
-	}, nil
+	}, bestTerms, nil
 }
 
 // fitChunksToBudget keeps the leading chunks whose rendered size fits in
@@ -536,13 +560,18 @@ func fitChunksToBudget(chunks []*types.Chunk, budget int) []*types.Chunk {
 	return chunks
 }
 
-func matchesAll(matchers []*regexp.Regexp, s string) bool {
+func countMatches(matchers []*regexp.Regexp, s string) int {
+	n := 0
 	for _, m := range matchers {
-		if !m.MatchString(s) {
-			return false
+		if m.MatchString(s) {
+			n++
 		}
 	}
-	return true
+	return n
+}
+
+func matchesAll(matchers []*regexp.Regexp, s string) bool {
+	return countMatches(matchers, s) == len(matchers)
 }
 
 // documentInfo is the metadata header shared by every read mode.
@@ -599,6 +628,7 @@ func (t *ReadDocumentTool) buildData(
 		"knowledge_id":      knowledge.ID,
 		"knowledge_base_id": knowledge.KnowledgeBaseID,
 		"knowledge_title":   strings.TrimSpace(knowledge.Title),
+		"source_url":        types.DocumentReferenceURL(knowledge.GetMetadata(), knowledge.CustomMetadata, knowledge.Source),
 		// Keep citation identities when chunks are omitted from SSE/history.
 		"chunk_ids":       chunkIDs,
 		"source_chunk_id": sourceChunkID,
@@ -610,7 +640,7 @@ func (t *ReadDocumentTool) buildData(
 }
 
 func (t *ReadDocumentTool) buildOutput(
-	knowledge *types.Knowledge, total int64, rows []readChunkRow, query string,
+	knowledge *types.Knowledge, total int64, rows []readChunkRow, query, queryNote string,
 ) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<document knowledge_id=\"%s\" title=\"%s\" total_chunks=\"%d\" fetched=\"%d\"",
@@ -644,6 +674,9 @@ func (t *ReadDocumentTool) buildOutput(
 	}
 	if query != "" {
 		fmt.Fprintf(&b, "<query>%s</query>\n", xmlEscape(query))
+	}
+	if queryNote != "" {
+		fmt.Fprintf(&b, "<query_note>%s</query_note>\n", xmlEscape(queryNote))
 	}
 	for _, r := range rows {
 		extra := ""

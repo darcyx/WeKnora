@@ -85,6 +85,7 @@ type Options struct {
 
 // Result is the outcome of a rerank run.
 type Result struct {
+	Cause error `json:"-"`
 	// Results are the returned rows, best first. They are copies carrying the
 	// composite score and base_score / model_score metadata; the input rows
 	// are never modified. On a model error they are the input rows unchanged.
@@ -150,6 +151,7 @@ func Rerank(
 	scores, scoredAsImage, err := scoreCandidates(ctx, model, query, res.Passages, imagePositions, images)
 	res.Diagnostics.ImagesScored = len(scoredAsImage)
 	if err != nil {
+		res.Cause = err
 		logger.Warnf(ctx, "[Rerank] Model call failed, keeping retrieval order: %v", err)
 		res.Diagnostics.Outcome = types.RerankOutcomeModelError
 		res.Diagnostics.Error = err.Error()
