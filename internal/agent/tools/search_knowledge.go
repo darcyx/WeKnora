@@ -41,6 +41,11 @@ var errSearchPanicked = errors.New("knowledge base search failed with an interna
 var searchKnowledgeTool = BaseTool{
 	name: ToolSearchKnowledge,
 	description: "Search the knowledge bases in scope and return the most relevant chunks with their content.\n" +
+		"Use original interface text to verify parameter names, types, values, required fields, defaults, signatures " +
+		"and code. For entity dependencies, calls or relations, use query_knowledge_graph first when that tool and a " +
+		"relevant graph-enabled base are available. For mixed questions under those conditions, query relationships " +
+		"there first and wait for its result before retrieving the parameter details here or with read_document. " +
+		"If graph evidence is missing, use original text to verify the relationship.\n" +
 		"mode \"hybrid\" (default) combines semantic and keyword retrieval. \"semantic\" ranks by meaning and " +
 		"tolerates paraphrase. \"keyword\" matches the literal terms and is the right choice for identifiers, " +
 		"error codes, product names and exact phrases. A base without the requested index is searched with the " +

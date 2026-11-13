@@ -22,10 +22,15 @@ var errGraphQueryPanicked = errors.New("knowledge graph query failed with an int
 
 var queryKnowledgeGraphTool = BaseTool{
 	name: ToolQueryKnowledgeGraph,
-	description: "Query the knowledge graph of graph-enabled knowledge bases to explore how entities relate " +
-		"(for example \"relationship between Docker and Kubernetes\"). Put the entity names in query. Returns " +
+	description: "Query the knowledge graph of graph-enabled knowledge bases for entity dependencies, calls and relations " +
+		"(for example which callback order fulfillment depends on). For relationship questions, use this as the first " +
+		"knowledge tool when a relevant graph-enabled base is in scope. For a question combining relationships and " +
+		"parameter details, split those parts: query relationships here first and wait for this result before calling " +
+		"search_knowledge or read_document to verify parameter names, types, values, required fields, defaults, " +
+		"signatures and code in the original " +
+		"interface documentation. Put the entity names in query. Returns " +
 		"the matching entities' relations and the chunks they were extracted from, then chunks found by text " +
-		"search, with chunk://N handles.\nUse search_knowledge for ordinary text retrieval and " +
+		"search, with chunk://N handles. If the graph lacks relationship evidence, consult original text. Use " +
 		"read_document(id=chunk://N, context=k) to read around a chunk.",
 	schema: json.RawMessage(`{
 		"type": "object",
