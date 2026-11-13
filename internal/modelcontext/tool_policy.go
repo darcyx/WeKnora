@@ -442,12 +442,16 @@ func walkJSONValue(key string, value interface{}, rewrite func(key, value string
 	return value
 }
 
-// Some providers double-encode items. Unwrap only this built-in's array before
-// resolving source handles; doing it at Execute time leaves nested url://N values
-// unresolved. ModelArguments has already retained the exact provider payload.
-func normalizeWebFetchItems(calls []types.LLMToolCall) {
+// Unwrap known array fields before resolving their handles. ModelArguments retains the wire payload.
+func normalizeDoubleEncodedArrays(calls []types.LLMToolCall) {
 	for i := range calls {
-		if calls[i].Function.Name != "web_fetch" {
+		var field string
+		switch calls[i].Function.Name {
+		case "web_fetch":
+			field = "items"
+		case "query_knowledge_graph":
+			field = "knowledge_base_ids"
+		default:
 			continue
 		}
 		var args map[string]json.RawMessage
@@ -455,14 +459,14 @@ func normalizeWebFetchItems(calls []types.LLMToolCall) {
 			continue
 		}
 		var wrapped string
-		if json.Unmarshal(args["items"], &wrapped) != nil {
+		if json.Unmarshal(args[field], &wrapped) != nil {
 			continue
 		}
 		var items []json.RawMessage
 		if json.Unmarshal([]byte(wrapped), &items) != nil || len(items) == 0 {
 			continue
 		}
-		args["items"] = json.RawMessage(wrapped)
+		args[field] = json.RawMessage(wrapped)
 		if encoded, err := json.Marshal(args); err == nil {
 			calls[i].Function.Arguments = string(encoded)
 		}

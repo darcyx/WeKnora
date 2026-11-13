@@ -34,10 +34,10 @@ func TestWikiSearchLiteralPostgresUsesBoundEscapedPattern(t *testing.T) {
 				pattern = regexp.QuoteMeta(pattern)
 			}
 			args := []driver.Value{
-				pattern, pattern, pattern, pattern, "kb-1",
-				pattern, pattern, pattern, pattern, "archived", int64(10),
+				pattern, pattern, pattern, pattern, pattern, "kb-1",
+				pattern, pattern, pattern, pattern, pattern, "archived", int64(10),
 			}
-			expected := mock.ExpectQuery(`SELECT .*~\* \$1`).WithArgs(args...)
+			expected := mock.ExpectQuery(`SELECT .*~\* \$1.*jsonb_array_elements_text.*wiki_alias.value ~\* \$3`).WithArgs(args...)
 			expected.WillReturnRows(sqlmock.NewRows([]string{"id"}))
 			if tc.literal {
 				_, err = repo.SearchLiteral(context.Background(), "kb-1", tc.query, 10)

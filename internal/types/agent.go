@@ -130,6 +130,7 @@ type AgentConfig struct {
 	MemoryEnabled           *bool         `json:"memory_enabled,omitempty"`             // nil inherits workspace
 	SearchTargets           SearchTargets `json:"-"`                                    // Pre-computed unified search targets (runtime only)
 	FAQPreflightUsage       *TokenUsage   `json:"-"`                                    // Model usage incurred before the agent loop
+	FAQPreflightQuestions   []string      `json:"-"`                                    // Titles already seen in this turn's FAQ search
 	// MCP service selection
 	MCPSelectionMode string   `json:"mcp_selection_mode"` // MCP selection mode: "all", "selected", "none"
 	MCPServices      []string `json:"mcp_services"`       // Selected MCP service IDs (when mode is "selected")

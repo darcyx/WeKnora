@@ -11,7 +11,6 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 type graphConfigSummary struct {
@@ -28,13 +27,23 @@ var queryKnowledgeGraphTool = BaseTool{
 		"the matching entities' relations and the chunks they were extracted from, then chunks found by text " +
 		"search, with chunk://N handles.\nUse search_knowledge for ordinary text retrieval and " +
 		"read_document(id=chunk://N, context=k) to read around a chunk.",
-	schema: utils.GenerateSchema[QueryKnowledgeGraphInput](),
+	schema: json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"knowledge_base_ids": {
+				"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10,
+				"description": "Knowledge base handles from the current directory, for example [\"kb://1\"]"
+			},
+			"query": {"type": "string", "description": "Entity names to look up"}
+		},
+		"required": ["knowledge_base_ids", "query"], "additionalProperties": false
+	}`),
 }
 
 // QueryKnowledgeGraphInput defines the input parameters for query knowledge graph tool
 type QueryKnowledgeGraphInput struct {
-	KnowledgeBaseIDs []string `json:"knowledge_base_ids" jsonschema:"Array of kb://N knowledge base handles to query"`
-	Query            string   `json:"query" jsonschema:"Query content (entity name or query text)"`
+	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+	Query            string   `json:"query"`
 }
 
 // QueryKnowledgeGraphTool queries the knowledge graph for entities and relationships

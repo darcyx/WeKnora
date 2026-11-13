@@ -95,7 +95,6 @@ func (e *AgentEngine) drainSteerMessages(
 // Only newly accepted inputs trigger FAQ evaluation. Replayed steps still provide context.
 type SteerFAQReply struct {
 	Answer string
-	Steps  []types.AgentStep
 	Usage  *types.TokenUsage
 }
 
@@ -135,11 +134,6 @@ func (e *AgentEngine) finishSteerFAQ(ctx context.Context, state *types.AgentStat
 	if err := e.eventBus.Emit(ctx, event.Event{ID: id + "-faq-answer", Type: event.EventAgentFinalAnswer,
 		SessionID: sessionID, Data: event.AgentFinalAnswerData{Content: reply.Answer, Done: true}}); err != nil {
 		return false, err
-	}
-	if len(reply.Steps) > 0 {
-		reply.Steps[0].UserMessagesBefore = state.PendingSteerMessages
-		state.PendingSteerMessages = nil
-		state.RoundSteps = append(state.RoundSteps, reply.Steps...)
 	}
 	state.KnowledgeRefs = nil
 	state.FinalAnswer, state.IsComplete = reply.Answer, true

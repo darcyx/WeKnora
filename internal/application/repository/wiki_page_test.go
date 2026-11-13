@@ -882,15 +882,18 @@ func TestSearchAcross_RanksTitleAboveContentAndStaysInRequestedKBs(t *testing.T)
 	outside := makeWikiPage("kb-c", "entity/wangxin-other", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
 	outside.Title = "王新"
 
-	for _, p := range []*types.WikiPage{titleHit, contentHit, archived, outside} {
+	aliasHit := makeWikiPage("kb-a", "entity/alias", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	aliasHit.Aliases = types.StringArray{"王新", "another name"}
+	for _, p := range []*types.WikiPage{titleHit, contentHit, archived, outside, aliasHit} {
 		require.NoError(t, repo.Create(ctx, p))
 	}
 
 	pages, err := repo.SearchAcross(ctx, []string{"kb-a", "kb-b"}, "王新", 10)
 	require.NoError(t, err)
-	require.Len(t, pages, 2)
+	require.Len(t, pages, 3)
 	assert.Equal(t, titleHit.ID, pages[0].ID, "title match in another KB must outrank a newer body mention")
-	assert.Equal(t, contentHit.ID, pages[1].ID)
+	assert.Equal(t, aliasHit.ID, pages[1].ID)
+	assert.Equal(t, contentHit.ID, pages[2].ID)
 }
 
 func TestSearch_UsesSharedAcrossQueryForSingleKB(t *testing.T) {

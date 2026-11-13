@@ -39,6 +39,21 @@ func TestWikiWriteTableRowIdentitiesMarkdownTables(t *testing.T) {
 	}
 }
 
+func TestWikiWriteRowIdentitiesUseWikiLinkLabels(t *testing.T) {
+	header := "| 分级标准 | 限制标准 |\n| --- | --- |\n"
+	plain := header + "| 分级8+ | 8 岁 |\n| 分级12+ | 12 岁 |\n"
+	first := "| [[concept/age|分级8+]] | 8 岁 |\n"
+	linked := header + first + "| [[concept/age\\|分级12+]] | 12 岁 |\n"
+	for _, pair := range [][2]string{{plain, linked}, {linked, plain}} {
+		if missing := wikiWriteMissingRowIdentities(pair[0], pair[1]); len(missing) != 0 {
+			t.Fatalf("link formatting lost row identities: %q", missing)
+		}
+	}
+	if got := wikiWriteMissingRowIdentities(linked, header+first); !reflect.DeepEqual(got, []string{"分级12+"}) {
+		t.Fatalf("missing grade: got %q", got)
+	}
+}
+
 func TestWikiWriteMissingRowIdentitiesWithOptionalPipes(t *testing.T) {
 	full := "| Name | Value |\n| --- | --- |\n| Alice | 1 |\n| Bob | 2 |\n"
 	optional := "Name | Value\n--- | ---\nAlice | 1\nBob | 2\n"

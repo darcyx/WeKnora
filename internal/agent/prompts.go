@@ -172,7 +172,7 @@ type KnowledgeBaseInfo struct {
 	Description string
 	DocCount    int
 	// Capabilities lists the retrieval surfaces this KB exposes. Any subset of
-	// {"wiki", "chunks"}. "chunks" is present when the KB has vector and/or
+	// {"wiki", "chunks", "graph"}. "chunks" is present when the KB has vector and/or
 	// keyword (BM25) indexing enabled. This is the *deterministic* source of
 	// truth the agent should consult before picking a retrieval strategy —
 	// significantly more reliable than running probing searches.

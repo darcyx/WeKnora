@@ -22,7 +22,7 @@ import (
 // to get a sense of the wiki's shape; any deeper exploration should go
 // through wiki_search. Keeping the cap small bounds the content envelope
 // served to the LLM, which is the main reason this synthesis exists.
-const wikiIndexAgentTopK = 20
+const wikiIndexAgentTopK = 5
 
 // renderIndexOverviewForAgent formats a WikiIndexResponse as a compact
 // markdown block suitable for embedding inside the <content> tag that
@@ -323,7 +323,7 @@ const (
 	// link section, and wikiLinkSummaryMaxRunes bounds each one. A hub page can
 	// carry dozens of links, and inlining every full summary used to spend more
 	// of the output budget than the page bodies the caller asked for.
-	wikiMaxLinkSummaries    = 20
+	wikiMaxLinkSummaries    = 3
 	wikiLinkSummaryMaxRunes = 150
 
 	// wikiMinPageBody is the smallest body slice worth rendering. When the

@@ -7,6 +7,17 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestKBRetrievalCapabilitiesIncludesEnabledGraph(t *testing.T) {
+	kb := &types.KnowledgeBase{
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true, KeywordEnabled: true, GraphEnabled: true},
+		ExtractConfig:    &types.ExtractConfig{Enabled: true},
+	}
+	assert.Equal(t, []string{"wiki", "chunks", "graph"}, kbRetrievalCapabilities(kb))
+
+	kb.ExtractConfig.Enabled = false
+	assert.Equal(t, []string{"wiki", "chunks"}, kbRetrievalCapabilities(kb))
+}
+
 func TestAgentHasKnowledgeScope_TagOnlySearchTargets(t *testing.T) {
 	cfg := &types.AgentConfig{
 		SearchTargets: types.SearchTargets{

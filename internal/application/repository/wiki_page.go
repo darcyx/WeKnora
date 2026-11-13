@@ -1445,7 +1445,7 @@ func escapeLikePattern(s string) string {
 // Results are ranked by where the query hit, highest-relevance first:
 //
 //	title    hit → rank 4 (most obvious intent: user typed what the page is called)
-//	slug     hit → rank 3 (url-like identifiers, direct jump)
+//	slug or alias hit → rank 3 (another name for the page)
 //	summary  hit → rank 2 (short authored abstract)
 //	content  hit → rank 1 (body mention — often surfaces unrelated pages whose
 //	                       prose merely mentions the query as trivia)
@@ -1526,15 +1526,21 @@ func (r *wikiPageRepository) SearchAcross(
 	pred := func(column string) string {
 		return wikiSearchPredicate(column, op, withEscape)
 	}
+	aliases := r.wikiLinkArraySQL("aliases")
+	aliasTable := "jsonb_array_elements_text(" + aliases + ") AS wiki_alias(value)"
+	if r.wikiDialect() == "sqlite" {
+		aliasTable = "json_each(" + aliases + ") AS wiki_alias"
+	}
+	aliasMatch := "EXISTS (SELECT 1 FROM " + aliasTable + " WHERE " + pred("wiki_alias.value") + ")"
 	rankExpr := "CASE " +
 		"WHEN " + pred("title") + " THEN 4 " +
-		"WHEN " + pred("slug") + " THEN 3 " +
+		"WHEN " + pred("slug") + " OR " + aliasMatch + " THEN 3 " +
 		"WHEN " + pred("summary") + " THEN 2 " +
 		"WHEN " + pred("content") + " THEN 1 " +
 		"ELSE 0 END AS match_rank"
 	matchClause := "(" + pred("title") + " OR " + pred("content") +
-		" OR " + pred("summary") + " OR " + pred("slug") + ")"
-	matchArgs := wikiSearchMatchArgs(pattern, likeEscapeChar, withEscape, 4)
+		" OR " + pred("summary") + " OR " + pred("slug") + " OR " + aliasMatch + ")"
+	matchArgs := wikiSearchMatchArgs(pattern, likeEscapeChar, withEscape, 5)
 	whereArgs := make([]interface{}, 0, 1+len(matchArgs))
 	whereArgs = append(whereArgs, kbIDs)
 	whereArgs = append(whereArgs, matchArgs...)

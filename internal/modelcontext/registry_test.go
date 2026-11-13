@@ -383,6 +383,11 @@ func TestRegistryDecodesCanonicalArgumentsForEveryBuiltInReferenceTool(t *testin
 			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
 		},
 		{
+			"knowledge graph with double-encoded KB handles", "query_knowledge_graph",
+			`{"knowledge_base_ids":"[\"kb://1\"]","query":"topic"}`,
+			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
+		},
+		{
 			"data analysis SQL", "data_analysis",
 			`{"knowledge_id":"doc://1","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'doc://1'"}`,
 			`{"knowledge_id":"doc-real","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'weknora://doc/doc-real'"}`,

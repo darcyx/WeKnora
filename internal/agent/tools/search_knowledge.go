@@ -133,7 +133,8 @@ type SearchKnowledgeTool struct {
 	// patternFilter, when set, keeps only results whose text matches it.
 	// It is not exposed to the model; the MCP grep_chunks endpoint uses it
 	// to keep grep semantics on top of index-backed retrieval.
-	patternFilter *regexp.Regexp
+	patternFilter      *regexp.Regexp
+	preflightQuestions []string
 	// contextImages attaches the images of results found by an image's own
 	// vector, for a model that can see them; see WithContextImages.
 	contextImages bool
@@ -146,6 +147,11 @@ type SearchKnowledgeTool struct {
 // carry captions.
 func (t *SearchKnowledgeTool) WithContextImages(enabled bool) *SearchKnowledgeTool {
 	t.contextImages = enabled
+	return t
+}
+
+func (t *SearchKnowledgeTool) WithFAQPreflightQuestions(questions []string) *SearchKnowledgeTool {
+	t.preflightQuestions = questions
 	return t
 }
 
@@ -274,6 +280,11 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	for _, kb := range kbList {
 		if kb != nil {
 			kbTypeMap[kb.ID] = kb.Type
+		}
+	}
+	if mode == SearchModeHybrid && t.patternFilter == nil && len(kbIDs) == 1 && kbTypeMap[kbIDs[0]] == types.KnowledgeBaseTypeFAQ {
+		if hit := t.preflightQuestionResult(ctx, searchTargets, query); hit != nil {
+			return hit, nil
 		}
 	}
 
@@ -985,6 +996,15 @@ func faqMetadataFromResult(result *types.SearchResult) (*types.FAQChunkMetadata,
 		return nil, nil
 	}
 	return (&types.Chunk{Metadata: result.ChunkMetadata}).FAQMetadata()
+}
+
+// DirectAnswerFloor is the score a semantic FAQ hit needs before it may answer
+// without the agent. Rerank scores are model-dependent, so the floor sits
+// halfway between the configured candidate threshold and a perfect score.
+// ponytail: uncalibrated midpoint; tune against logged faq_scope scores, or make
+// it a per-model config value once real traffic shows where wrong hits cluster.
+func (t *SearchKnowledgeTool) DirectAnswerFloor() float64 {
+	return (t.rerankThreshold() + 1) / 2
 }
 
 func (t *SearchKnowledgeTool) rerankThreshold() float64 {

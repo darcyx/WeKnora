@@ -248,6 +248,11 @@ func (s *sessionService) AgentQA(
 		llmContext = []chat.Message{}
 	}
 
+	// FAQ matching belongs to the incoming question, before restoring the Agent's retrieval state.
+	if answered, err := s.tryAgentFAQ(ctx, req, agentConfig, eventBus, summaryModel, rerankModel, llmContext); answered || err != nil {
+		return err
+	}
+
 	// Hold the sandbox across this turn so an install that finishes while we
 	// are running cannot rebuild the VM between tool calls. Staging below is
 	// the first resolve: if the previous turn left a stale mark, that is
@@ -364,6 +369,9 @@ func (s *sessionService) AgentQA(
 	// through it. Nil (IM/embed) keeps the old behaviour untouched.
 	if req.SteerSink != nil {
 		engine.SetSteerSink(req.SteerSink)
+		if receiver, ok := engine.(interface{ SetSteerFAQ(agent.SteerFAQFunc) }); ok {
+			receiver.SetSteerFAQ(s.steerFAQ(req, agentConfig, eventBus, summaryModel, rerankModel, llmContext))
+		}
 	}
 
 	engine.SetRunMode(req.Mode)

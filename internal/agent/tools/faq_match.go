@@ -82,8 +82,29 @@ func (t *SearchKnowledgeTool) FormatFAQResults(ctx context.Context, query string
 	return result
 }
 
+// A repeated title can be looked up directly. Re-read it under this call's
+// filters so an edited, disabled or out-of-scope answer is never replayed.
+func (t *SearchKnowledgeTool) preflightQuestionResult(ctx context.Context, targets types.SearchTargets, query string) *types.ToolResult {
+	key := strings.TrimRight(query, "?？")
+	for _, question := range t.preflightQuestions {
+		if key == "" || strings.TrimRight(strings.TrimSpace(question), "?？") != key {
+			continue
+		}
+		scoped := *t
+		scoped.searchTargets = targets
+		result, err := scoped.FindExactFAQs(ctx, question)
+		if err != nil || len(result.Matches) != 1 {
+			return nil
+		}
+		row := result.Matches[0].Result
+		rows := []*searchResultWithMeta{{SearchResult: row, SourceQuery: query, KnowledgeBaseID: row.KnowledgeBaseID, KnowledgeBaseType: types.KnowledgeBaseTypeFAQ}}
+		return scoped.formatOutput(ctx, rows, targets.GetAllKnowledgeBaseIDs(), query, "exact")
+	}
+	return nil
+}
+
 // FindFAQCandidates retrieves semantic FAQ candidates within the resolved scope.
-// These are evidence for clarification, not sufficient for automatic direct answers.
+// A candidate still needs a coverage check before its answer can be published.
 func (t *SearchKnowledgeTool) FindFAQCandidates(ctx context.Context, query string) (result FAQSearchResult, err error) {
 	defer func() { t.attachFAQRecovery(&err, query, false) }()
 	result.RequestedTargets = t.searchTargets.Clone()

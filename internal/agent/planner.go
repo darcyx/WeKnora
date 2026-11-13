@@ -36,8 +36,13 @@ func (e *AgentEngine) maybePlan(ctx context.Context, query string, messages []ch
 	if e.config == nil || !e.config.PlanningEnabled {
 		return nil, false
 	}
+	// FAQ preflight already assessed this unpinned request with the business context.
+	compact := len(e.config.FAQPreflightQuestions) > 0 && len(e.selectedDocs) == 0 &&
+		e.questionOrigin == nil && e.pageContext.Empty() && len(e.pinnedSkills) == 0 && len(e.pinnedMCPServices) == 0
 	var contextMessages []chat.Message
-	if len(messages) > 0 && messages[0].Role == "system" {
+	if compact {
+		contextMessages = append(contextMessages, chat.Message{Role: "system", Content: planPrompt})
+	} else if len(messages) > 0 && messages[0].Role == "system" {
 		contextMessages = append(contextMessages, messages[0])
 	}
 	// The last message is the current turn; include only recent plain history.
@@ -60,7 +65,11 @@ func (e *AgentEngine) maybePlan(ctx context.Context, query string, messages []ch
 	if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
 		task = messages[len(messages)-1]
 	}
-	task.Content = planPrompt + "\n\nCurrent request and context:\n" + task.Content
+	if compact {
+		task.Content = query
+	} else {
+		task.Content = planPrompt + "\n\nCurrent request and context:\n" + task.Content
+	}
 	contextMessages = append(contextMessages, task)
 	thinking := false
 	result, err := e.streamLLMToEventBus(
