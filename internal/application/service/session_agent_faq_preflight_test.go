@@ -66,7 +66,7 @@ func (c preflightChat) Chat(ctx context.Context, messages []chat.Message, _ *cha
 	return c.call(ctx, messages)
 }
 
-const preflightSelection = `{"decision":"direct_answer","selected_id":"1","scope_match":"same","question_match":"equivalent","requires_steps":false,"answer_kind":"other","unanswered_parts_of_original_request":[]}`
+const preflightSelection = `{"decision":"direct_answer","selected_id":"1","matched_facts":["支付"],"requires_steps":false,"answer_kind":"other","unanswered_parts_of_original_request":[]}`
 const preflightQuestion = `{"question":"哪个平台？","scope_match":"missing","missing_user_fields":["平台"],"unanswered_parts_of_original_request":[]}`
 
 func preflightFixture(t *testing.T) (*sessionService, *types.QARequest, *types.AgentConfig, *preflightRepo) {
@@ -97,9 +97,10 @@ func (preflightMessages) UpdateMessageRetrievalState(context.Context, string, st
 
 func TestFAQFallsThroughForCurrentProjectState(t *testing.T) {
 	const query = "账密注册的功能开关状态"
+	selection := strings.Replace(preflightSelection, "支付", query, 1)
 	for _, decision := range []string{`{"decision":"needs_live_data"}`, `{"decision":"insufficient"}`, `{}`, preflightQuestion, `{"question":"请问是官包还是渠道包？"}`,
-		strings.Replace(preflightSelection, `"selected_id":"1"`, `"selected_id":"0"`, 1),
-		preflightSelection[:len(preflightSelection)-1] + `,"question":"是官包吗？"}`} {
+		strings.Replace(selection, `"selected_id":"1"`, `"selected_id":"0"`, 1),
+		selection[:len(selection)-1] + `,"question":"是官包吗？"}`} {
 		s, req, cfg, repo := preflightFixture(t)
 		req.Query = query
 		repo.chunk.Metadata = types.JSON(`{"standard_question":"账密注册开关的各个值是什么意思？","similar_questions":["账密注册的功能开关状态"],"answers":["0 关闭注册和登录，1 仅登录，2 仅注册，3 注册和登录均开启。"]}`)
@@ -228,6 +229,45 @@ func TestFAQSemanticDirectAnswerUsesModelScore(t *testing.T) {
 		if tc.want {
 			require.Equal(t, row.ID, evaluation.Match.Result.ID)
 		}
+	}
+}
+
+func TestFAQSemanticDirectAnswerRequiresGroundedFacts(t *testing.T) {
+	const question = "ios微信登陆跳转失败"
+	const detail = "通用链接的配置有误"
+	for _, tc := range []struct {
+		name    string
+		facts   []string
+		history []chat.Message
+		want    bool
+	}{
+		{"user paraphrase confirmed earlier", []string{question, detail}, []chat.Message{{Role: "user", Content: "微信提示" + detail}}, true},
+		{"FAQ-only error", []string{question, "Universal Links 配置异常"}, nil, false},
+		{"assistant hypothesis", []string{question, detail}, []chat.Message{{Role: "assistant", Content: "可能是" + detail}}, false},
+		{"compacted summary", []string{question, detail}, []chat.Message{{Role: "user", Content: detail, Kind: chat.MessageKindCompactionSummary}}, false},
+		{"background notice", []string{question, detail}, backgroundInjectionMessages(types.AgentStep{BackgroundInjections: []types.BackgroundInjection{{Content: detail}}}), false},
+		{"generated image caption", []string{question, detail}, []chat.Message{buildUserHistoryMessage(&types.Message{Content: "看截图", Images: types.MessageImages{{Caption: detail}}})}, false},
+		{"project context without the request", []string{"iOS"}, nil, false},
+		{"no facts", nil, nil, false},
+		{"empty quote", []string{question, " "}, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, req, cfg, repo := preflightFixture(t)
+			req.Query, req.AppInfo = question, `{"platform":"iOS"}`
+			repo.chunk.Metadata = types.JSON(`{"standard_question":"微信登录提示 Universal Links 配置异常怎么办？","answers":["核对 Universal Links 配置。"]}`)
+			s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+			facts, err := json.Marshal(tc.facts)
+			require.NoError(t, err)
+			reply := strings.Replace(preflightSelection, `["支付"]`, string(facts), 1)
+			model := preflightChat{call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+				if messages[0].Content == faqRewritePrompt {
+					return &types.ChatResponse{Content: "微信登录提示 Universal Links 配置异常怎么办？"}, nil
+				}
+				return &types.ChatResponse{Content: reply}, nil
+			}}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.99}}, tc.history)
+			require.Equal(t, tc.want, evaluation.reply().Answer != "")
+		})
 	}
 }
 

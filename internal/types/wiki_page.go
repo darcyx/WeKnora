@@ -189,6 +189,8 @@ func IsValidWikiPageStatus(status string) bool {
 // Wiki pages are LLM-generated, interlinked markdown documents that form
 // a persistent, compounding knowledge artifact.
 type WikiPage struct {
+	// SearchAcross computes this rank for ordering results across scoped searches.
+	MatchRank int `json:"-" gorm:"column:match_rank;->;-:migration"`
 	// Unique identifier (UUID)
 	ID string `json:"id" gorm:"type:varchar(36);primaryKey"`
 	// Workspace ID for multi-workspace isolation

@@ -78,7 +78,6 @@ func (e *AgentEngine) Resume(
 		TurnUsage:     snap.TurnUsage,
 		Plan:          snap.Plan,
 	}
-	systemPrompt := e.buildSystemPrompt(ctx)
 	if snap.Retrieval != nil && snap.RetrievalTurnID != "" && snap.RetrievalTurnID != messageID {
 		return nil, fmt.Errorf("retrieval snapshot belongs to a different assistant message")
 	}
@@ -123,7 +122,7 @@ func (e *AgentEngine) Resume(
 	for id, content := range snap.UserMessages {
 		e.recordSteerMessage(id, content)
 	}
-	messages := e.buildMessagesWithLLMContext(systemPrompt, snap.Query, sessionID, llmContext, snap.ImageURLs)
+	messages := e.buildMessagesWithLLMContext(e.buildSystemPrompt(ctx), snap.Query, sessionID, llmContext, snap.ImageURLs)
 	appendUsers := func(step types.AgentStep) error {
 		for _, id := range step.UserMessagesBefore {
 			content, ok := snap.UserMessages[id]

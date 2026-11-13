@@ -170,8 +170,11 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 	var recoveredCallID string
 	switch action {
 	case retrievalSearch:
-		if g.SearchGrace != questionSearchGrace || c.countSearches(g, c.state.questionID(), callID) >= g.SearchGrace || !isBudgetedSearchTool(tool) || previous == nil || !previous.Completed || !admission.RuntimeManaged && previous.Outcome != retrievalSuccess {
-			return fmt.Errorf("follow-up search requires a completed successful search and remaining question budget")
+		if g.SearchGrace == questionSearchGrace && c.countSearches(g, c.state.questionID(), callID) >= g.SearchGrace {
+			return fmt.Errorf("ordinary search allowance exhausted for gap %s; use the allowances in the retrieval state or answer from available evidence", gapID)
+		}
+		if g.SearchGrace != questionSearchGrace || !isBudgetedSearchTool(tool) || previous == nil || !previous.Completed || !admission.RuntimeManaged && previous.Outcome != retrievalSuccess {
+			return fmt.Errorf("ordinary follow-up search requires an eligible search tool, a completed preceding call and an active search allowance")
 		}
 		if len(failures) > 0 && !independentRetrievalScope(failures, arguments) {
 			return fmt.Errorf("a search cannot retry a failed scope; use the original recovery allowance")
@@ -308,12 +311,17 @@ func (c *retrievalControl) observe(callID, content string, outcome retrievalOutc
 	return c.persistLocked()
 }
 
+func (c *retrievalControl) reviewable(g *retrievalGap, a *retrievalAttempt) bool {
+	return g != nil && a != nil && a.GapID == g.ID && g.LastCallID == a.ID &&
+		g.Status == retrievalPending && g.LastReview == "" && a.Completed &&
+		a.Outcome == retrievalSuccess && retrievalScopeCovers(c.state.Scope, a.Scope)
+}
+
 func (c *retrievalControl) review(gapID, callID string, verdict retrievalStatus, quotes []string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	g, a := c.gap(gapID), c.attempt(callID)
-	if g == nil || a == nil || a.GapID != gapID || g.LastCallID != callID ||
-		g.Status != retrievalPending || !retrievalScopeCovers(c.state.Scope, a.Scope) || !a.Completed || a.Outcome != retrievalSuccess || g.LastReview != "" {
+	if !c.reviewable(g, a) {
 		return fmt.Errorf("review must refer to the gap's unreviewed successful observation")
 	}
 	newEvidence := false

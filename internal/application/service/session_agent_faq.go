@@ -174,7 +174,10 @@ func recentDialogue(history []chat.Message, n int) []chat.Message {
 	var recent []chat.Message
 	for i := len(history) - 1; i >= 0 && len(recent) < n; i-- {
 		m := history[i]
-		if (m.Role != "user" && m.Role != "assistant") || m.Content == "" {
+		if m.OriginalUserText != nil {
+			m.Content = *m.OriginalUserText
+		}
+		if m.Kind != "" || (m.Role != "user" && m.Role != "assistant") || strings.TrimSpace(m.Content) == "" {
 			continue
 		}
 		content := []rune(m.Content)

@@ -41,12 +41,9 @@ func TestRuntimeRetrievalUsesOriginalToolsAndRecordedOutcomes(t *testing.T) {
 	for _, tool := range e.buildToolsForLLM() {
 		require.NotEqual(t, reviewRetrievalTool, tool.Function.Name)
 		require.NotContains(t, string(tool.Function.Parameters), `"retrieval"`)
-		if tool.Function.Name == agenttools.ToolSearchKnowledge {
-			require.Contains(t, tool.Function.Description, "an allowance, not a target")
-			require.Contains(t, tool.Function.Description, "no usable answer and no grounded next lead")
-			require.Contains(t, tool.Function.Description, "Neither case requires review_retrieval merely to finish")
-		}
+		require.NotContains(t, tool.Function.Description, questionSearchGuidance())
 	}
+	require.Contains(t, e.buildSystemPrompt(t.Context()), questionSearchGuidance())
 	require.Empty(t, e.retrievalStatePrompt())
 	first := retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
 	require.True(t, first.Result.Success, first.Result.Error)
@@ -73,23 +70,42 @@ func TestRuntimeRetrievalGraceThenOriginalSupplementAndStop(t *testing.T) {
 		require.True(t, call.Result.Success, call.Result.Error)
 	}
 	require.False(t, e.usesRuntimeRetrieval())
-	require.Contains(t, e.retrievalStatePrompt(), fmt.Sprintf("first %d search calls", questionSearchGrace))
+	require.Contains(t, e.retrievalStatePrompt(), "ordinary search allowance is spent")
 	compact := e.retrievalStatePrompt()
+	require.Contains(t, compact, "a no_progress review")
 	e.runtimeRetrieval = false
 	structured := e.retrievalStatePrompt()
 	e.runtimeRetrieval = true
 	require.Less(t, len(compact), len(structured)/2, "ordinary QA must not carry the full dependency and scope protocol")
 	require.Equal(t, strings.Split(compact, "</retrieval_user_inputs>")[0], strings.Split(structured, "</retrieval_user_inputs>")[0], "compact guidance must retain the complete runtime state")
 	t.Logf("retrieval notice: ordinary=%d bytes, structured=%d bytes", len(compact), len(structured))
-	require.False(t, retrievalProbeCall(e, "unreviewed", agenttools.ToolSearchKnowledge, `{"query":"again"}`).Result.Success)
+	denied := retrievalProbeCall(e, "unreviewed", agenttools.ToolSearchKnowledge, `{"query":"again"}`).Result
+	require.False(t, denied.Success)
+	require.Contains(t, denied.Error, "ordinary search allowance exhausted")
 	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: fmt.Sprint(questionSearchGrace - 1), Status: retrievalNoProgress}))
 	call := retrievalProbeCall(e, "supplement", agenttools.ToolSearchKnowledge, `{"query":"TapTap configuration","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap"}}`)
 	require.True(t, call.Result.Success, call.Result.Error)
+	require.NotContains(t, e.retrievalStatePrompt(), "a no_progress review")
 	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: "supplement", Status: retrievalNoProgress}))
 	require.False(t, retrievalProbeCall(e, "spent", agenttools.ToolSearchKnowledge, `{"query":"yet another wording"}`).Result.Success)
 	require.Len(t, search.calls, questionSearchGrace+1)
 	_, err := restoreRetrievalControl(e.retrieval.snapshot())
 	require.NoError(t, err)
+}
+
+func TestRuntimeRetrievalSpentAfterFailedSearch(t *testing.T) {
+	e, search := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	for i := 1; i <= questionSearchGrace; i++ {
+		if i == questionSearchGrace {
+			search.err = context.DeadlineExceeded
+		}
+		result := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i)).Result
+		require.Equal(t, i < questionSearchGrace, result.Success)
+	}
+	prompt := e.retrievalStatePrompt()
+	require.Contains(t, prompt, "Recover a needed transient failure")
+	require.NotContains(t, prompt, "a no_progress review")
 }
 
 func TestRuntimeRetrievalReadsPublishedRecentReferences(t *testing.T) {

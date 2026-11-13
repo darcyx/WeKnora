@@ -41,17 +41,18 @@ type AgentStep struct {
 
 // Message message information
 type Message struct {
-	ID                  string          `json:"id"`
-	SessionID           string          `json:"session_id"`
-	RequestID           string          `json:"request_id"`
-	Content             string          `json:"content"`
-	Role                string          `json:"role"`
-	KnowledgeReferences []*SearchResult `json:"knowledge_references"`
-	AgentSteps          []AgentStep     `json:"agent_steps,omitempty"` // Agent execution steps (only for assistant messages)
-	IsCompleted         bool            `json:"is_completed"`
-	Channel             string          `json:"channel,omitempty"` // Source channel: "web", "api", "im", etc.
-	CreatedAt           time.Time       `json:"created_at"`
-	UpdatedAt           time.Time       `json:"updated_at"`
+	ID                  string            `json:"id"`
+	SessionID           string            `json:"session_id"`
+	RequestID           string            `json:"request_id"`
+	Content             string            `json:"content"`
+	Role                string            `json:"role"`
+	Images              []ImageAttachment `json:"images,omitempty"`
+	KnowledgeReferences []*SearchResult   `json:"knowledge_references"`
+	AgentSteps          []AgentStep       `json:"agent_steps,omitempty"` // Agent execution steps (only for assistant messages)
+	IsCompleted         bool              `json:"is_completed"`
+	Channel             string            `json:"channel,omitempty"` // Source channel: "web", "api", "im", etc.
+	CreatedAt           time.Time         `json:"created_at"`
+	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
 // MessageListResponse message list response

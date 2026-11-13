@@ -471,7 +471,7 @@ func NewWikiReadPageTool(
 		BaseTool: NewBaseTool(
 			ToolWikiReadPage,
 			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, and links.
-Use this to read specific wiki pages when you know their slug (e.g. "entity/acme-corp", "concept/rag").
+Use the exact slug from the wiki directory or the target of a returned [[slug|title]] link.
 Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned.`,
 			json.RawMessage(`{
   "type": "object",
@@ -479,7 +479,7 @@ Knowledge-base routing is automatic. Known link/search provenance is preferred; 
     "slugs": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "List of wiki page slugs to read (e.g. ['entity/acme-corp', 'index'])"
+      "description": "Wiki page slugs, preserving their original paths; use 'index' for the index overview"
     }
   },
   "required": ["slugs"]
@@ -797,7 +797,7 @@ func NewWikiSearchTool(
     },
     "limit": {
       "type": "integer",
-      "description": "Maximum pages to return per knowledge base (default 10, max 50)",
+      "description": "Maximum pages to return across all selected knowledge bases per query (default 10, max 50)",
       "minimum": 1,
       "maximum": 50
     }
@@ -944,14 +944,8 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 					))
 					continue
 				}
-				actualKBID := kbID
 				kept++
-				allHits = append(allHits, searchHit{page: p, kbID: actualKBID})
-				t.routes.rememberPage(p, actualKBID)
-				foundKBs[p.Slug] = append(foundKBs[p.Slug], actualKBID)
-				// Register neighbour slugs so links surfaced from this
-				// page's body can be routed to the same KB by the frontend.
-				registerLinkedSlugs(foundKBs, p, actualKBID)
+				allHits = append(allHits, searchHit{page: p, kbID: kbID})
 			}
 		}
 		if len(allHits) == 0 {
@@ -967,10 +961,21 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 			continue
 		}
 
+		sort.SliceStable(allHits, func(i, j int) bool {
+			a, b := allHits[i].page, allHits[j].page
+			if a.MatchRank != b.MatchRank {
+				return a.MatchRank > b.MatchRank
+			}
+			return a.UpdatedAt.After(b.UpdatedAt)
+		})
+		allHits = allHits[:min(params.Limit, len(allHits))]
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "<search_results count=\"%d\" query=\"%s\">\n", len(allHits), query)
 		for _, h := range allHits {
 			p := h.page
+			t.routes.rememberPage(p, h.kbID)
+			foundKBs[p.Slug] = append(foundKBs[p.Slug], h.kbID)
+			registerLinkedSlugs(foundKBs, p, h.kbID)
 			key := seenLinkKey(h.kbID, p.Slug)
 			t.mu.Lock()
 			seen := t.seenSlugs[key]

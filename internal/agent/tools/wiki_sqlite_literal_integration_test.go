@@ -111,3 +111,32 @@ func TestWikiSearchLiteralSQLiteIntegration(t *testing.T) {
 		t.Fatalf("SQLite existing regex behavior changed: result=%+v err=%v", result, err)
 	}
 }
+
+func TestWikiSearchReturnsGlobalTopPagesAcrossScopedKBs(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&types.WikiPage{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := repository.NewWikiPageRepository(db)
+	ctx := t.Context()
+	body := newPublishedPage("first", "kb-1", "body", "Reference", "engine")
+	title := newPublishedPage("second", "kb-2", "title", "Engine", "Guide")
+	body.UpdatedAt = title.UpdatedAt.Add(time.Hour)
+	for _, page := range []*types.WikiPage{body, title} {
+		if err := repo.Create(ctx, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tool := NewWikiSearchTool(sqliteSearchService{repo: repo}, nil, NewWikiScopesFromKBIDs([]string{"kb-1", "kb-2"}), nil)
+	result, err := tool.Execute(ctx, json.RawMessage(`{"query":"engine","limit":1}`))
+	if err != nil || !result.Success || strings.Count(result.Output, "<page>") != 1 || !strings.Contains(result.Output, "[[title|") {
+		t.Fatalf("expected only the title match from the second KB: result=%+v err=%v", result, err)
+	}
+	found := result.Data["found_kbs"].(map[string][]string)
+	if len(found) != 1 || len(found["title"]) != 1 || found["title"][0] != "kb-2" {
+		t.Fatalf("unexpected provenance: %v", found)
+	}
+}

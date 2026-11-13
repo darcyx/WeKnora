@@ -356,7 +356,7 @@ func TestBuildTurnBodyMessages_KeepsMidRunUsersInPlace(t *testing.T) {
 
 	// The injected message belongs between the round it interrupted and the
 	// round it caused, not bolted onto either end.
-	assert.Equal(t, chat.Message{Role: "user", Content: types.SteerMessageContent("also check B")}, got[2])
+	assert.Equal(t, chat.Message{Role: "user", Content: types.SteerMessageContent("also check B"), OriginalUserText: new("also check B")}, got[2])
 
 	assert.Equal(t, "assistant", got[3].Role)
 	assert.Equal(t, "tool", got[4].Role)
@@ -390,7 +390,7 @@ func TestBuildTurnBodyMessages_LateMidRunUserPrecedesAnswer(t *testing.T) {
 
 	got := buildTurnBodyMessages(assistant, midRun)
 	require.Len(t, got, 4)
-	assert.Equal(t, chat.Message{Role: "user", Content: types.SteerMessageContent("and keep it short")}, got[2])
+	assert.Equal(t, chat.Message{Role: "user", Content: types.SteerMessageContent("and keep it short"), OriginalUserText: new("and keep it short")}, got[2])
 	assert.Equal(t, chat.Message{Role: "assistant", Content: "Here you go."}, got[3])
 }
 
@@ -564,9 +564,9 @@ func TestBuildTurnBodyMessages_ReplaysExplicitBoundariesAndIntermediateAnswers(t
 	require.Len(t, got, 5)
 	assert.Equal(t, []chat.Message{
 		{Role: "assistant", Content: "first draft"},
-		{Role: "user", Content: types.SteerMessageContent("revise")},
+		{Role: "user", Content: types.SteerMessageContent("revise"), OriginalUserText: new("revise")},
 		{Role: "assistant", Content: "second draft"},
-		{Role: "user", Content: types.SteerMessageContent("revise")},
+		{Role: "user", Content: types.SteerMessageContent("revise"), OriginalUserText: new("revise")},
 		{Role: "assistant", Content: "final"},
 	}, got)
 }

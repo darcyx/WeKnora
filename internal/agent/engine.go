@@ -263,6 +263,9 @@ func (e *AgentEngine) buildSystemPrompt(ctx context.Context) string {
 		logger.Debugf(ctx, "[Agent][Prompt] section=%s bytes=%d", section.Name, len(section.Content))
 	}
 	prompt := renderSystemPromptSections(sections) + e.collaborationGuidance()
+	if e.retrievalGuard && e.retrieval != nil {
+		prompt += "\n\n" + questionSearchGuidance()
+	}
 	if e.runNote != "" {
 		prompt += "\n\n" + e.runNote
 	}
@@ -469,11 +472,6 @@ func (e *AgentEngine) Execute(
 	}
 	defer func() { finishAgentSpan(agentSpan, state, err) }()
 
-	// Build system prompt using progressive RAG prompt
-	// If skills are enabled, include skills metadata (Level 1 - Progressive Disclosure)
-	systemPrompt := e.buildSystemPrompt(ctx)
-	logger.Debugf(ctx, "[Agent] SystemPrompt: %d chars", len(systemPrompt))
-
 	// Initialize messages with history
 	var imgs []string
 	if len(imageURLs) > 0 {
@@ -488,6 +486,8 @@ func (e *AgentEngine) Execute(
 	if err := e.initializeRetrievalContinuation(ctx); err != nil {
 		return nil, err
 	}
+	systemPrompt := e.buildSystemPrompt(ctx)
+	logger.Debugf(ctx, "[Agent] SystemPrompt: %d chars", len(systemPrompt))
 	messages := e.buildMessagesWithLLMContext(systemPrompt, query, sessionID, llmContext, imgs)
 	if e.toolRegistry != nil {
 		e.toolRegistry.RememberMCPHistory(messages)
