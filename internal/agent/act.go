@@ -266,6 +266,40 @@ func (e *AgentEngine) executeToolCalls(
 	}
 
 	logger.Infof(ctx, "[Agent][Round-%d] Executing %d tool call(s)", round, n)
+	e.turnHasWikiSearch = slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool { return call.Function.Name == agenttools.ToolWikiSearch })
+	defer func() { e.turnHasWikiSearch = false }()
+
+	// When the model explicitly requested both Wiki discovery and an unscoped
+	// document search, execute both in the original order within their budget.
+	// Restrict reordering to these read-only calls; all normal source and budget
+	// checks still run, and results retain the model's original call order.
+	if e.turnHasWikiSearch && n >= 2 {
+		var shadowed []int
+		eligible := true
+		for i, tc := range response.ToolCalls {
+			if tc.Function.Name == agenttools.ToolWikiSearch {
+				continue
+			}
+			var args map[string]any
+			if json.Unmarshal([]byte(tc.Function.Arguments), &args) != nil || !wikiShadowsSearch(tc.Function.Name, args) {
+				eligible = false
+				break
+			}
+			shadowed = append(shadowed, i)
+		}
+		if eligible && len(shadowed) > 0 {
+			e.turnHasWikiSearch = false
+			for i, tc := range response.ToolCalls {
+				if s := e.executeSingleToolCall(ctx, tc, i, step, iteration, round, sessionID, assistantMessageID); s != nil {
+					return s
+				}
+				if result := step.ToolCalls[len(step.ToolCalls)-1].Result; result != nil && result.Success && result.UserQuestion != nil {
+					break
+				}
+			}
+			return nil
+		}
+	}
 
 	// Use parallel execution when enabled and there are multiple tool calls
 	hasQuestion := slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool { return call.Function.Name == agenttools.ToolAskUser })
@@ -576,6 +610,11 @@ func (e *AgentEngine) runToolCallAnswered(
 		}
 	}
 
+	// Rejected before the retrieval ledger sees it, so no allowance is spent.
+	if e.turnHasWikiSearch && wikiShadowsSearch(tc.Function.Name, args) {
+		return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
+			Result: &types.ToolResult{Success: false, Error: wikiParallelSearchError}}
+	}
 	if e.retrieval != nil && tc.Function.Name == reviewRetrievalTool {
 		if len(tc.UnresolvedHandles) > 0 {
 			return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,

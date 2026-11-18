@@ -50,3 +50,20 @@ func TestFormatWithinBudgetListsOmittedDocumentsWithinBudget(t *testing.T) {
 		t.Fatalf("omitted=%d data=%v output=%s", omitted, rows, result.Output)
 	}
 }
+
+func TestFormatWithinBudgetDoesNotDropEvidenceForLargeMetadata(t *testing.T) {
+	metadata := strings.Repeat("文", 38560)
+	results := []*searchResultWithMeta{
+		{SearchResult: &types.SearchResult{ID: "c1", KnowledgeID: "d1", KnowledgeCustomMetadata: metadata, Content: "first"}, KnowledgeBaseID: "kb"},
+		{SearchResult: &types.SearchResult{ID: "c2", KnowledgeID: "d2", Content: "specific answer"}, KnowledgeBaseID: "kb"},
+	}
+	ctx := WithOutputBudget(context.Background(), 3000)
+	result, omitted := (&SearchKnowledgeTool{}).formatWithinBudget(ctx, results, []string{"kb"}, "q", SearchModeHybrid)
+	rows := result.Data["results"].([]map[string]interface{})
+	if omitted != 0 || len(rows) != 2 || rows[1]["content"] != "specific answer" {
+		t.Fatalf("omitted=%d rows=%v", omitted, len(rows))
+	}
+	if rows[0]["knowledge_metadata"] != metadata || !strings.Contains(result.Output, `<metadata truncated="true">`) {
+		t.Fatal("the model view should mark truncated metadata while preserving structured metadata")
+	}
+}

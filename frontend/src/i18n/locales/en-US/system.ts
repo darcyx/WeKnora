@@ -1,4 +1,47 @@
 export default {
+  tokenQuotaSettings: {
+    title: "Token quotas",
+    description: "View and manage token usage and quotas for external API integration users.",
+    identityHint: "Quotas are scoped to a workspace and external user ID; periods use UTC.",
+    tenantId: "Workspace ID",
+    tenantIdPlaceholder: "Enter workspace ID",
+    tenantIdRequired: "Enter a workspace ID",
+    tenantIdInvalid: "Workspace ID must be numeric",
+    subjectId: "External user ID",
+    subjectIdPlaceholder: "Enter external user ID",
+    subjectIdRequired: "Enter an external user ID",
+    query: "Query",
+    listUsers: "List users",
+    usersTitle: "External users",
+    usersDescription: "Select a user to view or adjust quota, or query a user not yet listed.",
+    previousPage: "Previous",
+    nextPage: "Next",
+    pageInfo: "Page {page}, {total} users total",
+    dailyUsage: "Daily usage",
+    monthlyUsage: "Monthly usage",
+    reservedTokens: "Reserved tokens",
+    reservedHint: "Tokens reserved for in-flight requests.",
+    unlimited: "Unlimited",
+    limitValue: "Limit: {value}",
+    overrideTitle: "User quota override",
+    overrideDescription: "Set individual limits for this user; leave blank to inherit platform defaults.",
+    overridden: "Overridden",
+    inheriting: "Inheriting defaults",
+    dailyLimit: "Daily limit",
+    monthlyLimit: "Monthly limit",
+    inheritPlaceholder: "Inherit default",
+    limitHint: "0 means unlimited; leave blank to inherit the default.",
+    reset: "Reset to default",
+    resetConfirm: "Remove this user's quota override and restore platform defaults?",
+    save: "Save",
+    noData: "Enter a workspace ID and external user ID to query quota.",
+    loadFailed: "Failed to load quota",
+    overrideRequired: "Set at least one override",
+    saveSuccess: "Quota saved",
+    saveFailed: "Failed to save quota",
+    resetSuccess: "Default quota restored",
+    resetFailed: "Failed to reset quota",
+  },
   documentProgress: {
     queueView: 'Queue tasks',
     title: 'Document and Wiki progress',
@@ -347,6 +390,11 @@ export default {
         }
       },
       keyLabels: {
+        token_quota: {
+          default_daily_limit: "Default daily token limit",
+          default_monthly_limit: "Default monthly token limit",
+          max_completion_tokens: "Default maximum output tokens",
+        },
         auth: {
           registration_mode: 'Registration mode',
           default_tenant_mode: 'Default workspace provisioning',
@@ -379,6 +427,11 @@ export default {
         }
       },
       keyDescriptions: {
+        token_quota: {
+          default_daily_limit: "Default daily token limit for external API integration users (UTC calendar day). 0 means unlimited; user overrides take precedence. Changes take effect immediately.",
+          default_monthly_limit: "Default monthly token limit for external API integration users (UTC calendar month). 0 means unlimited; user overrides take precedence. Changes take effect immediately.",
+          max_completion_tokens: "Maximum output tokens used for reservation and model calls when max_tokens is not specified. Must be positive; a lower value reduces reservations but also limits response length.",
+        },
         auth: {
           registration_mode: 'Registration mode. Open registration allows anyone to create an account; invitation registration requires a valid invitation link; disabled registration prevents account creation while existing accounts can still accept invitations. Changes take effect immediately.',
           default_tenant_mode: 'Workspace provisioning after public registration. create_personal creates an Owner workspace; tenantless creates only the account until the user accepts an invitation or creates a workspace. Applies to new users only.',

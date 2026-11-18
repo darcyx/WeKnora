@@ -202,3 +202,22 @@ func TestRetrievalBoundaryPartialStageRecoveryKeepsSuccessfulEvidence(t *testing
 	require.Len(t, remaining, 1)
 	require.Equal(t, []string{"b"}, remaining[0].KnowledgeBaseIDs)
 }
+
+func TestContinuationAdmissionUsesFocusedPromptAndPreservesContext(t *testing.T) {
+	e, _ := newRetrievalProbeEngine(t)
+	model := &projectContextChat{mockChat: &mockChat{}, reply: `{"decision":"new_goal","reason":"independent request"}`}
+	e.chatModel = model
+	e.SetRetrievalUserMessage("new", "另一个问题")
+	e.appInfo = "project attributes"
+	e.retrievalHistory = []string{"previous user wording"}
+	previous := retrievalState{Goal: "old goal", Scope: "scope", Gaps: []retrievalGap{{ID: "gap-1", Scope: "scope", Fact: "old fact", Status: retrievalNeedsUser, MissingUserFields: []string{"platform"}}}, Attempts: []retrievalAttempt{{ID: "irrelevant attempt", Content: "hidden"}}}
+	_, err := e.retrievalAdmission(t.Context(), "continuation", map[string]any{"previous": previous, "current_input": "另一个问题", "input_id": "message:new"})
+	require.NoError(t, err)
+	require.Len(t, model.messages, 3)
+	require.Contains(t, model.messages[0].Content, "Classify whether")
+	require.Contains(t, model.messages[2].Content, "old goal")
+	require.Contains(t, model.messages[2].Content, "platform")
+	require.Contains(t, model.messages[2].Content, "project attributes")
+	require.Contains(t, model.messages[2].Content, "previous user wording")
+	require.NotContains(t, model.messages[2].Content, "irrelevant attempt")
+}

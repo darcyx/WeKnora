@@ -758,6 +758,8 @@ export default {
     never: 'Never',
     systemCapabilityGroup: 'Platform control plane',
     capabilities: {
+      tokenQuotaRead: "View token quotas",
+      tokenQuotaManage: "Manage token quotas",
       tenantsRead: 'Read workspaces',
       tenantsManage: 'Manage workspaces',
       settingsRead: 'Read system settings',
@@ -767,6 +769,8 @@ export default {
       auditRead: 'Read system audit'
     },
     capabilityHints: {
+      tokenQuotaRead: "View external users’ token quotas and usage.",
+      tokenQuotaManage: "Set or delete external users’ token quota overrides.",
       tenantsRead: 'List, search, and inspect every workspace.',
       tenantsManage: 'Create, update, delete workspaces and apply global workspace settings.',
       settingsRead: 'Read platform runtime settings.',

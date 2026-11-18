@@ -119,9 +119,21 @@ func TestRetrievalExhaustedReviewPreservesStopAndObservationValidation(t *testin
 	stopped := retrievalProbeCall(e, "stop", reviewRetrievalTool, `{"gap_id":"gap-1","call_id":"first","status":"exhausted_no_progress"}`)
 	require.True(t, stopped.Result.Success, stopped.Result.Error)
 	require.Equal(t, retrievalExhausted, e.retrieval.snapshot().Gaps[0].Status)
+	require.Contains(t, e.retrievalStatePrompt(), "For exhausted fact gap-1, compose from applicable evidence")
 	again := retrievalProbeCall(e, "again", agenttools.ToolSearchKnowledge, `{"query":"another wording"}`)
 	require.False(t, again.Result.Success)
 	require.Len(t, p.calls, 1)
+}
+
+func TestNoProgressFeedbackDoesNotInventClarification(t *testing.T) {
+	e, _ := newRetrievalProbeEngine(t)
+	first := retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.True(t, first.Result.Success, first.Result.Error)
+	review := retrievalProbeCall(e, "review", reviewRetrievalTool, `{"gap_id":"gap-1","call_id":"first","status":"no_progress"}`)
+	require.True(t, review.Result.Success, review.Result.Error)
+	require.Contains(t, review.Result.Output, "No progress recorded")
+	require.NotContains(t, review.Result.Output, "necessary clarification")
+	require.Contains(t, review.Result.Output, "Failed or unread sources are not evidence of absence")
 }
 
 func TestRetrievalSchemaAndTerminalReview(t *testing.T) {
@@ -299,4 +311,47 @@ func TestInlineReviewGapInferenceRequiresCurrentObservedCall(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReviewSchemaTracksPendingAndUserConditionFacts(t *testing.T) {
+	t.Setenv(stableRetrievalToolsEnv, "false")
+	e, _ := newRetrievalProbeEngine(t)
+	e.EnableRetrievalGuard()
+	reviewSchema := func() map[string]any {
+		for _, tool := range e.buildToolsForLLM() {
+			if tool.Function.Name == reviewRetrievalTool {
+				var schema map[string]any
+				require.NoError(t, json.Unmarshal(tool.Function.Parameters, &schema))
+				return schema
+			}
+		}
+		t.Fatal("review tool missing")
+		return nil
+	}
+	initial := reviewSchema()
+	require.Len(t, initial["oneOf"], 1, "new_fact remains available without a pending gap")
+	e.retrieval.mu.Lock()
+	scope := e.retrieval.state.Scope
+	e.retrieval.state.Gaps = []retrievalGap{{ID: "pending", Scope: scope, Status: retrievalPending}, {ID: "blocked", Scope: scope, Status: retrievalNeedsUser}, {ID: "done", Scope: scope, Status: retrievalSatisfied}}
+	e.retrieval.mu.Unlock()
+	active := reviewSchema()
+	require.Len(t, active["oneOf"], 2)
+	props := active["properties"].(map[string]any)
+	branches := active["oneOf"].([]any)
+	gap := branches[1].(map[string]any)["properties"].(map[string]any)
+	statuses := gap["status"].(map[string]any)["enum"].([]any)
+	require.Contains(t, statuses, "user_conditions")
+	require.Contains(t, statuses, "no_progress")
+	require.Contains(t, props, "new_fact")
+	require.Contains(t, props, "user_answers")
+	e.retrieval.mu.Lock()
+	e.retrieval.state.Gaps = []retrievalGap{{ID: "blocked", Scope: scope, Status: retrievalNeedsUser}, {ID: "done", Scope: scope, Status: retrievalSatisfied}}
+	e.retrieval.mu.Unlock()
+	blockedSchema := reviewSchema()
+	blockedBranch := blockedSchema["oneOf"].([]any)[1].(map[string]any)["properties"].(map[string]any)
+	require.Equal(t, []any{"user_conditions"}, blockedBranch["status"].(map[string]any)["enum"])
+	e.retrieval.mu.Lock()
+	e.retrieval.state.Gaps = []retrievalGap{{ID: "old", Scope: "previous-scope", Status: retrievalPending}}
+	e.retrieval.mu.Unlock()
+	require.Len(t, reviewSchema()["oneOf"], 1, "facts outside the current source scope cannot expose gap reviews")
 }

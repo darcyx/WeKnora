@@ -32,6 +32,9 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		result = &copyResult
 	}
 	displayType := stringValue(result.Data, "display_type")
+	for _, skipped := range mapsValue(result.Data["skipped_knowledge_bases"]) {
+		r.RegisterKnowledgeBase(stringValue(skipped, "knowledge_base_id"))
+	}
 	if displayType == "search_results" && len(mapsValue(result.Data["stages"])) > 0 {
 		displayType = "search_stages"
 	}
@@ -39,7 +42,7 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		return r.modelWebFetchOutput(mapsValue(result.Data["results"]), result.Output)
 	}
 	if !result.Success {
-		return failedToolModelText(result.Output, result.Error)
+		return r.annotateSkippedSearches(failedToolModelText(result.Output, result.Error), result.Data)
 	}
 	switch displayType {
 	case "search_stages":
@@ -65,7 +68,8 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		}
 		output := r.modelKnowledgeOutput(mode, mapsValue(result.Data["results"]), result.Output)
 		output = r.annotateOmittedCandidates(output, result.Data)
-		return annotateSearchNotes(r.annotateModeFallbacks(output, result.Data), result.Data)
+		output = annotateSearchNotes(r.annotateModeFallbacks(output, result.Data), result.Data)
+		return r.annotateSkippedSearches(output, result.Data)
 	case "knowledge_chunks_list":
 		return r.modelKnowledgeChunksOutput(result.Data, result.Output)
 	case "document_info":
@@ -83,6 +87,31 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		r.registerStructuredReferences(result.Output)
 		return r.CompactKnownText(result.Output)
 	}
+}
+
+func (r *sourceRegistry) annotateSkippedSearches(output string, data map[string]interface{}) string {
+	skippedBases := mapsValue(data["skipped_knowledge_bases"])
+	for _, skipped := range skippedBases[:min(3, len(skippedBases))] {
+		note := fmt.Sprintf("Knowledge base %s was not searched: %s.",
+			r.RegisterKnowledgeBase(stringValue(skipped, "knowledge_base_id")), stringValue(skipped, "reason"))
+		if strings.Contains(output, note) {
+			continue
+		}
+		if strings.HasSuffix(output, "</retrieval>") {
+			output = strings.TrimSuffix(output, "</retrieval>") + "  <skipped>" + escapeText(note) + "</skipped>\n</retrieval>"
+		} else {
+			output += "\n" + note
+		}
+	}
+	if len(skippedBases) > 3 {
+		note := fmt.Sprintf("%d additional knowledge bases were not searched; use wiki or graph tools for them.", len(skippedBases)-3)
+		if strings.HasSuffix(output, "</retrieval>") {
+			output = strings.TrimSuffix(output, "</retrieval>") + "  <skipped>" + escapeText(note) + "</skipped>\n</retrieval>"
+		} else {
+			output += "\n" + note
+		}
+	}
+	return output
 }
 
 // registerStructuredReferences registers durable IDs found under explicitly
@@ -195,7 +224,7 @@ func (r *sourceRegistry) modelDocumentInfoOutput(data map[string]interface{}, fa
 		}
 		b.WriteString(">\n")
 		if description := stringValue(row, "description"); description != "" {
-			fmt.Fprintf(&b, "    <description>%s</description>\n", escapeText(description))
+			writeDocumentMetadata(&b, "    ", "description", description)
 		}
 		b.WriteString("  </document>\n")
 		count++
@@ -614,7 +643,7 @@ func writeDocumentInfo(b *strings.Builder, info map[string]interface{}) {
 	}
 	b.WriteString(">\n")
 	if description != "" {
-		fmt.Fprintf(b, "      <description>%s</description>\n", escapeText(description))
+		writeDocumentMetadata(b, "      ", "description", description)
 	}
 	if len(metadata) > 0 {
 		keys := make([]string, 0, len(metadata))
@@ -622,16 +651,25 @@ func writeDocumentInfo(b *strings.Builder, info map[string]interface{}) {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		b.WriteString("      <metadata>")
+		var value strings.Builder
 		for i, key := range keys {
 			if i > 0 {
-				b.WriteString("; ")
+				value.WriteString("; ")
 			}
-			fmt.Fprintf(b, "%s: %v", escapeText(key), metadata[key])
+			fmt.Fprintf(&value, "%s: %v", key, metadata[key])
 		}
-		b.WriteString("</metadata>\n")
+		writeDocumentMetadata(b, "      ", "metadata", value.String())
 	}
 	b.WriteString("    </info>\n")
+}
+
+func writeDocumentMetadata(b *strings.Builder, indent, tag, value string) {
+	value, truncated := truncateModelEvidence(value, 1024)
+	fmt.Fprintf(b, "%s<%s", indent, tag)
+	if truncated {
+		b.WriteString(` truncated="true"`)
+	}
+	fmt.Fprintf(b, ">%s</%s>\n", escapeText(value), tag)
 }
 
 func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]interface{}) string {
@@ -685,7 +723,7 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 		}
 		b.WriteString(">\n")
 		if group.metadata != "" {
-			fmt.Fprintf(&b, "    <metadata>%s</metadata>\n", escapeText(group.metadata))
+			writeDocumentMetadata(&b, "    ", "metadata", group.metadata)
 		}
 		if info != nil && stringValue(info, "knowledge_id") == group.realID {
 			writeDocumentInfo(&b, info)

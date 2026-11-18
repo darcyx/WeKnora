@@ -514,4 +514,12 @@ func TestDocumentReferenceGraphKeepsOriginalLink(t *testing.T) {
 	require.NotEmpty(t, rows)
 	require.Equal(t, "https://docs.example/graph", rows[0]["source_url"])
 	require.Equal(t, "Evidence", rows[0]["knowledge_title"])
+
+	documents.documents["doc"].Metadata = nil
+	documents.documents["doc"].CustomMetadata = types.JSON(`{"id":"anydata-login","url":"https://docs.dobest.cn/docs-server/d9e9ba5e"}`)
+	result = executeGraphEvidenceTool(t, tool)
+	rows = result.Data["results"].([]map[string]interface{})
+	require.NotEmpty(t, rows)
+	require.Equal(t, "doc", rows[0]["knowledge_id"])
+	require.Equal(t, "https://docs.dobest.cn/docs-server/d9e9ba5e", rows[0]["source_url"])
 }

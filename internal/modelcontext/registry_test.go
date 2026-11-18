@@ -2,6 +2,7 @@ package modelcontext
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -641,6 +642,16 @@ func TestModelOutputRendersReadDocumentHeaderAndNavigation(t *testing.T) {
 	require.Contains(t, paged, `<chunk id="chunk://1" index="4" view="full">`)
 	require.Contains(t, paged, `<pagination next_offset="6" remaining="6" />`)
 	require.NotContains(t, paged, "doc-real")
+
+	large := strings.Repeat("文", 40000)
+	largeOutput := registry.ModelToolResultForTool("read_document", &types.ToolResult{Success: true, Data: map[string]any{
+		"display_type": "knowledge_chunks_list", "knowledge_id": "doc-real", "knowledge_title": "Engine Manual",
+		"document": map[string]interface{}{"knowledge_id": "doc-real", "description": large, "metadata": map[string]interface{}{"description": large}},
+		"chunks":   []map[string]interface{}{{"chunk_id": "chunk-4", "content": "evidence"}},
+	}})
+	require.Contains(t, largeOutput, `<description truncated="true">`+strings.Repeat("文", 1024)+`</description>`)
+	require.Contains(t, largeOutput, `<metadata truncated="true">description: `+strings.Repeat("文", 1011)+`</metadata>`)
+	require.Contains(t, largeOutput, `<content>evidence</content>`)
 
 	matched := registry.ModelToolResultForTool("read_document", &types.ToolResult{Success: true, Data: map[string]any{
 		"display_type":    "knowledge_chunks_list",

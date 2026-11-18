@@ -213,6 +213,34 @@ func (e *AgentEngine) retrievalTools(tools []chat.Tool) []chat.Tool {
 			"not":        map[string]any{"required": []string{"gap_id"}},
 		},
 	}
+	// Keep the opt-in stable tool prefix byte-for-byte stable. Otherwise only
+	// expose review categories that the current fact states can accept.
+	if !stable {
+		hasPending, hasUserBlocker := false, false
+		state := e.retrieval.snapshot()
+		for _, gap := range state.Gaps {
+			if !retrievalScopeCovers(state.Scope, gap.Scope) {
+				continue
+			}
+			hasPending = hasPending || gap.Status == retrievalPending
+			hasUserBlocker = hasUserBlocker || gap.Status == retrievalNeedsUser
+		}
+		branches := []any{terminalSchema["oneOf"].([]any)[1]}
+		if hasPending || hasUserBlocker {
+			var statuses []string
+			if hasPending {
+				statuses = append(statuses, "progress", "no_progress", "satisfied", "needs_user", "exhausted_no_progress")
+			}
+			if hasUserBlocker {
+				statuses = append(statuses, "user_conditions")
+			}
+			branches = append(branches, map[string]any{
+				"required": []string{"gap_id"}, "not": map[string]any{"required": []string{"new_fact"}},
+				"properties": map[string]any{"status": map[string]any{"enum": statuses}},
+			})
+		}
+		terminalSchema["oneOf"] = branches
+	}
 	parameters, _ := json.Marshal(terminalSchema)
 	return append(tools, chat.Tool{Type: "function", Function: chat.FunctionDef{
 		Name: reviewRetrievalTool, Parameters: parameters,
@@ -251,6 +279,9 @@ func retrievalFactProperties() map[string]any {
 func (e *AgentEngine) prepareRetrievalCall(ctx context.Context, tc types.LLMToolCall, args map[string]any) (string, error) {
 	e.retrievalGateMu.Lock()
 	defer e.retrievalGateMu.Unlock()
+	if tc.Function.Name == "search_knowledge" {
+		e.includeProjectIntegrationLibraries(args)
+	}
 	if err := e.resolveProjectConditions(ctx); err != nil {
 		return "", err
 	}
@@ -268,6 +299,75 @@ func (e *AgentEngine) prepareRetrievalCall(ctx context.Context, tc types.LLMTool
 		return e.prepareBudgetedSearch(ctx, tc, args)
 	}
 	return e.prepareStructuredRetrievalCall(ctx, tc, args)
+}
+
+// Include known integration libraries only within the already authorized turn scope.
+func (e *AgentEngine) includeProjectIntegrationLibraries(args map[string]any) {
+	ids, ok := args["knowledge_base_ids"].([]any)
+	if !ok || len(ids) == 0 || e.retrieval == nil || e.config == nil {
+		return
+	}
+	if hint, ok := args["retrieval"].(map[string]any); ok && (hint["action"] == "recovery" || hint["scope_from"] != nil) {
+		return
+	}
+	state := e.retrieval.snapshot()
+	original, err := json.Marshal(retrievalToolArgs(args))
+	if err != nil {
+		return
+	}
+	for i := range state.Attempts {
+		attempt := &state.Attempts[i]
+		if attempt.QuestionID == state.questionID() && len(attempt.Failures) > 0 && validateScopedRecovery(attempt, string(original)) == nil {
+			return
+		}
+	}
+	hasSearch := false
+	for i := len(state.Attempts) - 1; i >= 0; i-- {
+		attempt := state.Attempts[i]
+		if attempt.QuestionID == state.questionID() && isBudgetedSearchTool(attempt.Tool) && !attempt.FAQOnly {
+			hasSearch = attempt.Completed && attempt.Outcome == retrievalSuccess && len(attempt.Failures) == 0
+			break
+		}
+	}
+	if !hasSearch {
+		return
+	}
+	var app struct {
+		GameInfo struct {
+			DeviceType string `json:"device_type"`
+		} `json:"gameInfo"`
+	}
+	if json.Unmarshal([]byte(e.appInfo), &app) != nil {
+		return
+	}
+	names := map[string]bool{}
+	for _, device := range strings.FieldsFunc(app.GameInfo.DeviceType, func(r rune) bool {
+		return r == '、' || r == ',' || r == '，' || r == ';' || r == '；'
+	}) {
+		switch strings.ToLower(strings.TrimSpace(device)) {
+		case "手游":
+			names["docs-client"] = true
+		case "端游", "pc":
+			names["docs-pc"] = true
+		}
+	}
+	for _, id := range ids {
+		value, ok := id.(string)
+		if !ok || !slices.ContainsFunc(e.config.SearchTargets, func(target *types.SearchTarget) bool {
+			return target != nil && target.KnowledgeBaseID == value
+		}) {
+			return
+		}
+	}
+	for _, kb := range e.knowledgeBasesInfo {
+		if kb == nil || !names[kb.Name] || !slices.ContainsFunc(e.config.SearchTargets, func(target *types.SearchTarget) bool {
+			return target != nil && target.KnowledgeBaseID == kb.ID
+		}) || slices.Contains(ids, any(kb.ID)) {
+			continue
+		}
+		ids = append(ids, kb.ID)
+	}
+	args["knowledge_base_ids"] = ids
 }
 
 func (e *AgentEngine) prepareStructuredRetrievalCall(ctx context.Context, tc types.LLMToolCall, args map[string]any) (string, error) {
@@ -389,6 +489,9 @@ func (e *AgentEngine) reviewRetrieval(ctx context.Context, raw string) *types.To
 	if err != nil {
 		return &types.ToolResult{Success: false, Error: "Retrieval decision rejected: " + err.Error()}
 	}
+	if review.Status == retrievalNoProgress {
+		return &types.ToolResult{Success: true, Output: "No progress recorded for this fact. Reuse available evidence; a supplementary search requires a grounded lead and remaining allowance. If no further relevant lead remains, answer from supported evidence or follow the configured no-answer rules. Failed or unread sources are not evidence of absence."}
+	}
 	return &types.ToolResult{Success: true, Output: "Retrieval state updated; reassess the remaining fact using the preserved state and allowances. Complete any independent requests, recording their supported answers with satisfied before combining them with the necessary clarification. Stop only work that depends on missing fields."}
 }
 
@@ -488,6 +591,11 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 	statePrompt := "\n<retrieval_state>" + string(encoded) + "</retrieval_state>\n" +
 		fmt.Sprintf("<retrieval_scope>scope-%d</retrieval_scope>\n", slices.Index(s.Scopes, s.Scope)+1) +
 		"<retrieval_user_inputs>" + string(inputs) + "</retrieval_user_inputs>\n"
+	for _, gap := range s.Gaps {
+		if gap.Status == retrievalExhausted && retrievalScopeCovers(s.Scope, gap.Scope) {
+			statePrompt += fmt.Sprintf("For exhausted fact %s, compose from applicable evidence and follow the configured rules for unresolved parts; do not search unrelated sources. Continue any independent pending facts. ", gap.ID)
+		}
+	}
 	if e.runtimeRetrievalFor(s) {
 		statePrompt += "The ordinary search allowance is spent. Read an available document using its original arguments without retrieval metadata. "
 		for _, gap := range s.Gaps {
@@ -605,7 +713,7 @@ func (e *AgentEngine) retrievalCorrectionGuidance(step types.AgentStep) string {
 	}
 	const retained = " Existing successful observations remain usable. A rejected call does not establish missing user information and does not justify another search. Answer the supported question now if possible. If further work requires correction, correct only the reported decision once; preserve all stop and recovery limits."
 	if reviewOnly {
-		return "The retrieval review was rejected; no retrieval was attempted. A terminal review is not required to finish: answer from available evidence, or use the configured no-answer response if successful retrieval left no usable answer and no grounded next lead. Only if continuing work needs a corrected review, follow the reported error: progress, no_progress and exhausted_no_progress require the gap's last_call_id for its latest unreviewed successful observation; evidence quotes must belong to their cited calls. Do not search to repair a review." + retained
+		return "The retrieval review was rejected; no retrieval was attempted. A terminal review is not required to finish: answer from available evidence, or use the configured no-answer response if successful retrieval left no usable answer and no grounded next lead. Only if continuing work needs a corrected review, follow the reported error: progress, no_progress and exhausted_no_progress require the gap's last_call_id for its latest unreviewed successful observation; evidence quotes must belong to their cited calls. Do not search to repair a review. This review cannot substitute for an unread, omitted or unexecuted relevant source; complete needed retrieval or state the limitation, not a no-answer conclusion requiring completed verification." + retained
 	}
 	if readOnly {
 		return "The requested reading was not dispatched. Check whether its full answer or source range is already present; reuse that evidence. Only an observed, still-needed unread source/range warrants a corrected read." + retained

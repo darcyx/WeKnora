@@ -175,3 +175,67 @@ func TestRetrievalErrorAndDecisionBudgetsAreSeparate(t *testing.T) {
 	require.NoError(t, restored.observe("supplement", "permission denied", retrievalUnknown))
 	require.Equal(t, retrievalUnavailable, restored.snapshot().Gaps[0].Status)
 }
+
+func TestSupplementLeadMayUseEarlierApplicableObservation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		gap     string
+		scope   string
+		outcome retrievalOutcome
+		allow   bool
+	}{
+		{"same gap and scope", "gap-1", "scope", retrievalSuccess, true},
+		{"other gap", "gap-2", "scope", retrievalSuccess, false},
+		{"outside scope", "gap-1", "other", retrievalSuccess, false},
+		{"failed observation", "gap-1", "scope", retrievalUnknown, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newRetrievalControl("比较两种方式", "scope")
+			c.state.Gaps = []retrievalGap{{ID: "gap-1", Scope: "scope", Status: retrievalPending, LastCallID: "latest", LastReview: retrievalNoProgress}}
+			c.state.Attempts = []retrievalAttempt{
+				{ID: "earlier", GapID: tc.gap, Scope: tc.scope, Completed: true, Outcome: tc.outcome, Content: "有关格式见 topData 文档"},
+				{ID: "latest", GapID: "gap-1", Scope: "scope", Completed: true, Outcome: retrievalSuccess, Content: "另一份资料"},
+			}
+			err := c.acquire("gap-1", "supplement", retrievalSupplement, "topData 文档", "search_knowledge", `{}`)
+			if tc.allow {
+				require.NoError(t, err)
+				require.True(t, c.snapshot().Gaps[0].SupplementUsed)
+				require.NoError(t, c.observe("supplement", "未找到更多资料", retrievalSuccess))
+				require.NoError(t, c.review("gap-1", "supplement", retrievalNoProgress, nil))
+				require.Equal(t, retrievalExhausted, c.snapshot().Gaps[0].Status)
+				require.Error(t, c.acquire("gap-1", "again", retrievalSupplement, "topData 文档", "search_knowledge", `{}`))
+			} else {
+				require.ErrorContains(t, err, "no grounded supplementary")
+			}
+		})
+	}
+}
+
+func TestSupplementRejectsWholeCurrentQuestionButAllowsConcreteLead(t *testing.T) {
+	const question = "极光和腾讯推送鸿蒙可以使用吗？"
+	control := newRetrievalControl(question, "scope")
+	control.recordUserInput("message:current", question)
+	gap, err := control.register(retrievalFactProposal{GoalQuote: question, Fact: "鸿蒙推送支持情况"})
+	require.NoError(t, err)
+	require.NoError(t, control.acquire(gap, "initial", retrievalInitial, "", "search", `{}`))
+	require.NoError(t, control.observe("initial", "极光推送已接入；腾讯推送鸿蒙接入指南", retrievalSuccess))
+	require.NoError(t, control.review(gap, "initial", retrievalNoProgress, nil))
+	for _, lead := range []string{question, "极光和腾讯推送鸿蒙可以使用吗", "极光和腾讯推送鸿蒙可以使用吗?", " 极光和腾讯推送 鸿蒙可以使用吗？ "} {
+		require.ErrorContains(t, control.acquire(gap, "bad", retrievalSupplement, lead, "search", `{}`), "not a new supplementary lead")
+	}
+	require.False(t, control.snapshot().Gaps[0].SupplementUsed)
+	require.NoError(t, control.acquire(gap, "good", retrievalSupplement, "腾讯推送鸿蒙接入指南", "search", `{}`))
+}
+
+func TestSupplementRejectsUnchangedImperativeRequest(t *testing.T) {
+	const question = "查询 TPNS 鸿蒙支持情况"
+	control := newRetrievalControl(question, "scope")
+	control.recordUserInput("message:current", question)
+	gap, err := control.register(retrievalFactProposal{GoalQuote: question, Fact: "鸿蒙推送支持情况"})
+	require.NoError(t, err)
+	require.NoError(t, control.acquire(gap, "initial", retrievalInitial, "", "search", `{}`))
+	require.NoError(t, control.observe("initial", "TPNS 鸿蒙接入指南", retrievalSuccess))
+	require.NoError(t, control.review(gap, "initial", retrievalNoProgress, nil))
+	require.ErrorContains(t, control.acquire(gap, "bad", retrievalSupplement, question, "search", `{}`), "not a new supplementary lead")
+	require.NoError(t, control.acquire(gap, "good", retrievalSupplement, "TPNS", "search", `{}`))
+}

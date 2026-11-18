@@ -6,17 +6,34 @@ import (
 	"fmt"
 	"strings"
 
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
 const questionSearchGrace = 3
 
 func questionSearchGuidance() string {
-	return fmt.Sprintf("The first %d searches per user message may omit retrieval metadata and reviews. Answer as soon as the requested facts are supported. For a missing fact, read the returned source that addresses it. After ordinary searches are spent, follow the review, supplement and recovery rules; changing query, fact or library does not reset them. If successful retrieval leaves no grounded lead, answer the supported parts or use the configured no-answer response if none are supported. Finishing needs no review. Respect user-information and permission blockers; a tool failure is not evidence of absence.", questionSearchGrace)
+	return fmt.Sprintf("The first %d searches per user message may omit retrieval metadata and reviews. Answer as soon as the requested facts are supported. For a missing fact, read the returned source that addresses it. After a targeted search across relevant accessible sources returns no relevant evidence or grounded next lead, stop searching; answer supported parts and follow the configured rules for unresolved parts. Unrelated hits and placeholders are not progress or proof of absence. After ordinary searches are spent, follow the review, supplement and recovery rules; changing query, fact or library does not reset them. Finishing needs no review. Respect user-information and permission blockers; a tool failure is not evidence of absence.", questionSearchGrace)
 }
 
 func isBudgetedSearchTool(name string) bool {
 	return name == "search_knowledge" || name == "wiki_search" || name == "query_knowledge_graph"
+}
+
+const wikiParallelSearchError = "search_knowledge was not run: it was issued in the same turn as wiki_search without knowledge_base_ids or metadata. " +
+	"Use the wiki_search results first (read the matching Wiki page). Search the whole library in a later turn only if the Wiki leaves the fact unsupported, " +
+	"or restrict this search with knowledge_base_ids. No search allowance was used."
+
+// wikiShadowsSearch reports whether a call is an unscoped library search that
+// must not run alongside wiki_search in the same turn. A search restricted by
+// knowledge base or metadata is a deliberate source choice and stays allowed.
+func wikiShadowsSearch(name string, args map[string]any) bool {
+	if name != agenttools.ToolSearchKnowledge && name != agenttools.LegacyToolKnowledgeSearch {
+		return false
+	}
+	kbs, _ := args["knowledge_base_ids"].([]any)
+	metadata, _ := args["metadata"].(map[string]any)
+	return len(kbs) == 0 && len(metadata) == 0
 }
 
 // Accepted user messages and ask_user answers have stable IDs across a resume.

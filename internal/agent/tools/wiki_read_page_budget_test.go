@@ -119,29 +119,53 @@ func TestWikiReadPageKeepsSmallPagesIntactBesideLargeOnes(t *testing.T) {
 
 // Inlining a full summary for every neighbour costs one query each and used to
 // consume more budget than the bodies the caller actually asked for.
-func TestWikiReadPageCapsInlinedLinkSummaries(t *testing.T) {
-	page := newTestWikiPage("kb-1", "concept/hub")
-	pages := map[string]*types.WikiPage{wikiPageKey("kb-1", "concept/hub"): page}
-	for i := 0; i < 40; i++ {
-		slug := fmt.Sprintf("entity/neighbour-%02d", i)
-		page.OutLinks = append(page.OutLinks, slug)
-		neighbour := newTestWikiPage("kb-1", slug)
-		neighbour.Summary = "NEIGHBOUR_SUMMARY " + strings.Repeat("y", 500)
-		pages[wikiPageKey("kb-1", slug)] = neighbour
+// Listing every remaining bare slug of a hub page (80+ links) still cost
+// thousands of tokens, so each section is capped at wikiMaxLinkSlugs entries.
+func TestWikiReadPageCapsLinkSections(t *testing.T) {
+	tests := []struct {
+		name      string
+		links     int
+		wantShown int
+		wantNote  string
+	}{
+		{name: "hub page is capped", links: 100, wantShown: wikiMaxLinkSlugs,
+			wantNote: fmt.Sprintf("(+%d more links omitted;", 100-wikiMaxLinkSlugs)},
+		{name: "small page is unchanged", links: 10, wantShown: 10},
 	}
-	service := &fakeWikiPageService{pages: pages}
-	tool := NewWikiReadPageTool(service, nil, NewWikiScopesFromKBIDs([]string{"kb-1"}), NewWikiRouteResolver())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			page := newTestWikiPage("kb-1", "concept/hub")
+			pages := map[string]*types.WikiPage{wikiPageKey("kb-1", "concept/hub"): page}
+			for i := 0; i < tt.links; i++ {
+				out := fmt.Sprintf("entity/out-%03d", i)
+				in := fmt.Sprintf("entity/in-%03d", i)
+				page.OutLinks = append(page.OutLinks, out)
+				page.InLinks = append(page.InLinks, in)
+				neighbour := newTestWikiPage("kb-1", out)
+				neighbour.Summary = "NEIGHBOUR_SUMMARY " + strings.Repeat("y", 500)
+				pages[wikiPageKey("kb-1", out)] = neighbour
+			}
+			tool := NewWikiReadPageTool(&fakeWikiPageService{pages: pages}, nil,
+				NewWikiScopesFromKBIDs([]string{"kb-1"}), NewWikiRouteResolver())
 
-	result := readPageOutput(t, context.Background(), tool, []string{"concept/hub"})
+			result := readPageOutput(t, context.Background(), tool, []string{"concept/hub"})
 
-	assert.Equal(t, wikiMaxLinkSummaries, strings.Count(result.Output, "NEIGHBOUR_SUMMARY"),
-		"only the first %d neighbour summaries may be inlined", wikiMaxLinkSummaries)
-	for i := 0; i < 40; i++ {
-		assert.Contains(t, result.Output, fmt.Sprintf("[[entity/neighbour-%02d]]", i),
-			"every neighbour slug stays visible even without its summary")
+			assert.Equal(t, min(wikiMaxLinkSummaries, tt.links), strings.Count(result.Output, "NEIGHBOUR_SUMMARY"),
+				"only the first %d neighbour summaries may be inlined", wikiMaxLinkSummaries)
+			assert.NotContains(t, result.Output, strings.Repeat("y", wikiLinkSummaryMaxRunes+1),
+				"each inlined summary must be capped")
+			assert.Equal(t, tt.wantShown, strings.Count(result.Output, "[[entity/out-"))
+			assert.Equal(t, tt.wantShown, strings.Count(result.Output, "[[entity/in-"))
+			for i := 0; i < tt.wantShown; i++ {
+				assert.Contains(t, result.Output, fmt.Sprintf("[[entity/out-%03d]]", i))
+			}
+			if tt.wantNote == "" {
+				assert.NotContains(t, result.Output, "more links omitted")
+				return
+			}
+			assert.Equal(t, 2, strings.Count(result.Output, tt.wantNote), "one note per link section")
+		})
 	}
-	assert.NotContains(t, result.Output, strings.Repeat("y", wikiLinkSummaryMaxRunes+1),
-		"each inlined summary must be capped")
 }
 
 // The same slug arriving twice used to be resolved and rendered twice, spending
@@ -172,4 +196,130 @@ func TestWikiReadSingleAmbiguousSlugDoesNotSuggestFewerSlugs(t *testing.T) {
 	result := readPageOutput(t, WithOutputBudget(context.Background(), 2000), tool, []string{"index"})
 	assert.NotContains(t, result.Output, "fewer slugs")
 	assert.Contains(t, result.Output, "knowledge_base_ids")
+}
+
+func TestWikiReadPageReservesBodyWhenRelationshipsExhaustBudget(t *testing.T) {
+	page := newBulkyWikiPage("kb-platform", "entity/taptap", 2500)
+	pending := pendingWikiPage{page: page, kbID: "kb-platform", body: "TAPTAP EVIDENCE " + strings.Repeat("x", 2500),
+		outLinks: []string{strings.Repeat("related ", 1200)}, inLinks: []string{strings.Repeat("incoming ", 600)}, sources: []string{`<source knowledge_id="doc-1"/>`}}
+	out, _, omitted := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 5000)
+	require.Contains(t, out, "TAPTAP EVIDENCE")
+	require.Contains(t, out, "kb-platform")
+	require.Contains(t, out, "doc-1")
+	require.Contains(t, out, "relationships omitted for output budget")
+	require.NotContains(t, out, "body omitted: output budget exhausted")
+	require.Empty(t, omitted)
+	require.LessOrEqual(t, utf8.RuneCountInString(out), 5000)
+}
+
+func TestWikiBudgetKeepsSameSlugSourcesDistinctAndEmptyBodyHonest(t *testing.T) {
+	first := newTestWikiPage("kb-a", "entity/taptap")
+	second := newTestWikiPage("kb-b", "entity/taptap")
+	pages := []pendingWikiPage{
+		{page: first, kbID: "kb-a", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="a"/>`}, body: "甲知识正文" + strings.Repeat("甲", 1000)},
+		{page: second, kbID: "kb-b", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="b"/>`}, body: "乙知识正文" + strings.Repeat("乙", 1000)},
+	}
+	out, _, omitted := renderWikiPagesWithinBudget(pages, 6000)
+	require.Empty(t, omitted)
+	for _, want := range []string{"kb-a", "kb-b", `knowledge_id="a"`, `knowledge_id="b"`, "甲知识正文", "乙知识正文"} {
+		require.Contains(t, out, want)
+	}
+	require.LessOrEqual(t, utf8.RuneCountInString(out), 6000)
+	out, truncated, _ := renderWikiPagesWithinBudget([]pendingWikiPage{{page: first, kbID: "kb-a", body: ""}}, 5000)
+	require.Empty(t, truncated)
+	require.NotContains(t, out, "body omitted")
+}
+
+func TestWikiBudgetKeepsFirstBodyWhenManyPagesExceedBudget(t *testing.T) {
+	var pages []pendingWikiPage
+	for i := 0; i < 12; i++ {
+		slug := fmt.Sprintf("entity/page-%d", i)
+		page := newTestWikiPage("kb-a", slug)
+		pages = append(pages, pendingWikiPage{page: page, kbID: "kb-a", body: "PAGE EVIDENCE " + strings.Repeat("正", 1000), outLinks: []string{strings.Repeat("关系", 3000)}, sources: []string{`<source knowledge_id="doc-1"/>`}})
+	}
+	out, _, omitted := renderWikiPagesWithinBudget(pages, 5000)
+	require.Contains(t, out, "PAGE EVIDENCE")
+	require.Contains(t, out, `knowledge_id="doc-1"`)
+	require.NotEmpty(t, omitted)
+	require.LessOrEqual(t, utf8.RuneCountInString(out), 5000)
+}
+
+func TestWikiSeenSummariesOnlyAfterRenderedForCorrectKB(t *testing.T) {
+	parentA := newTestWikiPage("kb-a", "entity/parent-a")
+	parentA.Content = strings.Repeat("正文", 900)
+	parentA.OutLinks = []string{"entity/target"}
+	for i := 0; i < 14; i++ {
+		parentA.OutLinks = append(parentA.OutLinks, fmt.Sprintf("entity/very-long-neighbour-%03d-%s", i, strings.Repeat("x", 35)))
+	}
+	parentB := newTestWikiPage("kb-a", "entity/parent-b")
+	parentB.OutLinks = []string{"entity/target"}
+	parentD := newTestWikiPage("kb-a", "entity/parent-d")
+	parentD.OutLinks = []string{"entity/target"}
+	parentC := newTestWikiPage("kb-b", "entity/parent-c")
+	parentC.OutLinks = []string{"entity/target"}
+	targetA := newTestWikiPage("kb-a", "entity/target")
+	targetA.Summary = "TARGET A VISIBLE SUMMARY"
+	targetB := newTestWikiPage("kb-b", "entity/target")
+	targetB.Summary = "TARGET B VISIBLE SUMMARY"
+	pages := map[string]*types.WikiPage{}
+	for _, p := range []*types.WikiPage{parentA, parentB, parentC, parentD, targetA, targetB} {
+		pages[wikiPageKey(p.KnowledgeBaseID, p.Slug)] = p
+	}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: pages}, nil, NewWikiScopesFromKBIDs([]string{"kb-a", "kb-b"}), NewWikiRouteResolver())
+	first := readPageOutput(t, WithOutputBudget(context.Background(), 1400), tool, []string{"entity/parent-a"})
+	require.Contains(t, first.Output, "relationships omitted for output budget")
+	require.NotContains(t, first.Output, targetA.Summary)
+	second := readPageOutput(t, context.Background(), tool, []string{"entity/parent-b"})
+	require.Contains(t, second.Output, targetA.Summary, "a suppressed summary must not become seen")
+	third := readPageOutput(t, context.Background(), tool, []string{"entity/parent-c"})
+	require.Contains(t, third.Output, targetB.Summary, "a different KB must not inherit seen state")
+	fourth := readPageOutput(t, context.Background(), tool, []string{"entity/parent-d"})
+	require.Contains(t, fourth.Output, "summary omitted, already seen", "visible summaries should still be deduplicated")
+}
+
+func TestWikiOmittedPageDoesNotMarkSummarySeen(t *testing.T) {
+	first := newTestWikiPage("kb-a", "entity/first")
+	first.Content = strings.Repeat("A", 1500)
+	second := newTestWikiPage("kb-a", "entity/second")
+	second.OutLinks = []string{"entity/target"}
+	second.Summary = "OMITTED PAGE SUMMARY"
+	second.Content = strings.Repeat("B", 1500)
+	parent := newTestWikiPage("kb-a", "entity/later")
+	parent.OutLinks = []string{"entity/target", second.Slug}
+	target := newTestWikiPage("kb-a", "entity/target")
+	target.Summary = "NOT YET VISIBLE"
+	pages := map[string]*types.WikiPage{}
+	for _, p := range []*types.WikiPage{first, second, parent, target} {
+		pages[wikiPageKey(p.KnowledgeBaseID, p.Slug)] = p
+	}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: pages}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 1200), tool, []string{first.Slug, second.Slug})
+	require.Contains(t, result.Output, "<omitted_pages")
+	require.NotContains(t, result.Output, target.Summary)
+	next := readPageOutput(t, context.Background(), tool, []string{parent.Slug})
+	require.Contains(t, next.Output, target.Summary)
+	require.Contains(t, next.Output, second.Summary, "a wholly omitted page must not be marked seen")
+}
+
+func TestWikiRegistryTruncationDoesNotMarkSummariesSeen(t *testing.T) {
+	first := newTestWikiPage("kb-a", "entity/first")
+	first.OutLinks = []string{"entity/target"}
+	later := newTestWikiPage("kb-a", "entity/later")
+	later.OutLinks = []string{"entity/target"}
+	target := newTestWikiPage("kb-a", "entity/target")
+	target.Summary = "SUMMARY MUST REMAIN AVAILABLE"
+	pages := map[string]*types.WikiPage{}
+	for _, p := range []*types.WikiPage{first, later, target} {
+		pages[wikiPageKey(p.KnowledgeBaseID, p.Slug)] = p
+	}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: pages}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+	slugs := []string{first.Slug}
+	for i := 0; i < 80; i++ {
+		slugs = append(slugs, fmt.Sprintf("entity/missing-%03d", i))
+	}
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 1200), tool, slugs)
+	require.Greater(t, utf8.RuneCountInString(result.Output), 1200, "error trailer must trigger registry truncation")
+	require.Contains(t, result.Output, target.Summary, "the raw output alone would otherwise mark this summary seen")
+	next := readPageOutput(t, context.Background(), tool, []string{later.Slug})
+	require.Contains(t, next.Output, target.Summary, "a possibly truncated result must not commit seen state")
 }

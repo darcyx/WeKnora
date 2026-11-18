@@ -309,8 +309,17 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 		"[Tool][SearchKnowledge] query=%q mode=%s limit=%d top_k=%d targets=%d kbs=%d",
 		query, mode, limit, topK, len(searchTargets), len(kbIDs))
 
-	allResults, searchFailures, searchCalls, embedFallbacks, _ := t.concurrentSearchByTargets(ctx, query, mode,
+	allResults, searchFailures, searchCalls, embedFallbacks, completed := t.concurrentSearchByTargets(ctx, query, mode,
 		kbModes, searchTargets, kbList, topK, vectorThreshold, keywordThreshold, kbTypeMap)
+	completedIDs := completed.GetAllKnowledgeBaseIDs()
+	var skipped []map[string]interface{}
+	for _, kb := range kbList {
+		if kb != nil {
+			if _, searchable := kbModes[kb.ID]; !searchable {
+				skipped = append(skipped, map[string]interface{}{"knowledge_base_id": kb.ID, "reason": "no chunk index; use a wiki or graph tool"})
+			}
+		}
+	}
 	failureMessages := make([]string, 0, len(searchFailures))
 	for _, failure := range searchFailures {
 		failureMessages = append(failureMessages, fmt.Sprintf("%v: %v", failure.KnowledgeBaseIDs, failure.Cause))
@@ -326,7 +335,11 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	if searchCalls > 0 && len(searchFailures) >= searchCalls {
 		msg := "Knowledge search failed: " + strings.Join(failureMessages, "; ") +
 			". The knowledge bases were not searched, so this is not evidence that they lack the answer."
-		return &types.ToolResult{Success: false, Output: msg, Error: msg, RetrievalFailures: searchFailures}, nil
+		if len(skipped) > 0 {
+			msg += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
+		}
+		return &types.ToolResult{Success: false, Output: msg, Error: msg,
+			Data: map[string]interface{}{"skipped_knowledge_bases": skipped}, RetrievalFailures: searchFailures}, nil
 	}
 
 	deduplicated := t.deduplicateResultsForRerank(allResults)
@@ -394,7 +407,10 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 		}
 	}
 
-	result, omitted := t.formatWithinBudget(ctx, final, kbIDs, query, mode)
+	result, omitted := t.formatWithinBudget(ctx, final, completedIDs, query, mode)
+	if len(skipped) > 0 {
+		result.Data["skipped_knowledge_bases"] = skipped
+	}
 	if omitted > 0 {
 		result.Data["omitted_for_budget"] = omitted
 	}
@@ -423,7 +439,11 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 			if len(rows) > limit {
 				rows = rows[:limit]
 			}
-			recovered, omitted := t.formatWithinBudget(ctx, rows, kbIDs, query, mode)
+			recovered, omitted := t.formatWithinBudget(ctx, rows, completedIDs, query, mode)
+			if len(skipped) > 0 {
+				recovered.Data["skipped_knowledge_bases"] = skipped
+				recovered.Output += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
+			}
 			t.attachContextImages(ctx, recovered, rows[:len(rows)-omitted])
 			return recovered, nil
 		}
@@ -431,7 +451,10 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 	t.attachSearchRecovery(result, query, mode, limit)
 	if len(final) == 0 {
-		result.Output = emptySearchStatement(query, result.Data, len(kbIDs))
+		result.Output = emptySearchStatement(query, result.Data, len(completedIDs))
+	}
+	if len(skipped) > 0 {
+		result.Output += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
 	}
 	return result, nil
 }
@@ -1162,7 +1185,12 @@ func writeKnowledgeMetadataHeader(ob *strings.Builder, results []*searchResultWi
 			xmlEscape(result.KnowledgeBaseID),
 			xmlEscape(result.KnowledgeTitle),
 		)
-		fmt.Fprintf(&documents, "<metadata>%s</metadata>\n", xmlEscape(result.KnowledgeCustomMetadata))
+		metadata := []rune(result.KnowledgeCustomMetadata)
+		if len(metadata) > 1024 {
+			fmt.Fprintf(&documents, "<metadata truncated=\"true\">%s</metadata>\n", xmlEscape(string(metadata[:1024])))
+		} else {
+			fmt.Fprintf(&documents, "<metadata>%s</metadata>\n", xmlEscape(result.KnowledgeCustomMetadata))
+		}
 		documents.WriteString("</document>\n")
 	}
 	if !hasMetadata {

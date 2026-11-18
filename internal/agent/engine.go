@@ -95,6 +95,7 @@ type AgentEngine struct {
 	retrievalPrevious        json.RawMessage
 	retrievalSave            func(context.Context, json.RawMessage) error
 	retrievalTurnID          string
+	turnHasWikiSearch        bool // the tool calls being executed include wiki_search
 	retrievalUserMessage     struct{ id, text string }
 	// steerSink, when set, lets users append messages into the running turn.
 	// Drained at every round boundary; nil disables mid-run injection.
@@ -1647,7 +1648,7 @@ func (e *AgentEngine) runReActIteration(
 			*messagesPtr = append(*messagesPtr, chat.Message{Role: "system", Content: e.retrievalCorrectionGuidance(step)})
 		} else {
 			*messagesPtr = append(*messagesPtr, chat.Message{Role: "system", Content: "Retrieval decision correction is exhausted. No further retrieval is allowed in this run. " +
-				"Use only available evidence, ask for necessary information, or state the unresolved limitation. Do not present an unfinished task as completed."})
+				"Use only available evidence, ask for necessary information, or state the unresolved limitation. An unread, omitted or unexecuted relevant source is not a completed search; do not use a no-answer response that requires completed verification. Do not present an unfinished task as completed."})
 			if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, *messagesPtr); err != nil {
 				return iterOutcomeBreak, err
 			}

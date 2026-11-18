@@ -17,6 +17,93 @@ type scopedSearchFailureService struct {
 	failures map[string]error
 }
 
+type mixedIndexSearchService struct {
+	stubKnowledgeBaseService
+	rows    []*types.SearchResult
+	failAll bool
+}
+
+func (s *mixedIndexSearchService) GetKnowledgeBasesByIDsOnly(context.Context, []string) ([]*types.KnowledgeBase, error) {
+	return []*types.KnowledgeBase{
+		kbWithIndexes("ordinary", true, true, types.KnowledgeBaseTypeDocument),
+		kbWithIndexes("00000000-0000-0000-0000-000000000002", false, false, types.KnowledgeBaseTypeDocument),
+	}, nil
+}
+
+func (s *mixedIndexSearchService) HybridSearch(_ context.Context, id string, _ types.SearchParams) ([]*types.SearchResult, error) {
+	if s.failAll || id == "bad" {
+		return nil, context.DeadlineExceeded
+	}
+	return s.rows, nil
+}
+
+func TestSearchKnowledgeReportsSkippedWikiWhenOtherSearchFails(t *testing.T) {
+	tool := NewSearchKnowledgeTool(&mixedIndexSearchService{failAll: true}, nil, nil, types.SearchTargets{
+		{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "ordinary"},
+		{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "00000000-0000-0000-0000-000000000002"},
+	}, nil, nil)
+	result, err := tool.Execute(t.Context(), json.RawMessage(`{"query":"payment","mode":"keyword"}`))
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Contains(t, result.Output, "not evidence")
+	require.Contains(t, result.Output, "knowledge bases were not searched")
+	modelOutput := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolSearchKnowledge, result)
+	require.Contains(t, modelOutput, "wiki or graph tool")
+	require.NotContains(t, modelOutput, "00000000-0000-0000-0000-000000000002")
+}
+
+func TestSearchKnowledgePreservesSkippedWikiUnderOutputBudget(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail=%t", fail), func(t *testing.T) {
+			tool := NewSearchKnowledgeTool(&mixedIndexSearchService{failAll: fail}, nil, nil, types.SearchTargets{
+				{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "ordinary"},
+				{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "00000000-0000-0000-0000-000000000002"},
+			}, nil, nil)
+			registry := NewToolRegistry()
+			registry.SetMaxToolOutputSize(100)
+			registry.RegisterTool(tool)
+			result, err := registry.ExecuteTool(t.Context(), ToolSearchKnowledge, json.RawMessage(`{"query":"payment","mode":"keyword"}`))
+			require.NoError(t, err)
+			modelOutput := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolSearchKnowledge, result)
+			require.Contains(t, modelOutput, "was not searched")
+			require.Contains(t, modelOutput, "wiki or graph tool")
+			require.NotContains(t, modelOutput, "00000000-0000-0000-0000-000000000002")
+		})
+	}
+}
+
+func TestSearchKnowledgeReportsSkippedWikiAlongsideActualResults(t *testing.T) {
+	for _, hit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hit=%t", hit), func(t *testing.T) {
+			svc := &mixedIndexSearchService{}
+			if hit {
+				svc.rows = []*types.SearchResult{{ID: "00000000-0000-0000-0000-000000000003", KnowledgeID: "00000000-0000-0000-0000-000000000004", KnowledgeBaseID: "ordinary", Content: "Payment setup", Score: 0.9}}
+			}
+			tool := NewSearchKnowledgeTool(svc, nil, nil, types.SearchTargets{
+				{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "ordinary"},
+				{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "00000000-0000-0000-0000-000000000002"},
+				{Type: types.SearchTargetTypeKnowledge, KnowledgeBaseID: "bad", KnowledgeIDs: []string{"doc-bad"}},
+			}, nil, nil)
+			result, err := tool.Execute(t.Context(), json.RawMessage(`{"query":"payment","mode":"keyword"}`))
+			require.NoError(t, err)
+			require.True(t, result.Success)
+			require.Equal(t, []string{"ordinary"}, result.Data["knowledge_base_ids"])
+			require.Len(t, result.RetrievalFailures, 1)
+			require.Contains(t, result.Output, "knowledge bases were not searched")
+			modelOutput := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolSearchKnowledge, result)
+			require.Contains(t, modelOutput, "was not searched")
+			require.Contains(t, modelOutput, "wiki or graph tool")
+			if hit {
+				require.Contains(t, modelOutput, "Payment setup")
+				require.Contains(t, modelOutput, "partial_failure")
+			} else {
+				require.Contains(t, modelOutput, "in 1 knowledge base(s)")
+				require.Contains(t, modelOutput, "could not be searched")
+			}
+		})
+	}
+}
+
 func (s *scopedSearchFailureService) HybridSearch(_ context.Context, id string, _ types.SearchParams) ([]*types.SearchResult, error) {
 	if err := s.failures[id]; err != nil {
 		return nil, fmt.Errorf("retrieval adapter: %w", err)

@@ -396,6 +396,24 @@ func TestModelOutputRendersKnowledgeMetadataOncePerDocument(t *testing.T) {
 	require.Equal(t, 2, strings.Count(output, "<chunk "))
 }
 
+func TestModelOutputLimitsLargeKnowledgeMetadata(t *testing.T) {
+	metadata := strings.Repeat("资料", 20000)
+	result := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results",
+		"results": []map[string]interface{}{{
+			"chunk_id": "chunk-1", "knowledge_id": "doc-1", "knowledge_base_id": "kb-1",
+			"knowledge_title": "Glossary", "source_url": "https://example.com/doc",
+			"knowledge_metadata": metadata, "content": "matched evidence",
+		}},
+	}}
+	output := newSourceRegistry().ModelOutput(result)
+	require.Contains(t, output, `<metadata truncated="true">`+strings.Repeat("资料", 512)+`</metadata>`)
+	require.Contains(t, output, `title="Glossary"`)
+	require.Contains(t, output, `source_url="https://example.com/doc"`)
+	require.Contains(t, output, `<content>matched evidence</content>`)
+	require.Equal(t, metadata, result.Data["results"].([]map[string]interface{})[0]["knowledge_metadata"])
+}
+
 func TestModelOutputWebAliasExpandsToWebCitation(t *testing.T) {
 	registry := newSourceRegistry()
 	output := registry.ModelOutput(&types.ToolResult{

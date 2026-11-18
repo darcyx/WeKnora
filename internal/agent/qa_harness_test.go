@@ -31,7 +31,7 @@ import (
 // guard below is tied to a scenario that fails without it.
 
 const (
-	harnessQuery = "TapTap 沙盒支付怎么配置"
+	harnessQuery = "taptap沙盒支付怎么设置"
 	harnessKB    = "kb"
 )
 

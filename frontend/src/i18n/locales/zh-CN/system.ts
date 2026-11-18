@@ -1,4 +1,47 @@
 export default {
+  tokenQuotaSettings: {
+    title: "Token 配额",
+    description: "查看和管理 API 集成外部用户的 Token 使用量与配额。",
+    identityHint: "配额按空间和外部用户 ID 分别计算，周期按 UTC 时间。",
+    tenantId: "空间 ID",
+    tenantIdPlaceholder: "请输入空间 ID",
+    tenantIdRequired: "请输入空间 ID",
+    tenantIdInvalid: "空间 ID 必须是数字",
+    subjectId: "外部用户 ID",
+    subjectIdPlaceholder: "请输入外部用户 ID",
+    subjectIdRequired: "请输入外部用户 ID",
+    query: "查询",
+    listUsers: "列出用户",
+    usersTitle: "外部用户",
+    usersDescription: "选择用户查看或调整配额，也可直接查询尚未出现的用户。",
+    previousPage: "上一页",
+    nextPage: "下一页",
+    pageInfo: "第 {page} 页，共 {total} 位用户",
+    dailyUsage: "今日使用",
+    monthlyUsage: "本月使用",
+    reservedTokens: "预占 Token",
+    reservedHint: "进行中的请求预留的 Token 数。",
+    unlimited: "不限制",
+    limitValue: "上限：{value}",
+    overrideTitle: "用户覆盖配额",
+    overrideDescription: "为该用户单独设置上限，留空则继承平台默认值。",
+    overridden: "已覆盖",
+    inheriting: "继承默认值",
+    dailyLimit: "每日上限",
+    monthlyLimit: "每月上限",
+    inheritPlaceholder: "继承默认值",
+    limitHint: "0 表示不限制；留空表示继承默认值。",
+    reset: "恢复默认",
+    resetConfirm: "确定删除该用户的配额覆盖并恢复平台默认值吗？",
+    save: "保存",
+    noData: "输入空间 ID 和外部用户 ID 后查询配额。",
+    loadFailed: "加载配额失败",
+    overrideRequired: "请至少设置一项覆盖值",
+    saveSuccess: "配额已保存",
+    saveFailed: "保存配额失败",
+    resetSuccess: "已恢复默认配额",
+    resetFailed: "恢复默认配额失败",
+  },
   documentProgress: {
     queueView: '队列任务',
     title: '资料与 Wiki 进度',
@@ -313,6 +356,11 @@ export default {
         }
       },
       keyDescriptions: {
+        token_quota: {
+          default_daily_limit: "API 集成外部用户的默认每日 Token 上限（UTC 自然日）。0 表示不限制；用户覆盖值优先，修改立即生效。",
+          default_monthly_limit: "API 集成外部用户的默认每月 Token 上限（UTC 自然月）。0 表示不限制；用户覆盖值优先，修改立即生效。",
+          max_completion_tokens: "未指定 max_tokens 时，用于额度预占和模型调用的最大输出 Token 数。必须为正整数；较小值减少预占，但也会限制回答长度。",
+        },
         model: {
           max_concurrency: '后台任务（文档入库/富化）对单个模型的默认并发上限，按模型 ID 全副本共享。每次调用实时读取，修改后立即生效、无需重启。0 或负数表示关闭默认限制（各模型仍会尊重自身在模型管理里配置的上限）。仅影响后台任务，不影响交互式对话。'
         },
@@ -345,6 +393,11 @@ export default {
         }
       },
       keyLabels: {
+        token_quota: {
+          default_daily_limit: "默认每日 Token 上限",
+          default_monthly_limit: "默认每月 Token 上限",
+          max_completion_tokens: "默认最大输出 Token 数",
+        },
         model: {
           max_concurrency: '模型默认并发上限'
         },

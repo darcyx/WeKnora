@@ -9,6 +9,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
+// faqCandidateLimit caps FAQ retrieval candidates independently of the
+// document-search topK configuration.
+const faqCandidateLimit = 10
+
 // FAQSearchError marks an incomplete candidate set while retaining each actual
 // failed scope and cause. Returned matches remain evidence, not a unique answer.
 type FAQSearchError struct {
@@ -157,6 +161,9 @@ func (t *SearchKnowledgeTool) FindFAQCandidates(ctx context.Context, query strin
 		return result, faqSearchError(failures, nil, "", nil)
 	}
 	topK, vectorThreshold, keywordThreshold := t.retrievalParams(8)
+	// FAQ answers need only a handful of items; a smaller pool keeps rerank and
+	// the FAQ-coverage judge prompt small.
+	topK = min(topK, faqCandidateLimit)
 	rows, searchFailures, _, _, completed := t.concurrentSearchByTargets(ctx, query, SearchModeSemantic, modes, targets, faqKBs, topK, vectorThreshold, keywordThreshold, typesByID)
 	result.CompletedTargets = completed
 	failures = append(failures, searchFailures...)

@@ -581,6 +581,7 @@ export default {
     }
   },
   settings: {
+    tokenQuotas: "토큰 할당량",
     modelManagement: '모델 관리',
     webSearchConfig: '웹 검색',
     autoCheckUpdate: '업데이트 자동 다운로드',

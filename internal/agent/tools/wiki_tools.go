@@ -325,6 +325,10 @@ const (
 	// of the output budget than the page bodies the caller asked for.
 	wikiMaxLinkSummaries    = 3
 	wikiLinkSummaryMaxRunes = 150
+	// wikiMaxLinkSlugs bounds how many entries a link section lists at all. Hub
+	// pages carry 80+ links, and listing every bare slug cost thousands of
+	// tokens per read; the rest are summarised by a single omission note.
+	wikiMaxLinkSlugs = 15
 
 	// wikiMinPageBody is the smallest body slice worth rendering. When the
 	// budget cannot give every resolved page at least this much, trailing pages
@@ -411,6 +415,40 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, [
 	usable := budget - wikiBudgetReserve
 	if usable <= 0 || total <= usable {
 		return strings.Join(rendered, separator), nil, nil
+	}
+
+	// Relationships can be much larger than the page itself. Reserve space for
+	// actual evidence before treating auxiliary links as fixed overhead. Work on
+	// copies so another rendering does not lose the original metadata.
+	pages = append([]pendingWikiPage(nil), pages...)
+	perPage := (budget - wikiBudgetReserve) / len(pages)
+	for i := range pages {
+		p := &pages[i]
+		bodyFloor := min(wikiMinPageBody, utf8.RuneCountInString(p.body))
+		maxOverhead := perPage - bodyFloor
+		overhead := func() int { return utf8.RuneCountInString(p.render("")) }
+		if overhead() > maxOverhead {
+			p.outLinks = []string{"(relationships omitted for output budget)"}
+			p.inLinks = []string{"(relationships omitted for output budget)"}
+		}
+		if overhead() > maxOverhead {
+			if len(p.sources) > 1 {
+				p.sources = []string{p.sources[0], "(additional sources omitted for output budget)"}
+			}
+		}
+		if overhead() > maxOverhead {
+			page := *p.page
+			page.Summary = truncateRunes(page.Summary, 150)
+			if len(page.Aliases) > 3 {
+				page.Aliases = page.Aliases[:3]
+			}
+			p.page = &page
+		}
+	}
+
+	for i, p := range pages {
+		rendered[i] = p.render(p.body)
+		overheads[i] = utf8.RuneCountInString(rendered[i]) - bodySizes[i]
 	}
 
 	fixedCost := func(keep int) int {
@@ -547,11 +585,18 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 	// multiple KBs when the agent has several wiki KBs in scope.
 	foundKBs := make(map[string][]string)
 
-	formatLinks := func(slugs []string, kbID string) []string {
+	type visibleSummary struct{ kbID, owner, key, fragment string }
+	var summaries []visibleSummary
+	formatLinks := func(slugs []string, kbID, owner string) []string {
 		var descs []string
 		inlined := 0
+		omitted := 0
 		for _, s := range slugs {
 			if s == "" {
+				continue
+			}
+			if len(descs) >= wikiMaxLinkSlugs {
+				omitted++
 				continue
 			}
 			// Past the cap the slug alone is enough: the model can always read
@@ -577,11 +622,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				descs = append(descs, fmt.Sprintf("[[%s]]", s))
 				continue
 			}
-			descs = append(descs, fmt.Sprintf("[[%s]] (%s)", s, truncateRunes(linkPage.Summary, wikiLinkSummaryMaxRunes)))
+			fragment := fmt.Sprintf("[[%s]] (%s)", s, truncateRunes(linkPage.Summary, wikiLinkSummaryMaxRunes))
+			descs = append(descs, fragment)
+			summaries = append(summaries, visibleSummary{kbID, owner, key, fragment})
 			inlined++
-			t.mu.Lock()
-			t.seenLinks[key] = true
-			t.mu.Unlock()
+		}
+		if omitted > 0 {
+			descs = append(descs, fmt.Sprintf("(+%d more links omitted; use wiki_search or read a neighbour page to explore)", omitted))
 		}
 		if len(descs) == 0 {
 			return []string{"(none)"}
@@ -596,9 +643,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		resolved := pendingWikiPage{
 			page:     page,
 			kbID:     kbID,
-			outLinks: formatLinks(page.OutLinks, kbID),
-			inLinks:  formatLinks(page.InLinks, kbID),
+			outLinks: formatLinks(page.OutLinks, kbID, page.Slug),
+			inLinks:  formatLinks(page.InLinks, kbID, page.Slug),
 			body:     page.Content,
+		}
+
+		if page.Summary != "" {
+			summaries = append(summaries, visibleSummary{kbID, page.Slug, seenLinkKey(kbID, page.Slug), "<summary>\n" + page.Summary + "\n</summary>"})
 		}
 
 		for _, ref := range page.SourceRefs {
@@ -710,9 +761,6 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				// echoes a link like `[[summary/xyz]]` from this page's body,
 				// the frontend can resolve it to the same KB without guessing.
 				registerLinkedSlugs(foundKBs, page, actualKBID)
-				t.mu.Lock()
-				t.seenLinks[seenLinkKey(actualKBID, slug)] = true
-				t.mu.Unlock()
 			}
 		}
 
@@ -767,6 +815,27 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				"\n<note>Ambiguous slug: '%s' also exists in allowed KB %v, not rendered because of knowledge_base_ids.</note>",
 				slug, kbs,
 			)
+		}
+	}
+
+	// Only mark summaries that survive both page-budget rendering and the
+	// registry's final output cap. Omitted pages and omitted relationship
+	// sections must remain eligible to show their summaries on a later read.
+	// Registry head/tail truncation can join unrelated page fragments. In that
+	// case conservatively leave all summaries eligible for a future read.
+	if utf8.RuneCountInString(finalOutput) <= OutputBudget(ctx) {
+		for _, pageBlock := range strings.Split(finalOutput, "<wiki_page>") {
+			if !strings.Contains(pageBlock, "</wiki_page>") {
+				continue
+			}
+			for _, summary := range summaries {
+				if strings.Contains(pageBlock, "<knowledge_base_id>"+summary.kbID+"</knowledge_base_id>") &&
+					strings.Contains(pageBlock, "<link>[["+summary.owner+"|") && strings.Contains(pageBlock, summary.fragment) {
+					t.mu.Lock()
+					t.seenLinks[summary.key] = true
+					t.mu.Unlock()
+				}
+			}
 		}
 	}
 

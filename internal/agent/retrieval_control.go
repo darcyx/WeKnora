@@ -167,6 +167,16 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 	}
 	groundedLead := admission.ObservedRead && tool == "read_document" || lead != "" && (c.hasUserQuote(lead) ||
 		previous != nil && evidenceContains(previous.Content, lead))
+	if action == retrievalSupplement && !groundedLead && lead != "" {
+		for _, attempt := range c.state.Attempts {
+			if attempt.GapID == gapID && attempt.Completed && attempt.Outcome == retrievalSuccess &&
+				retrievalScopeCovers(c.state.Scope, attempt.Scope) && retrievalScopeCovers(g.Scope, attempt.Scope) &&
+				evidenceContains(attempt.Content, lead) {
+				groundedLead = true
+				break
+			}
+		}
+	}
 	var recoveryTargets types.SearchTargets
 	var recoveredCallID string
 	switch action {
@@ -203,6 +213,12 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 			return fmt.Errorf("searching or listing sources cannot be relabeled as necessary reading")
 		}
 	case retrievalSupplement:
+		// Repeating the current full question is not a new lead. Keep concrete
+		// identifiers and user-selected sources usable as grounded leads.
+		question := strings.TrimSpace(c.userInputs[c.state.questionID()])
+		if question != "" && normalizeRetrievalQuestion(lead) == normalizeRetrievalQuestion(question) {
+			return fmt.Errorf("the full current question is not a new supplementary lead; cite a concrete relevant detail or source")
+		}
 		if g.LastReview != retrievalNoProgress || g.SupplementUsed || !groundedLead {
 			return fmt.Errorf("no grounded supplementary retrieval remains for gap %s", gapID)
 		}
@@ -587,4 +603,9 @@ func restoreRetrievalControl(state retrievalState) (*retrievalControl, error) {
 		}
 	}
 	return c, nil
+}
+
+// Normalize only spacing and terminal question punctuation, not semantics.
+func normalizeRetrievalQuestion(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimRight(strings.TrimSpace(value), "?？")), ""))
 }

@@ -1,11 +1,29 @@
 package modelcontext
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+func TestSkippedSearchNotesAreBounded(t *testing.T) {
+	skipped := make([]map[string]interface{}, 100)
+	for i := range skipped {
+		skipped[i] = map[string]interface{}{
+			"knowledge_base_id": fmt.Sprintf("00000000-0000-0000-0000-%012d", i),
+			"reason":            "no chunk index; use a wiki or graph tool",
+		}
+	}
+	result := &types.ToolResult{Success: true, Output: "No matches.", Data: map[string]interface{}{
+		"display_type": "search_results", "skipped_knowledge_bases": skipped,
+	}}
+	got := NewRegistry(true).ModelToolResultForTool("search_knowledge", result)
+	if strings.Count(got, "Knowledge base kb://") != 3 || !strings.Contains(got, "97 additional knowledge bases were not searched") {
+		t.Fatalf("skipped summary = %q", got)
+	}
+}
 
 func TestAnnotateSearchNotes(t *testing.T) {
 	t.Parallel()

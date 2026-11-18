@@ -59,6 +59,7 @@ export default {
     }
   },
   settings: {
+    tokenQuotas: "トークン割り当て",
     modelManagement: 'モデル管理',
     webSearchConfig: 'Web検索',
     autoCheckUpdate: '更新の自動ダウンロード',

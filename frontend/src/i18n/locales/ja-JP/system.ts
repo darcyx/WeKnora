@@ -1,4 +1,47 @@
 export default {
+  tokenQuotaSettings: {
+    title: "トークン割り当て",
+    description: "API 連携の外部ユーザーのトークン使用量と割り当てを管理します。",
+    identityHint: "割り当てはワークスペースと外部ユーザー ID ごとに計算され、期間は UTC 基準です。",
+    tenantId: "ワークスペース ID",
+    tenantIdPlaceholder: "ワークスペース ID を入力",
+    tenantIdRequired: "ワークスペース ID を入力してください",
+    tenantIdInvalid: "ワークスペース ID は数字で入力してください",
+    subjectId: "外部ユーザー ID",
+    subjectIdPlaceholder: "外部ユーザー ID を入力",
+    subjectIdRequired: "外部ユーザー ID を入力してください",
+    query: "検索",
+    listUsers: "ユーザー一覧",
+    usersTitle: "外部ユーザー",
+    usersDescription: "ユーザーを選択して割り当てを確認・変更するか、一覧にないユーザーを検索します。",
+    previousPage: "前へ",
+    nextPage: "次へ",
+    pageInfo: "ページ {page}、全 {total} ユーザー",
+    dailyUsage: "本日の使用量",
+    monthlyUsage: "今月の使用量",
+    reservedTokens: "予約済みトークン",
+    reservedHint: "実行中のリクエスト用に予約されたトークン数。",
+    unlimited: "無制限",
+    limitValue: "上限：{value}",
+    overrideTitle: "ユーザー別割り当て",
+    overrideDescription: "個別の上限を設定します。空欄の場合はプラットフォームの既定値を継承します。",
+    overridden: "個別設定あり",
+    inheriting: "既定値を継承",
+    dailyLimit: "日次上限",
+    monthlyLimit: "月次上限",
+    inheritPlaceholder: "既定値を継承",
+    limitHint: "0 は無制限、空欄は既定値の継承を意味します。",
+    reset: "既定値に戻す",
+    resetConfirm: "このユーザーの個別設定を削除してプラットフォームの既定値に戻しますか？",
+    save: "保存",
+    noData: "ワークスペース ID と外部ユーザー ID を入力して検索してください。",
+    loadFailed: "割り当ての読み込みに失敗しました",
+    overrideRequired: "少なくとも一つの上限を設定してください",
+    saveSuccess: "割り当てを保存しました",
+    saveFailed: "割り当ての保存に失敗しました",
+    resetSuccess: "既定の割り当てに戻しました",
+    resetFailed: "割り当てのリセットに失敗しました",
+  },
   documentProgress: {
     queueView: 'キュータスク',
     title: '資料と Wiki の進捗',
@@ -347,6 +390,11 @@ export default {
         }
       },
       keyLabels: {
+        token_quota: {
+          default_daily_limit: "既定の日次トークン上限",
+          default_monthly_limit: "既定の月次トークン上限",
+          max_completion_tokens: "既定の最大出力トークン数",
+        },
         auth: {
           registration_mode: '登録モード',
           default_tenant_mode: 'デフォルトのワークスペース作成方式',
@@ -379,6 +427,11 @@ export default {
         }
       },
       keyDescriptions: {
+        token_quota: {
+          default_daily_limit: "API 連携の外部ユーザーの日次既定上限（UTC 暦日）。0 は無制限です。個別設定が優先され、変更は直ちに反映されます。",
+          default_monthly_limit: "API 連携の外部ユーザーの月次既定上限（UTC 暦月）。0 は無制限です。個別設定が優先され、変更は直ちに反映されます。",
+          max_completion_tokens: "max_tokens が指定されない場合に予約とモデル呼び出しに使用する最大出力トークン数。正の整数が必要です。小さい値は予約量と回答の長さを制限します。",
+        },
         auth: {
           registration_mode: '登録モード。公開登録では誰でもアカウントを作成できます。招待登録には有効な招待リンクが必要です。登録禁止でも既存アカウントは招待を承諾できます。保存後すぐに反映されます。',
           default_tenant_mode: '公開登録後のワークスペース作成方式です。create_personalはオーナー権限のワークスペースを作成し、tenantlessはアカウントのみを作成して、ユーザが招待を承諾するかワークスペースを作成するまで待ちます。新規ユーザにのみ適用されます。',

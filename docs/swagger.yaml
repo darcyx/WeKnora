@@ -1481,6 +1481,8 @@ definitions:
       iteration:
         description: Iteration number (0-indexed)
         type: integer
+      plan_report:
+        type: boolean
       progress:
         description: Progress is user-facing commentary from a non-terminal round.
           Thought stays intact for model replay.
@@ -3082,6 +3084,10 @@ definitions:
           default). A negative value is unlimited: the loop runs until the model
           stops, the user cancels, or another guard fires.
         type: integer
+      max_tool_output_chars:
+        description: Zero inherits the registry default; tools preserve their paging/recovery
+          hints.
+        type: integer
       mcp_auth_wait_timeout:
         description: |-
           MCPAuthWaitTimeout is how many seconds to wait for in-conversation OAuth
@@ -3117,6 +3123,14 @@ definitions:
         description: |-
           ===== Multi-turn Conversation Settings =====
           Whether multi-turn conversation is enabled
+        type: boolean
+        x-agent: true
+        x-agent-detail: true
+      planning_enabled:
+        description: |-
+          PlanningEnabled turns on the engine-driven plan-and-execute decomposition
+          that runs before the ReAct loop. Defaults to false (off): the loop runs
+          as before. When true, a planner decides whether to decompose the task.
         type: boolean
         x-agent: true
         x-agent-detail: true
@@ -6178,6 +6192,13 @@ definitions:
         allOf:
         - $ref: '#/definitions/gorm.DeletedAt'
         description: Soft delete timestamp
+      feedback:
+        allOf:
+        - $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.MessageFeedback'
+        description: |-
+          Feedback is the end user's like/dislike vote on this assistant answer.
+          Nil means no vote has been cast yet. One-shot: set once via
+          SubmitMessageFeedback and never edited afterwards.
       id:
         description: Unique identifier for the message
         type: string
@@ -6347,6 +6368,33 @@ definitions:
         description: Total parsed chunks
         type: integer
     type: object
+  github_com_Tencent_WeKnora_internal_types.MessageFeedback:
+    properties:
+      created_at:
+        type: string
+      reason_text:
+        description: |-
+          ReasonText is the free-text explanation, required only when Reasons
+          includes "other".
+        type: string
+      reasons:
+        description: |-
+          Reasons is only populated for a dislike vote; multiple reasons may be
+          selected at once, "other" being one of them.
+        items:
+          type: string
+        type: array
+      type:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.MessageFeedbackType'
+    type: object
+  github_com_Tencent_WeKnora_internal_types.MessageFeedbackType:
+    enum:
+    - like
+    - dislike
+    type: string
+    x-enum-varnames:
+    - MessageFeedbackLike
+    - MessageFeedbackDislike
   github_com_Tencent_WeKnora_internal_types.MessageImage:
     properties:
       caption:
@@ -9254,6 +9302,80 @@ definitions:
           any volume-mount use case (shared datasets, pre-installed toolchains,
           etc.).
     type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaLimits:
+    properties:
+      daily_token_limit:
+        type: integer
+      monthly_token_limit:
+        type: integer
+    type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaOverride:
+    properties:
+      createdAt:
+        type: string
+      daily_token_limit:
+        type: integer
+      monthly_token_limit:
+        type: integer
+      subject_id:
+        type: string
+      updatedAt:
+        type: string
+    type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaPeriodUsage:
+    properties:
+      completion_tokens:
+        type: integer
+      created_at:
+        type: string
+      period:
+        type: string
+      period_start:
+        type: string
+      prompt_tokens:
+        type: integer
+      reserved_tokens:
+        type: integer
+      subject_id:
+        type: string
+      total_tokens:
+        type: integer
+      updated_at:
+        type: string
+    type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaUsageSnapshot:
+    properties:
+      daily:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaPeriodUsage'
+      limits:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaLimits'
+      monthly:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaPeriodUsage'
+      override:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaOverride'
+      subject_id:
+        type: string
+    type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaUser:
+    properties:
+      external_user_id:
+        type: string
+      quota:
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaUsageSnapshot'
+    type: object
+  github_com_Tencent_WeKnora_internal_types.TokenQuotaUserPage:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaUser'
+        type: array
+      page:
+        type: integer
+      page_size:
+        type: integer
+      total:
+        type: integer
+    type: object
   github_com_Tencent_WeKnora_internal_types.TokenUsage:
     properties:
       cache_miss_tokens:
@@ -10717,6 +10839,13 @@ definitions:
         type: string
       page_type:
         type: string
+      source_refs:
+        description: |-
+          SourceRefs replaces the page's source documents (bare knowledge IDs or
+          "uuid|title"); titles are rebuilt server-side and `[]` clears them.
+        items:
+          type: string
+        type: array
       status:
         type: string
       summary:
@@ -12738,6 +12867,11 @@ definitions:
         description: Agent name
         type: string
         x-agent: true
+      planning_enabled:
+        description: Whether the agent decomposes complex queries into a plan before
+          the ReAct loop
+        type: boolean
+        x-agent: true
       rerank_model_id:
         description: Rerank model for knowledge retrieval; empty clears the selection
         type: string
@@ -13485,6 +13619,19 @@ definitions:
         description: '"local", "minio", "cos", "tos", "s3", "oss", "ks3", "obs"'
         type: string
     type: object
+  internal_handler.SubmitMessageFeedbackRequest:
+    properties:
+      reason_text:
+        type: string
+      reasons:
+        items:
+          type: string
+        type: array
+      type:
+        type: string
+    required:
+    - type
+    type: object
   internal_handler.SubmittedTaskData:
     properties:
       deleted_count:
@@ -13828,6 +13975,13 @@ definitions:
         type: string
         x-agent: true
       sort_order:
+        type: integer
+    type: object
+  internal_handler.UpdateUserTokenQuotaRequest:
+    properties:
+      daily_token_limit:
+        type: integer
+      monthly_token_limit:
         type: integer
     type: object
   internal_handler.ValidateTokenResponse:
@@ -14560,6 +14714,13 @@ definitions:
       disable_title:
         description: Whether to disable auto title generation
         type: boolean
+      ext:
+        additionalProperties: {}
+        description: |-
+          Ext carries the caller's complete app information for external
+          integrations. The whole object (including nested objects such as
+          "gameInfo") is serialized into the agent's per-turn <app_info> context.
+        type: object
       images:
         description: Attached images for multimodal chat
         items:
@@ -24596,6 +24757,55 @@ paths:
       summary: 删除消息
       tags:
       - 消息
+  /messages/{session_id}/{id}/feedback:
+    post:
+      consumes:
+      - application/json
+      description: id 为纯数字时记录会话级 FAQ 反馈，否则将 id 作为 request_id，按 session_id + request_id
+        记录助手消息反馈；同一会话同一对象仅可提交一次，点踩需提供原因（多选），选择"其他"时需附文字说明
+      parameters:
+      - description: 会话ID
+        in: path
+        name: session_id
+        required: true
+        type: string
+      - description: 请求ID（request_id）或FAQ条目数字ID（seq_id）
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: 反馈内容
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/internal_handler.SubmitMessageFeedbackRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 反馈已记录
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 请求参数错误
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError'
+        "404":
+          description: 会话或消息不存在
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError'
+        "409":
+          description: 该消息已提交过反馈
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError'
+      security:
+      - Bearer: []
+      - ApiKeyAuth: []
+      summary: 提交消息或FAQ反馈（点赞/点踩）
+      tags:
+      - 消息
   /messages/{session_id}/load:
     get:
       consumes:
@@ -29241,6 +29451,103 @@ paths:
             additionalProperties: true
             type: object
       summary: Apply the default storage quota to every existing workspace
+      tags:
+      - System Admin
+  /system/admin/token-quotas:
+    delete:
+      parameters:
+      - description: Workspace ID that issued the external user ID
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      - description: External user ID
+        in: query
+        name: subject_id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      summary: Remove an external user's token quota override
+      tags:
+      - System Admin
+    get:
+      parameters:
+      - description: Workspace ID that issued the external user ID
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      - description: External user ID
+        in: query
+        name: subject_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaUsageSnapshot'
+      summary: Get an external user's token quota
+      tags:
+      - System Admin
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: Workspace ID that issued the external user ID
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      - description: External user ID
+        in: query
+        name: subject_id
+        required: true
+        type: string
+      - description: Override limits
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/internal_handler.UpdateUserTokenQuotaRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaOverride'
+      summary: Update an external user's token quota override
+      tags:
+      - System Admin
+  /system/admin/token-quotas/users:
+    get:
+      parameters:
+      - description: Workspace ID
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      - description: One-based page number
+        in: query
+        name: page
+        type: integer
+      - description: Page size, 1-100
+        in: query
+        name: page_size
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.TokenQuotaUserPage'
+      summary: List observed external users with token quotas
       tags:
       - System Admin
   /system/admin/users:

@@ -18,6 +18,7 @@ import (
 func TestReadDocumentCitationIdentitySurvivesClientAndHistoryCompaction(t *testing.T) {
 	knowledge := &types.Knowledge{
 		ID: "doc-1", KnowledgeBaseID: "kb-1", Title: "Proposal.pptx", FileName: "Proposal.pptx",
+		CustomMetadata: types.JSON(`{"id":"anydata-login","url":"https://docs.dobest.cn/docs-server/d9e9ba5e"}`),
 	}
 	rows := []readChunkRow{
 		{chunk: &types.Chunk{ID: "chunk-1", Content: "First body"}},
@@ -36,7 +37,7 @@ func TestReadDocumentCitationIdentitySurvivesClientAndHistoryCompaction(t *testi
 	} {
 		t.Run(name, func(t *testing.T) {
 			if compact["knowledge_id"] != "doc-1" || compact["knowledge_base_id"] != "kb-1" ||
-				compact["source_chunk_id"] != "chunk-2" {
+				compact["source_chunk_id"] != "chunk-2" || compact["source_url"] != "https://docs.dobest.cn/docs-server/d9e9ba5e" {
 				t.Fatalf("lost citation provenance: %#v", compact)
 			}
 			if !reflect.DeepEqual(compact["chunk_ids"], []string{"chunk-1", "chunk-2"}) {

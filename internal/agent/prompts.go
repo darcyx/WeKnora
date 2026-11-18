@@ -209,6 +209,11 @@ func AvailablePlaceholders() []PlaceholderDefinition {
 	return result
 }
 
+// promptProfileMaxQuestions caps the typical questions rendered per KB. The
+// stored profile may hold more (types.KnowledgeBaseProfileMaxQuestions); a few
+// carry enough routing signal for a block re-sent on every round.
+const promptProfileMaxQuestions = 3
+
 // formatKnowledgeBaseList formats knowledge base information as XML for the prompt
 func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 	if len(kbInfos) == 0 {
@@ -225,11 +230,17 @@ func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 		if kbType == "" {
 			kbType = "document"
 		}
-		fmt.Fprintf(&b, "<knowledge_base id=\"%s\" name=\"%s\" type=\"%s\" doc_count=\"%d\" capabilities=\"%s\">\n",
-			escapeXMLAttr(kb.ID), escapeXMLAttr(formatDocSummary(kb.Name, 160)), escapeXMLAttr(kbType), kb.DocCount,
-			escapeXMLAttr(strings.Join(kb.Capabilities, ",")))
-		if kb.Description != "" {
-			fmt.Fprintf(&b, "<description>%s</description>\n", escapeXMLAttr(formatDocSummary(kb.Description, 240)))
+		fmt.Fprintf(&b, "<knowledge_base id=\"%s\" name=\"%s\" type=\"%s\" doc_count=\"%d\"",
+			escapeXMLAttr(kb.ID), escapeXMLAttr(formatDocSummary(kb.Name, 160)), escapeXMLAttr(kbType), kb.DocCount)
+		if len(kb.Capabilities) > 0 {
+			fmt.Fprintf(&b, " capabilities=\"%s\"", escapeXMLAttr(strings.Join(kb.Capabilities, ",")))
+		}
+		b.WriteString(">\n")
+		// A generated gist already summarizes the KB; repeating the manual
+		// description would cost tokens on every round for no routing signal.
+		hasGist := kb.Profile != nil && strings.TrimSpace(kb.Profile.Gist) != ""
+		if kb.Description != "" && !hasGist {
+			fmt.Fprintf(&b, "<description>%s</description>\n", escapeXMLAttr(formatDocSummary(kb.Description, 160)))
 		}
 		writeKnowledgeBaseProfile(&b, kb.Profile)
 		if len(kb.RecentDocs) > 0 {
@@ -245,12 +256,13 @@ func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 				if name == "" {
 					name = doc.FileName
 				}
-				fmt.Fprintf(&b,
-					"<document knowledge_id=\"%s\" chunk_id=\"%s\" type=\"%s\"><name>%s</name></document>\n",
-					escapeXMLAttr(doc.KnowledgeID),
-					escapeXMLAttr(doc.ChunkID),
-					escapeXMLAttr(doc.Type),
-					escapeXMLAttr(formatDocSummary(name, 160)))
+				// FAQ entries are addressed by chunk; documents by knowledge_id alone.
+				chunkAttr := ""
+				if kbType == "faq" && doc.ChunkID != "" {
+					chunkAttr = fmt.Sprintf(" chunk_id=\"%s\"", escapeXMLAttr(doc.ChunkID))
+				}
+				fmt.Fprintf(&b, "<document knowledge_id=\"%s\"%s><name>%s</name></document>\n",
+					escapeXMLAttr(doc.KnowledgeID), chunkAttr, escapeXMLAttr(formatDocSummary(name, 80)))
 			}
 			b.WriteString("</recent_documents>\n")
 		}
@@ -270,19 +282,19 @@ func writeKnowledgeBaseProfile(b *strings.Builder, profile *types.KnowledgeBaseP
 	}
 	b.WriteString("<generated_profile>\n")
 	if gist := strings.TrimSpace(profile.Gist); gist != "" {
-		fmt.Fprintf(b, "<gist>%s</gist>\n", escapeXMLAttr(formatDocSummary(gist, 300)))
+		fmt.Fprintf(b, "<gist>%s</gist>\n", escapeXMLAttr(formatDocSummary(gist, 200)))
 	}
 	if len(profile.Topics) > 0 {
 		fmt.Fprintf(b, "<topics>%s</topics>\n",
-			escapeXMLAttr(formatDocSummary(strings.Join(profile.Topics, ", "), 300)))
+			escapeXMLAttr(formatDocSummary(strings.Join(profile.Topics, ", "), 150)))
 	}
 	if len(profile.TypicalQuestions) > 0 {
 		b.WriteString("<typical_questions>\n")
 		for i, q := range profile.TypicalQuestions {
-			if i >= types.KnowledgeBaseProfileMaxQuestions {
+			if i >= promptProfileMaxQuestions {
 				break
 			}
-			fmt.Fprintf(b, "<question>%s</question>\n", escapeXMLAttr(formatDocSummary(q, 160)))
+			fmt.Fprintf(b, "<question>%s</question>\n", escapeXMLAttr(formatDocSummary(q, 100)))
 		}
 		b.WriteString("</typical_questions>\n")
 	}

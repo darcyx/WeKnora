@@ -144,6 +144,25 @@ func TestNeedsUserReviewReceivesScopedEvidence(t *testing.T) {
 	require.Empty(t, e.reviewedGoalQuestion(&types.AgentState{}, step))
 }
 
+func TestReviewGuardReceivesCitedObservationContent(t *testing.T) {
+	e, probe := newRetrievalProbeEngine(t)
+	probe.output = "iOS uses App Store Connect."
+	first := retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.True(t, first.Result.Success, first.Result.Error)
+	e.EnableRetrievalGuard()
+	model := &projectContextChat{mockChat: &mockChat{}, reply: `{"necessary_user_inputs":[{"field":"channel","reason":"the cited condition requires it"}],"remaining_independent_requests":[]}`}
+	e.chatModel = model
+	review := retrievalProbeCall(e, "review", reviewRetrievalTool, `{"gap_id":"gap-1","call_id":"first","status":"needs_user","missing_user_fields":["channel"],"quotes":["iOS uses App Store Connect."]}`)
+	require.True(t, review.Result.Success, review.Result.Error)
+	var payload struct {
+		Input struct{ Observations []map[string]any }
+	}
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(model.messages[len(model.messages)-1].Content, "review\n")), &payload))
+	require.Len(t, payload.Input.Observations, 1)
+	require.Equal(t, probe.output, payload.Input.Observations[0]["content"])
+	require.NotEmpty(t, payload.Input.Observations[0]["scope"])
+}
+
 func TestRetrievalUnknownIDCanBeCorrectedWithoutInventingUserFields(t *testing.T) {
 	e, probe := newRetrievalProbeEngine(t)
 	before := e.retrieval.snapshot()

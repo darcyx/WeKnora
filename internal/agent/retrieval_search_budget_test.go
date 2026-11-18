@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
@@ -299,4 +301,129 @@ func TestQuestionSearchGracePreservesPartialFailureScopes(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestWikiShadowsSearch(t *testing.T) {
+	cases := []struct {
+		name string
+		tool string
+		args string
+		want bool
+	}{
+		{"unscoped search", agenttools.ToolSearchKnowledge, `{"query":"防沉迷"}`, true},
+		{"legacy name", agenttools.LegacyToolKnowledgeSearch, `{"query":"防沉迷"}`, true},
+		{"empty scope", agenttools.ToolSearchKnowledge, `{"query":"防沉迷","knowledge_base_ids":[],"metadata":{}}`, true},
+		{"knowledge base scoped", agenttools.ToolSearchKnowledge, `{"query":"防沉迷","knowledge_base_ids":["kb://1"]}`, false},
+		{"metadata scoped", agenttools.ToolSearchKnowledge, `{"query":"防沉迷","metadata":{"region":"CN"}}`, false},
+		{"wiki search itself", agenttools.ToolWikiSearch, `{"query":"防沉迷"}`, false},
+		{"graph query", agenttools.ToolQueryKnowledgeGraph, `{"query":"防沉迷"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var args map[string]any
+			require.NoError(t, json.Unmarshal([]byte(tc.args), &args))
+			require.Equal(t, tc.want, wikiShadowsSearch(tc.tool, args))
+		})
+	}
+}
+
+func TestWikiShadowsSearchRejectsSameTurnLibrarySearch(t *testing.T) {
+	cases := []struct {
+		name       string
+		parallel   bool
+		calls      []string // tool:args
+		dispatched int
+	}{
+		{"parallel wiki and unscoped search", true, []string{agenttools.ToolWikiSearch + `|{"query":"防沉迷"}`, agenttools.ToolSearchKnowledge + `|{"query":"防沉迷"}`}, 1},
+		{"sequential search before wiki", false, []string{agenttools.ToolSearchKnowledge + `|{"query":"防沉迷"}`, agenttools.ToolWikiSearch + `|{"query":"防沉迷"}`}, 1},
+		{"scoped search with wiki", true, []string{agenttools.ToolWikiSearch + `|{"query":"防沉迷"}`, agenttools.ToolSearchKnowledge + `|{"query":"防沉迷","knowledge_base_ids":["kb-1"]}`}, 1},
+		{"search without wiki", true, []string{agenttools.ToolSearchKnowledge + `|{"query":"防沉迷"}`, agenttools.ToolSearchKnowledge + `|{"query":"实名认证"}`}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, probe := newRetrievalProbeEngine(t)
+			e.EnableRetrievalGuard()
+			e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"sandbox configuration"}`}
+			e.config.ParallelToolCalls = tc.parallel
+			e.toolRegistry.RegisterTool(&retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolWikiSearch, "test wiki", json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`))})
+			response := &types.ChatResponse{}
+			for i, call := range tc.calls {
+				name, args, _ := strings.Cut(call, "|")
+				response.ToolCalls = append(response.ToolCalls, types.LLMToolCall{ID: fmt.Sprint("call-", i), Function: types.FunctionCall{Name: name, Arguments: args}})
+			}
+			step := &types.AgentStep{}
+			require.Nil(t, e.executeToolCalls(context.Background(), response, step, 0, "session", "message"))
+			require.Len(t, probe.calls, tc.dispatched)
+			require.False(t, e.turnHasWikiSearch, "the turn flag must not leak into later rounds")
+			for _, call := range step.ToolCalls {
+				if call.Name != agenttools.ToolSearchKnowledge || call.Result.Success {
+					continue
+				}
+				require.Equal(t, wikiParallelSearchError, call.Result.Error)
+				require.Equal(t, wikiParallelSearchError, call.Result.Output, "the model sees the correction")
+			}
+			attempts := 0
+			for _, attempt := range e.retrieval.snapshot().Attempts {
+				if attempt.Tool == agenttools.ToolSearchKnowledge {
+					attempts++
+				}
+			}
+			require.Equal(t, tc.dispatched, attempts, "rejected searches stay out of the ledger")
+		})
+	}
+}
+
+func TestShadowedSearchKeepsOriginalOrderAndRemainingBudget(t *testing.T) {
+	e, search := newRetrievalProbeEngine(t)
+	e.EnableRetrievalGuard()
+	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"payment configuration"}`}
+	e.config.ParallelToolCalls = true
+	wiki := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolWikiSearch, "test wiki", json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`))}
+	e.toolRegistry.RegisterTool(wiki)
+	for _, call := range []struct{ id, tool, args string }{
+		{"prior-wiki", agenttools.ToolWikiSearch, `{"query":"taptap.*沙盒|沙盒.*支付"}`},
+		{"prior-doc", agenttools.ToolSearchKnowledge, `{"query":"taptap 沙盒","mode":"keyword","limit":5}`},
+	} {
+		got := retrievalProbeCall(e, call.id, call.tool, call.args)
+		require.True(t, got.Result.Success, got.Result.Error)
+	}
+	response := &types.ChatResponse{ToolCalls: []types.LLMToolCall{
+		{ID: "target-search", Function: types.FunctionCall{Name: agenttools.ToolSearchKnowledge, Arguments: `{"limit":5,"query":"TapTap 渠道沙盒支付怎么设置和测试？"}`}},
+		{ID: "wiki-search", Function: types.FunctionCall{Name: agenttools.ToolWikiSearch, Arguments: `{"knowledge_base_ids":["kb-4","kb-6"],"query":"taptap|TapTap"}`}},
+	}}
+	step := &types.AgentStep{}
+	require.Nil(t, e.executeToolCalls(context.Background(), response, step, 3, "session", "message"))
+	require.Len(t, step.ToolCalls, 2)
+	require.Equal(t, "target-search", step.ToolCalls[0].ID)
+	require.True(t, step.ToolCalls[0].Result.Success, step.ToolCalls[0].Result.Error)
+	require.Len(t, search.calls, 2, "original requested document search must be dispatched once")
+	require.JSONEq(t, `{"limit":5,"query":"TapTap 渠道沙盒支付怎么设置和测试？"}`, string(search.calls[1]))
+	require.False(t, step.ToolCalls[1].Result.Success, "the fourth ordinary search is still budgeted")
+}
+
+func TestShadowedBatchEmitsEachResultBeforeNextCall(t *testing.T) {
+	e, search := newRetrievalProbeEngine(t)
+	e.EnableRetrievalGuard()
+	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"allow","reason":"payment configuration"}`}
+	e.config.ParallelToolCalls = true
+	var seen []string
+	e.eventBus.On(event.EventAgentToolResult, func(_ context.Context, ev event.Event) error {
+		seen = append(seen, ev.Data.(event.AgentToolResultData).ToolCallID)
+		return nil
+	})
+	wiki := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolWikiSearch, "test wiki", json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`)), execute: func(_ context.Context, _ json.RawMessage) (*types.ToolResult, error) {
+		require.Equal(t, []string{"search-first"}, seen, "first result must be emitted before the next call runs")
+		return &types.ToolResult{Success: true, Output: "wiki evidence"}, nil
+	}}
+	e.toolRegistry.RegisterTool(wiki)
+	response := &types.ChatResponse{ToolCalls: []types.LLMToolCall{
+		{ID: "search-first", Function: types.FunctionCall{Name: agenttools.ToolSearchKnowledge, Arguments: `{"query":"TapTap 沙盒支付"}`}},
+		{ID: "wiki-next", Function: types.FunctionCall{Name: agenttools.ToolWikiSearch, Arguments: `{"query":"TapTap"}`}},
+	}}
+	step := &types.AgentStep{}
+	require.Nil(t, e.executeToolCalls(context.Background(), response, step, 0, "session", "message"))
+	require.Equal(t, []string{"search-first", "wiki-next"}, seen)
+	require.Len(t, search.calls, 1)
+	require.Len(t, wiki.calls, 1)
+	require.Len(t, step.ToolCalls, 2)
 }
