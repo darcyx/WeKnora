@@ -86,10 +86,15 @@ ENV VERSION=${VERSION_ARG}
 ENV COMMIT_ID=${COMMIT_ID_ARG}
 ENV BUILD_TIME=${BUILD_TIME_ARG}
 
-# The compiler cache mount accelerates rebuilds on persistent local builders.
+# Isolate cached cgo outputs when installed native libraries or AnyDoc change.
 # Read the Go version here so host machines without Go still report it correctly.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     export GO_VERSION="$(go version)"; \
+    native_cache_key="$( { dpkg-query -W -f='${Package}=${Version}\n'; go env GOOS GOARCH; echo "$GO_VERSION"; \
+        if [ "$WITH_ANYDOC" = "1" ]; then sha256sum third_party/anydoc-go/lib/linux_*_gnu/libanydoc_go.a; fi; \
+    } | sha256sum | cut -d' ' -f1)"; \
+    export GOCACHE="/root/.cache/go-build/$native_cache_key"; \
+    mkdir -p "$GOCACHE"; \
     if [ "$WITH_ANYDOC" = "1" ]; then \
         make build-prod GO_BUILD_TAGS=anydoc; \
     else \

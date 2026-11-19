@@ -264,9 +264,6 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runs: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runs: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs }}
     timeout-minutes: 60
     steps:
@@ -274,7 +271,30 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Set Go cache week
+        id: go-cache-week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Go compiler outputs
+        id: go-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/weknora-go-build
+          key: app-go-${{ matrix.arch }}-${{ hashFiles('docker/Dockerfile.app', 'go.mod', 'go.sum', 'Makefile', 'third_party/anydoc-go/**', 'scripts/build-anydoc-lib.sh') }}-${{ steps.go-cache-week.outputs.week }}
+          restore-keys: |
+            app-go-${{ matrix.arch }}-${{ hashFiles('docker/Dockerfile.app', 'go.mod', 'go.sum', 'Makefile', 'third_party/anydoc-go/**', 'scripts/build-anydoc-lib.sh') }}-
+
+      - name: Restore Go compiler cache mount
+        uses: reproducible-containers/buildkit-cache-dance@653a570f730e3b9460adc576db523788ba59a0d7 # v3.2.0
+        continue-on-error: true
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: '{"${{ runner.temp }}/weknora-go-build":"/root/.cache/go-build"}'
+          scratch-dir: ${{ runner.temp }}/go-cache-dance
+          skip-extraction: ${{ steps.go-cache.outputs.cache-hit == 'true' }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@v4
