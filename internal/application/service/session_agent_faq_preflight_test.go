@@ -46,7 +46,7 @@ func TestFAQSemanticPreflightUsesAgentEmbeddingTopK(t *testing.T) {
 			kbs.rows = nil
 			s.cfg = &config.Config{Conversation: &config.ConversationConfig{EmbeddingTopK: 200}}
 			cfg.EmbeddingTopK = tc.configured
-			s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, &agentFAQEvaluation{})
+			s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, false, &agentFAQEvaluation{})
 			require.Equal(t, tc.want, kbs.matchCount)
 		})
 	}
@@ -103,6 +103,65 @@ func (c preflightChat) Chat(ctx context.Context, messages []chat.Message, _ *cha
 
 const preflightSelection = `{"decision":"direct_answer","selected_id":"1","matched_facts":["支付"],"requires_steps":false,"answer_kind":"other","unanswered_parts_of_original_request":[]}`
 const preflightQuestion = `{"question":"哪个平台？","scope_match":"missing","missing_user_fields":["平台"],"unanswered_parts_of_original_request":[]}`
+
+func TestFAQExactFastPath(t *testing.T) {
+	for _, tc := range []struct {
+		name, question, query, certification string
+		semantic, ambiguous, changed         bool
+		wantReviews                          int
+		wantAnswer                           bool
+	}{
+		{"exact standalone", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, false, false, false, 0, true},
+		{"conditional", "支付问题", "支付问题", `false`, false, false, false, 1, true},
+		{"missing certification", "支付问题", "支付问题", ``, false, false, false, 1, true},
+		{"malformed certification", "支付问题", "支付问题", `"yes"`, false, false, false, 1, true},
+		{"similar question", "支付问题", "支付出错", `true`, false, false, false, 1, true},
+		{"semantic recall", "支付问题", "支付问题", `true`, true, false, false, 1, true},
+		{"ambiguous candidates", "支付问题", "支付问题", `true`, false, true, false, 1, true},
+		{"changed after selection", "支付问题", "支付问题", `true`, false, false, true, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, req, cfg, repo := preflightFixture(t)
+			req.Query = tc.query
+			repo.chunk.Metadata = types.JSON(`{"standard_question":"` + tc.question + `","similar_questions":["支付出错"],"answers":["标准答案"]}`)
+			s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+			original := *repo.chunk
+			if !tc.semantic {
+				repo.exact = func(context.Context, string) ([]*types.Chunk, error) {
+					if tc.ambiguous {
+						other := original
+						other.ID = "other"
+						return []*types.Chunk{&original, &other}, nil
+					}
+					return []*types.Chunk{&original}, nil
+				}
+			}
+			selection := preflightSelection
+			if strings.Contains(tc.query, "微信") {
+				selection = strings.Replace(selection, "支付", "微信登录后闪退", 1)
+			}
+			if tc.certification != "" {
+				selection = strings.TrimSuffix(selection, "}") + `,"standalone_unconditional":` + tc.certification + `}`
+			}
+			reviews := 0
+			model := preflightChat{
+				call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					if tc.changed {
+						repo.chunk.Metadata = types.JSON(`{"standard_question":"支付问题","answers":["新答案"]}`)
+					}
+					return &types.ChatResponse{Content: selection}, nil
+				},
+				review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					reviews++
+					return &types.ChatResponse{Content: `{"reason":"matched","coverage":[{"request_quote":"支付","answer_quote":"标准答案"}],"preconditions":[],"supported":true}`}, nil
+				},
+			}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.99}}, nil)
+			require.Equal(t, tc.wantReviews, reviews)
+			require.Equal(t, tc.wantAnswer, evaluation.Match != nil)
+		})
+	}
+}
 
 func TestFAQIndependentReview(t *testing.T) {
 	for _, tc := range []struct {
@@ -371,10 +430,11 @@ func TestFAQSemanticDirectAnswerRequiresGroundedFacts(t *testing.T) {
 	}
 }
 
-func TestFAQPreflightOverlapsRewriteAndCancelsItOnExactHit(t *testing.T) {
+func TestFAQPreflightOverlapsRewriteAndSkipsItOnExactHit(t *testing.T) {
 	s, req, cfg, repo := preflightFixture(t)
 	req.Query = "支付问题"
 	started := make(chan struct{})
+	release := make(chan struct{})
 	finished := make(chan struct{})
 	repo.exact = func(ctx context.Context, _ string) ([]*types.Chunk, error) {
 		select {
@@ -387,22 +447,21 @@ func TestFAQPreflightOverlapsRewriteAndCancelsItOnExactHit(t *testing.T) {
 	model := preflightChat{call: func(ctx context.Context, messages []chat.Message) (*types.ChatResponse, error) {
 		if messages[0].Content == faqRewritePrompt {
 			close(started)
-			<-ctx.Done()
+			// Ignores cancellation: an exact hit must not wait for it.
+			<-release
 			close(finished)
-			return &types.ChatResponse{Usage: types.TokenUsage{TotalTokens: 3}}, ctx.Err()
+			return &types.ChatResponse{Usage: types.TokenUsage{TotalTokens: 3}}, nil
 		}
 		return &types.ChatResponse{Content: preflightSelection, Usage: types.TokenUsage{TotalTokens: 7}}, nil
 	}}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	evaluation := s.evaluateAgentFAQ(ctx, req, cfg, model, nil, []chat.Message{{Role: "user", Content: "支付问题"}})
+	close(release)
+	<-finished
 	require.NotNil(t, evaluation.Match)
-	select {
-	case <-finished:
-	default:
-		t.Fatal("exact hit must cancel and collect the rewrite before completing")
-	}
-	require.Equal(t, 10, evaluation.Usage.TotalTokens, "both calls must be counted without concurrent config writes")
+	require.NotEmpty(t, evaluation.reply().Answer)
+	require.Equal(t, 7, evaluation.Usage.TotalTokens, "the skipped rewrite is not counted")
 }
 
 func TestFAQPreflightUsesRewriteAfterExactMiss(t *testing.T) {

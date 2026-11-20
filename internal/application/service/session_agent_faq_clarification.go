@@ -48,10 +48,11 @@ Example: User "How do I bind an app?" FAQ "Why does binding fail?" → "Go to th
 
 Output JSON only, with "decision" as the last key:
 {"decision":"needs_live_data"} or {"decision":"insufficient"} or
-{"matched_facts":[...],"unanswered_parts_of_original_request":[],"requires_steps":true|false,"answer_kind":"steps"|"explicitly_unavailable"|"other","selected_id":"...","decision":"direct_answer"}
+{"matched_facts":[...],"unanswered_parts_of_original_request":[],"requires_steps":true|false,"answer_kind":"steps"|"explicitly_unavailable"|"other","selected_id":"...","standalone_unconditional":true|false,"decision":"direct_answer"}
 - matched_facts: exact quotes from the current or recent user messages (never the FAQ, search rewrite or assistant conjecture): at least one identifying the request, plus one per essential condition. Check the quotes' meaning against the FAQ, including negation.
 - unanswered_parts_of_original_request must be empty for direct_answer.
 - requires_steps is true only if the user explicitly asks how to do something; then answer_kind is steps or explicitly_unavailable.
+- standalone_unconditional is true only for one self-contained intent whose answer needs no additional applicability condition, including a platform, environment, stage or prior context. The reported symptom itself is part of the request, not an extra condition. Example: "微信登录后闪退是什么原因？" with a general diagnostic answer may be true. A question relying on a previous turn or an answer applicable only to Android, a sandbox, or a specific stage must be false. If uncertain, use false.
 - Never compose an answer.`
 
 const faqCoverageFormat = `{
@@ -70,7 +71,8 @@ const faqCoverageFormat = `{
         "matched_facts": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
         "unanswered_parts_of_original_request": {"type": "array", "items": {"type": "string"}},
         "requires_steps": {"type": "boolean"},
-        "answer_kind": {"enum": ["steps", "explicitly_unavailable", "other"]}
+        "answer_kind": {"enum": ["steps", "explicitly_unavailable", "other"]},
+        "standalone_unconditional": {"type": "boolean"}
       },
       "required": ["decision", "selected_id", "matched_facts", "unanswered_parts_of_original_request", "requires_steps", "answer_kind"]
     }
@@ -140,7 +142,7 @@ func (s *sessionService) faqAssistantRequirements(ctx context.Context, cfg *type
 	return sections[0].Content, true
 }
 
-func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *types.QARequest, query string, cfg *types.AgentConfig, model chat.Chat, reranker rerank.Reranker, history []chat.Message, matches []tools.FAQMatch, evaluation *agentFAQEvaluation) {
+func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *types.QARequest, query string, cfg *types.AgentConfig, model chat.Chat, reranker rerank.Reranker, history []chat.Message, matches []tools.FAQMatch, rawExact bool, evaluation *agentFAQEvaluation) {
 	if err := faqEvaluationInterrupted(ctx, req); err != nil {
 		evaluation.observe("faq_interrupted", query, nil, matches, err)
 		return
@@ -209,12 +211,13 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 		return
 	}
 	var decision *struct {
-		Decision      string   `json:"decision"`
-		RequiresSteps *bool    `json:"requires_steps"`
-		AnswerKind    string   `json:"answer_kind"`
-		Unanswered    []string `json:"unanswered_parts_of_original_request"`
-		SelectedID    string   `json:"selected_id"`
-		MatchedFacts  []string `json:"matched_facts"`
+		Decision                string          `json:"decision"`
+		RequiresSteps           *bool           `json:"requires_steps"`
+		AnswerKind              string          `json:"answer_kind"`
+		Unanswered              []string        `json:"unanswered_parts_of_original_request"`
+		SelectedID              string          `json:"selected_id"`
+		MatchedFacts            []string        `json:"matched_facts"`
+		StandaloneUnconditional json.RawMessage `json:"standalone_unconditional"`
 	}
 	content, err := unwrapFAQDecision(response.Content)
 	if err != nil {
@@ -263,6 +266,23 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 				evaluation.observe("faq_scope", query, nil, matches, errFAQDirectScoreLow)
 				return
 			}
+		}
+		var standaloneUnconditional bool
+		_ = json.Unmarshal(decision.StandaloneUnconditional, &standaloneUnconditional)
+		if rawExact && len(matches) == 1 && strings.TrimSpace(req.AppInfo) == "" && len(recent) == 0 &&
+			strings.TrimSpace(req.Query) == strings.TrimSpace(match.Metadata.StandardQuestion) &&
+			standaloneUnconditional && faqFactsGrounded(decision.MatchedFacts, req.Query, "", nil) {
+			if err := faqEvaluationInterrupted(ctx, req); err != nil {
+				evaluation.observe("faq_interrupted", query, nil, matches, err)
+				return
+			}
+			if err := s.verifyFAQUnchanged(ctx, cfg.SearchTargets, match); err != nil {
+				evaluation.observe("faq_verify", match.Metadata.StandardQuestion, nil, []tools.FAQMatch{match}, err)
+				return
+			}
+			evaluation.observe("faq_scope", query, nil, matches, nil)
+			evaluation.Match, evaluation.Answer = &match, candidates[i].Answer
+			return
 		}
 		reviewInput, err := json.Marshal(map[string]any{"user_message": req.Query, "application_context": req.AppInfo, "recent_context": recent, "assistant_requirements": requirements, "candidate": map[string]any{"question": candidates[i].Question, "similar_questions": candidates[i].SimilarQuestions, "answer": candidates[i].Answer}})
 		if err != nil {

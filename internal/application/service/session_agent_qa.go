@@ -19,6 +19,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	modelruntime "github.com/Tencent/WeKnora/internal/models/runtime"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -50,7 +51,7 @@ func (s *sessionService) AgentQA(
 	ctx context.Context,
 	req *types.QARequest,
 	eventBus *event.EventBus,
-) (qaErr error) {
+) error {
 	if s.cfg != nil && s.cfg.Agent != nil && s.cfg.Agent.QATotalTimeoutSeconds > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.Agent.QATotalTimeoutSeconds)*time.Second)
@@ -255,33 +256,14 @@ func (s *sessionService) AgentQA(
 		llmContext = []chat.Message{}
 	}
 
-	// FAQ matching belongs to the incoming question. It runs on its own config
-	// copy while the turn is prepared and joins before the Agent starts.
-	faqCfg := *agentConfig
-	faqCfg.FAQPreflightUsage, faqCfg.FAQPreflightQuestions = nil, nil
-	faqCtx, cancelFAQ := context.WithCancel(ctx)
-	faqDone := make(chan agentFAQOutcome, 1)
-	go func() {
-		var outcome agentFAQOutcome
-		defer func() { faqDone <- outcome }()
-		defer tools.RecoverGoroutine(faqCtx, "Agent FAQ preflight", func() { outcome = agentFAQOutcome{} })
-		outcome.answered, outcome.err = s.tryAgentFAQ(faqCtx, req, &faqCfg, eventBus, summaryModel, rerankModel, llmContext)
-	}()
-	faqPending := true
-	defer func() {
-		cancelFAQ()
-		// Preparation failed before the join: a FAQ that already answered
-		// still owns the turn, as it did when it ran first.
-		if faqPending && (<-faqDone).answered {
-			qaErr = nil
-		}
-	}()
-
 	// Hold the sandbox across this turn so an install that finishes while we
 	// are running cannot rebuild the VM between tool calls. Staging below is
 	// the first resolve: if the previous turn left a stale mark, that is
 	// where the new image is picked up. HTTP send already holds the lease it
 	// took before persisting the turn, so only direct callers take one here.
+	// Acquire the lease BEFORE launching the async FAQ goroutine so defer
+	// releaseTurn() runs AFTER engine cleanup and finishFAQ() publication, and
+	// rewind-locked sessions are still rejected deterministically.
 	if !req.TurnLeaseHeld {
 		turnCtx, releaseTurn, err := s.holdSandboxTurn(ctx, sessionID, agentConfig.SandboxConfigID)
 		if err != nil {
@@ -291,217 +273,355 @@ func (s *sessionService) AgentQA(
 		ctx = turnCtx
 	}
 
-	// Reconcile all durable session attachments into the session's remote
-	// sandbox before the model can request shell or skill execution. The
-	// durable storage URL — not the ephemeral sandbox path — remains the
-	// source of truth. Gated on the sandbox manager advertising a session
-	// filesystem capability so provider-neutral remote wiring stays here.
-	var stagedAttachments []stagedSessionAttachment
+	// Keep qaCtx un-canceled by cancelPrep so post-join emission, cleanup,
+	// and engine execution never inherit a prep-only cancellation.
+	qaCtx := ctx
+	prepCtx, cancelPrep := context.WithCancel(qaCtx)
+	defer cancelPrep()
+
 	stager, ok := s.agentService.(sessionAttachmentStager)
 	if !ok {
 		return errors.New("agent service does not support session attachment staging")
 	}
-	// Probe the backend this session's sandbox actually runs on. Gating on the
-	// process-wide manager instead could inspect a different backend than the
-	// named workspace config selected by this agent.
-	inputStore, storeErr := stager.sessionSandboxInputStore(ctx, sessionID, agentConfig.SandboxConfigID)
-	if storeErr != nil {
-		return fmt.Errorf("resolve sandbox file store for session %s: %w", sessionID, storeErr)
-	}
-	mgr, _, layoutErr := resolveSandboxForExecution(
-		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
-		req.Session.TenantID, sessionID, agentConfig.SandboxConfigID, s.sandboxPolicy,
-		withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop),
+
+	baseAgentConfig := cloneAgentConfigForRun(agentConfig)
+
+	var (
+		faqCfg     *types.AgentConfig
+		faqDone    chan agentFAQOutcome
+		cancelFAQ  context.CancelFunc = func() {}
+		faqPending bool
+		finishFAQ  func() (answered, withdrawn bool, err error)
 	)
-	layout := sessionWorkspaceLayout(
-		ctx, sessionID, mgr, layoutErr, s.hostSandbox, agentConfig.SandboxConfigID,
-	)
-	if inputStore != nil && strings.TrimSpace(layout.InputDir) != "" {
-		sessionAttachments, loadErr := s.messageRepo.GetSessionAttachments(ctx, sessionID)
-		if loadErr != nil {
-			return fmt.Errorf("load session attachments for sandbox staging: %w", loadErr)
+	if faqDirectEligible(req, agentConfig, eventBus) && agentConfig.SearchTargets.MayContainFAQ() && summaryModel != nil {
+		faqCfg = cloneAgentConfigForRun(baseAgentConfig)
+		faqCfg.FAQPreflightUsage, faqCfg.FAQPreflightQuestions = nil, nil
+		var faqCtx context.Context
+		faqCtx, cancelFAQ = context.WithCancel(qaCtx)
+		defer cancelFAQ()
+		faqDone = make(chan agentFAQOutcome, 1)
+		go func() {
+			var outcome agentFAQOutcome
+			defer func() { faqDone <- outcome }()
+			defer tools.RecoverGoroutine(faqCtx, "Agent FAQ preflight", func() { outcome = agentFAQOutcome{} })
+			outcome.evaluation, outcome.err = s.preflightAgentFAQ(faqCtx, req, faqCfg, eventBus, summaryModel, rerankModel, llmContext)
+			if outcome.evaluation != nil && outcome.evaluation.reply().Answer != "" {
+				cancelPrep()
+			}
+		}()
+		finishFAQ = func() (bool, bool, error) {
+			outcome := <-faqDone
+			if outcome.err != nil {
+				return false, false, outcome.err
+			}
+			answered, err := emitAgentFAQEvaluation(qaCtx, req, eventBus, outcome.evaluation)
+			withdrawn := !answered && err == nil && prepCtx.Err() != nil && qaCtx.Err() == nil
+			return answered, withdrawn, err
 		}
-		stagedAttachments, err = stager.stageSessionAttachments(
-			ctx, sessionID, agentConfig.SandboxConfigID, req.Session.TenantID, sessionAttachments, layout,
+		faqPending = true
+	}
+
+	baseQACtx := qaCtx
+	var (
+		prep          *agentTurnPrep
+		engineStarted bool
+	)
+	releaseEngine := func() {
+		if prep == nil || prep.engine == nil || engineStarted {
+			return
+		}
+		if cleaner, ok := prep.engine.(interface{ Cleanup(context.Context) }); ok {
+			cleaner.Cleanup(context.WithoutCancel(qaCtx))
+		}
+		prep.engine = nil
+	}
+	defer releaseEngine()
+
+	prepare := func(pCtx context.Context, allowDeferStaging bool) (*agentTurnPrep, error) {
+		p := &agentTurnPrep{
+			config: cloneAgentConfigForRun(baseAgentConfig),
+			qaCtx:  baseQACtx,
+		}
+		var err error
+		// Probe the backend this session's sandbox actually runs on. Gating on the
+		// process-wide manager instead could inspect a different backend than the
+		// named workspace config selected by this agent.
+		inputStore, storeErr := stager.sessionSandboxInputStore(pCtx, sessionID, p.config.SandboxConfigID)
+		if storeErr != nil {
+			return p, fmt.Errorf("resolve sandbox file store for session %s: %w", sessionID, storeErr)
+		}
+		mgr, _, layoutErr := resolveSandboxForExecution(
+			pCtx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
+			req.Session.TenantID, sessionID, p.config.SandboxConfigID, s.sandboxPolicy,
+			withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop),
 		)
-		if err != nil {
-			return fmt.Errorf("restore session attachments into sandbox: %w", err)
-		}
-		for _, staged := range stagedAttachments {
-			if staged.AttachmentPath == "" {
-				continue
+		p.layout = sessionWorkspaceLayout(
+			pCtx, sessionID, mgr, layoutErr, s.hostSandbox, p.config.SandboxConfigID,
+		)
+		var stagedAttachments []stagedSessionAttachment
+		if inputStore != nil && strings.TrimSpace(p.layout.InputDir) != "" {
+			sessionAttachments, loadErr := s.messageRepo.GetSessionAttachments(pCtx, sessionID)
+			if loadErr != nil {
+				return p, fmt.Errorf("load session attachments for sandbox staging: %w", loadErr)
 			}
-			if agentConfig.AttachmentSandboxCopies == nil {
-				agentConfig.AttachmentSandboxCopies = make(map[string]string, len(stagedAttachments))
-			}
-			agentConfig.AttachmentSandboxCopies[staged.Path] = staged.AttachmentPath
-		}
-	}
-
-	pin, err := sandboxConfigForExistingSandbox(ctx, s.sandboxPinner, sessionID)
-	if err != nil {
-		return fmt.Errorf("read sandbox scope for child tasks: %w", err)
-	}
-	ctx = context.WithValue(ctx, childSourceKey{}, childSource{
-		Agent: req.CustomAgent, ModelID: effectiveModelID, SandboxConfigID: pin.ConfigID,
-	})
-
-	// Create agent engine with EventBus
-	logger.Info(ctx, "Creating agent engine")
-	engine, err := s.agentService.CreateAgentEngine(
-		ctx,
-		agentConfig,
-		summaryModel,
-		rerankModel,
-		eventBus,
-		sessionID,
-		req.AssistantMessageID,
-	)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to create agent engine: %v", err)
-		return err
-	}
-
-	if receiver, ok := engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
-		receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
-	}
-	if err := s.bindAgentRetrievalState(ctx, req, agentConfig, engine); err != nil {
-		return err
-	}
-
-	// Recall long-term memory for this turn. Like the RAG path this is a
-	// no-model read, and an agent may opt out of it entirely.
-	// It is applied after the FAQ preflight misses, so a FAQ answer shows no recall.
-	memoryCtx := types.ApplyAgentMemoryPreference(ctx, agentConfig.MemoryEnabled)
-	var recall interfaces.MemoryRecall
-	if s.memoryService != nil {
-		recall = s.memoryService.Recall(memoryCtx, req.Query)
-	}
-
-	// Mid-run steering: when the caller supplied a sink, the engine will drain
-	// user-appended messages at every round boundary and persist accepted ones
-	// through it. Nil (IM/embed) keeps the old behaviour untouched.
-	if req.SteerSink != nil {
-		engine.SetSteerSink(req.SteerSink)
-		if receiver, ok := engine.(interface{ SetSteerFAQ(agent.SteerFAQFunc) }); ok {
-			receiver.SetSteerFAQ(s.steerFAQ(req, agentConfig, eventBus, summaryModel, rerankModel, llmContext))
-		}
-	}
-
-	engine.SetRunMode(req.Mode)
-	if req.RunNote != "" {
-		if noted, ok := engine.(interface{ SetRunNote(string) }); ok {
-			noted.SetRunNote(req.RunNote)
-		}
-	}
-	collaborating := false
-	if bound, ok := engine.(interface{ HasCollaboration() bool }); ok {
-		collaborating = bound.HasCollaboration()
-	}
-	promptSuspend := s.cfg != nil && s.cfg.Agent.PromptSuspend()
-	if req.Suspendable && (promptSuspend || collaborating) {
-		if request, err := json.Marshal(resumableAgentRequest(ctx, req)); err != nil {
-			logger.Warnf(ctx, "Run cannot be suspended, encoding its request failed: %v", err)
-		} else {
-			engine.EnableSuspension(request)
-			// Scheduler-owned children always suspend on prompts: their approvals
-			// are forwarded to the parent and resumed by the scheduler.
-			if b := collaboration.FromContext(ctx); !promptSuspend && (b == nil || b.Child == nil) {
-				if restricted, ok := engine.(interface{ RestrictSuspensionToCollaboration() }); ok {
-					restricted.RestrictSuspensionToCollaboration()
+			if allowDeferStaging && len(sessionAttachments) == 0 {
+				// When FAQ preflight is running and the session has no attachments,
+				// AttachmentSandboxCopies is guaranteed empty. Defer the remote
+				// sandbox list/reconcile until after FAQ misses so FAQ hits never
+				// wake or probe the remote sandbox.
+				p.deferEmptyStaging = true
+			} else {
+				stagedAttachments, err = stager.stageSessionAttachments(
+					pCtx, sessionID, p.config.SandboxConfigID, req.Session.TenantID, sessionAttachments, p.layout,
+				)
+				if err != nil {
+					return p, fmt.Errorf("restore session attachments into sandbox: %w", err)
+				}
+				for _, staged := range stagedAttachments {
+					if staged.AttachmentPath == "" {
+						continue
+					}
+					if p.config.AttachmentSandboxCopies == nil {
+						p.config.AttachmentSandboxCopies = make(map[string]string, len(stagedAttachments))
+					}
+					p.config.AttachmentSandboxCopies[staged.Path] = staged.AttachmentPath
 				}
 			}
 		}
-	}
 
-	// A compaction that ends on a stored turn is written back onto it, so the
-	// next turn loads the summary instead of summarizing the same history
-	// again. Without multi-turn there is no stored history to end on.
-	if agentConfig.MultiTurnEnabled {
-		engine.SetContextCheckpointSink(messageCheckpointSink{repo: s.messageRepo, sessionID: sessionID})
-	}
+		pin, err := sandboxConfigForExistingSandbox(pCtx, s.sandboxPinner, sessionID)
+		if err != nil {
+			return p, fmt.Errorf("read sandbox scope for child tasks: %w", err)
+		}
+		childSrc := childSource{
+			Agent: req.CustomAgent, ModelID: effectiveModelID, SandboxConfigID: pin.ConfigID,
+		}
+		p.qaCtx = context.WithValue(baseQACtx, childSourceKey{}, childSrc)
+		pCtx = context.WithValue(pCtx, childSourceKey{}, childSrc)
 
-	var agentQuery string
-	var agentImageURLs []string
-	if req.Resume == nil {
-		agentQuery, agentImageURLs = composeAgentImageQuery(
-			ctx, req.Query, req.ImageDescription, agentModelSupportsVision, req.ImageURLs,
-			agentImageDescriber(engine),
+		// Create agent engine with EventBus
+		logger.Info(pCtx, "Creating agent engine")
+		p.engine, err = s.agentService.CreateAgentEngine(
+			pCtx,
+			p.config,
+			summaryModel,
+			rerankModel,
+			eventBus,
+			sessionID,
+			req.AssistantMessageID,
 		)
-		if agentModelSupportsVision && len(agentImageURLs) > 0 {
-			logger.Infof(ctx, "Agent model supports vision, passing %d image(s) directly", len(agentImageURLs))
-		} else if len(req.ImageURLs) > 0 && strings.Contains(agentQuery, "[用户上传图片内容]") {
-			logger.Infof(ctx, "Agent model does not support vision, appending image description")
-		} else if len(req.ImageURLs) > 0 {
-			logger.Warnf(ctx, "Agent model cannot view %d image(s) and no description was produced", len(req.ImageURLs))
+		if err != nil {
+			logger.Errorf(pCtx, "Failed to create agent engine: %v", err)
+			return p, err
 		}
-		if req.QuotedContext != "" {
-			agentQuery += "\n\n" + req.QuotedContext
+		if receiver, ok := p.engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
+			receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
 		}
-		// Stored documents are listed for read_file rather than pasted in;
-		// inline uploads without a stored document still carry their content.
-		if len(req.Attachments) > 0 {
-			agentQuery += req.Attachments.BuildAgentPrompt()
-			logger.Infof(ctx, "Appended %d attachment(s) to agent query", len(req.Attachments))
+		if err := s.bindAgentRetrievalState(pCtx, req, p.config, p.engine); err != nil {
+			return p, err
 		}
-		if manifest := buildSandboxAttachmentsPrompt(stagedAttachments, layout); manifest != "" {
-			agentQuery += manifest
-			logger.Infof(ctx, "Appended %d staged sandbox attachment path(s) to agent query", len(stagedAttachments))
+
+		// Recall long-term memory for this turn. Like the RAG path this is a
+		// no-model read, and an agent may opt out of it entirely.
+		// It is applied after the FAQ preflight misses, so a FAQ answer shows no recall.
+		memoryCtx := types.ApplyAgentMemoryPreference(pCtx, p.config.MemoryEnabled)
+		if s.memoryService != nil {
+			p.recall = s.memoryService.Recall(memoryCtx, req.Query)
 		}
+
+		// Mid-run steering: when the caller supplied a sink, the engine will drain
+		// user-appended messages at every round boundary and persist accepted ones
+		// through it. Nil (IM/embed) keeps the old behaviour untouched.
+		if req.SteerSink != nil {
+			p.engine.SetSteerSink(req.SteerSink)
+			if receiver, ok := p.engine.(interface{ SetSteerFAQ(agent.SteerFAQFunc) }); ok {
+				receiver.SetSteerFAQ(s.steerFAQ(req, p.config, eventBus, summaryModel, rerankModel, llmContext))
+			}
+		}
+
+		p.engine.SetRunMode(req.Mode)
+		if req.RunNote != "" {
+			if noted, ok := p.engine.(interface{ SetRunNote(string) }); ok {
+				noted.SetRunNote(req.RunNote)
+			}
+		}
+		collaborating := false
+		if bound, ok := p.engine.(interface{ HasCollaboration() bool }); ok {
+			collaborating = bound.HasCollaboration()
+		}
+		promptSuspend := s.cfg != nil && s.cfg.Agent.PromptSuspend()
+		if req.Suspendable && (promptSuspend || collaborating) {
+			if request, err := json.Marshal(resumableAgentRequest(p.qaCtx, req)); err != nil {
+				logger.Warnf(p.qaCtx, "Run cannot be suspended, encoding its request failed: %v", err)
+			} else {
+				p.engine.EnableSuspension(request)
+				// Scheduler-owned children always suspend on prompts: their approvals
+				// are forwarded to the parent and resumed by the scheduler.
+				if b := collaboration.FromContext(p.qaCtx); !promptSuspend && (b == nil || b.Child == nil) {
+					if restricted, ok := p.engine.(interface{ RestrictSuspensionToCollaboration() }); ok {
+						restricted.RestrictSuspensionToCollaboration()
+					}
+				}
+			}
+		}
+
+		// A compaction that ends on a stored turn is written back onto it, so the
+		// next turn loads the summary instead of summarizing the same history
+		// again. Without multi-turn there is no stored history to end on.
+		if p.config.MultiTurnEnabled {
+			p.engine.SetContextCheckpointSink(messageCheckpointSink{repo: s.messageRepo, sessionID: sessionID})
+		}
+
+		if req.Resume == nil {
+			p.agentQuery, p.agentImageURLs = composeAgentImageQuery(
+				pCtx, req.Query, req.ImageDescription, agentModelSupportsVision, req.ImageURLs,
+				agentImageDescriber(p.engine),
+			)
+			if agentModelSupportsVision && len(p.agentImageURLs) > 0 {
+				logger.Infof(pCtx, "Agent model supports vision, passing %d image(s) directly", len(p.agentImageURLs))
+			} else if len(req.ImageURLs) > 0 && strings.Contains(p.agentQuery, "[用户上传图片内容]") {
+				logger.Infof(pCtx, "Agent model does not support vision, appending image description")
+			} else if len(req.ImageURLs) > 0 {
+				logger.Warnf(pCtx, "Agent model cannot view %d image(s) and no description was produced", len(req.ImageURLs))
+			}
+			if req.QuotedContext != "" {
+				p.agentQuery += "\n\n" + req.QuotedContext
+			}
+			// Stored documents are listed for read_file rather than pasted in;
+			// inline uploads without a stored document still carry their content.
+			if len(req.Attachments) > 0 {
+				p.agentQuery += req.Attachments.BuildAgentPrompt()
+				logger.Infof(pCtx, "Appended %d attachment(s) to agent query", len(req.Attachments))
+			}
+			if manifest := buildSandboxAttachmentsPrompt(stagedAttachments, p.layout); manifest != "" {
+				p.agentQuery += manifest
+				logger.Infof(pCtx, "Appended %d staged sandbox attachment path(s) to agent query", len(stagedAttachments))
+			}
+		}
+
+		return p, nil
 	}
 
 	// Scope envelopes (runtime_context / must_use) are injected per LLM call inside
 	// the agent engine only; we intentionally do not persist them on user messages
 	// so multi-turn history stays clean and is not skewed by stale @mention scope.
+	var prepErr error
+	prep, prepErr = prepare(prepCtx, faqPending)
 
-	// Join the FAQ preflight: a direct answer or a failure ends the turn here.
-	faqPending = false
-	if outcome := <-faqDone; outcome.answered || outcome.err != nil {
-		if cleaner, ok := engine.(interface{ Cleanup(context.Context) }); ok {
-			cleaner.Cleanup(ctx)
+	// Join the FAQ preflight once the preparation has stopped: a direct answer
+	// or a failure ends the turn here, still under the turn lease.
+	if faqPending {
+		faqPending = false
+		if prepErr != nil {
+			cancelFAQ()
 		}
-		return outcome.err
-	}
-	if faqCfg.FAQPreflightUsage != nil {
-		addFAQPreflightUsage(agentConfig, *faqCfg.FAQPreflightUsage)
-	}
-	if len(faqCfg.FAQPreflightQuestions) > 0 {
-		agentConfig.FAQPreflightQuestions = append(agentConfig.FAQPreflightQuestions, faqCfg.FAQPreflightQuestions...)
-		if receiver, ok := engine.(interface{ SetFAQPreflightQuestions([]string) }); ok {
-			receiver.SetFAQPreflightQuestions(agentConfig.FAQPreflightQuestions)
+		answered, withdrawn, faqErr := finishFAQ()
+		switch {
+		case answered:
+			return nil
+		case faqErr != nil && (prepErr == nil || (prepCtx.Err() != nil && qaCtx.Err() == nil)):
+			return faqErr
+		case faqErr != nil && !errors.Is(faqErr, context.Canceled):
+			logger.Warnf(qaCtx, "FAQ preflight not published: %v", faqErr)
+		case withdrawn:
+			// The withdrawn answer had stopped the preparation: redo it in full on
+			// baseQACtx with a fresh AgentConfig copy so the Agent picks up the
+			// steer at its round boundaries.
+			logger.Infof(qaCtx, "FAQ answer withdrawn by a steer, preparing the agent again (session=%s, message=%s)", sessionID, req.AssistantMessageID)
+			releaseEngine()
+			prep, prepErr = prepare(baseQACtx, false)
+		}
+		if faqCfg.FAQPreflightUsage != nil && prep != nil {
+			addFAQPreflightUsage(prep.config, *faqCfg.FAQPreflightUsage)
+		}
+		if len(faqCfg.FAQPreflightQuestions) > 0 && prep != nil {
+			prep.config.FAQPreflightQuestions = append(prep.config.FAQPreflightQuestions, faqCfg.FAQPreflightQuestions...)
 		}
 	}
-	if recall.Prompt != "" {
-		engine.SetMemoryPrompt(recall.Prompt)
-		used := types.UsedMemoriesFromItems(recall.Items)
-		if err := eventBus.Emit(ctx, event.Event{
+	if prepErr != nil {
+		return prepErr
+	}
+	qaCtx = prep.qaCtx
+	if len(prep.config.FAQPreflightQuestions) > 0 {
+		if receiver, ok := prep.engine.(interface{ SetFAQPreflightQuestions([]string) }); ok {
+			receiver.SetFAQPreflightQuestions(prep.config.FAQPreflightQuestions)
+		}
+	}
+	if prep.deferEmptyStaging {
+		if _, err := stager.stageSessionAttachments(
+			qaCtx, sessionID, prep.config.SandboxConfigID, req.Session.TenantID, nil, prep.layout,
+		); err != nil {
+			return fmt.Errorf("restore session attachments into sandbox: %w", err)
+		}
+	}
+	if prep.recall.Prompt != "" {
+		prep.engine.SetMemoryPrompt(prep.recall.Prompt)
+		used := types.UsedMemoriesFromItems(prep.recall.Items)
+		if err := eventBus.Emit(qaCtx, event.Event{
 			Type:      event.EventMemoryRecalled,
 			SessionID: sessionID,
 			Data:      event.MemoryRecalledData{Memories: used},
 		}); err != nil {
-			logger.Warnf(ctx, "Failed to emit memory recalled event: %v", err)
+			logger.Warnf(qaCtx, "Failed to emit memory recalled event: %v", err)
 		}
-		logger.Infof(ctx, "Injected %d long-term memories into agent context", len(used))
+		logger.Infof(qaCtx, "Injected %d long-term memories into agent context", len(used))
 	}
 
 	// Execute agent with streaming (asynchronously)
 	// Events will be emitted to EventBus and handled by the Handler layer
-	logger.Info(ctx, "Executing agent with streaming")
-	if err := ctx.Err(); err != nil {
+	logger.Info(qaCtx, "Executing agent with streaming")
+	if err := qaCtx.Err(); err != nil {
 		return err
 	}
+	engineStarted = true
 	if req.Resume != nil {
-		_, err = engine.Resume(ctx, sessionID, req.AssistantMessageID, llmContext,
+		_, err = prep.engine.Resume(qaCtx, sessionID, req.AssistantMessageID, llmContext,
 			req.Resume.Snapshot, req.Resume.Prompt)
 	} else {
-		_, err = engine.Execute(ctx, sessionID, req.AssistantMessageID, agentQuery, llmContext, agentImageURLs)
+		_, err = prep.engine.Execute(qaCtx, sessionID, req.AssistantMessageID, prep.agentQuery, llmContext, prep.agentImageURLs)
 	}
 	if err != nil {
 		// The engine has already emitted EventError for this failure.
-		logger.Errorf(ctx, "Agent execution failed: %v", err)
+		logger.Errorf(qaCtx, "Agent execution failed: %v", err)
 	}
 	// Return empty - events will be handled by Handler via EventBus subscription
 	return nil
+}
+
+type agentTurnPrep struct {
+	config            *types.AgentConfig
+	qaCtx             context.Context
+	layout            sandbox.WorkspaceLayout
+	deferEmptyStaging bool
+	engine            interfaces.AgentEngine
+	recall            interfaces.MemoryRecall
+	agentQuery        string
+	agentImageURLs    []string
+}
+
+func cloneAgentConfigForRun(cfg *types.AgentConfig) *types.AgentConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	cloned.AllowedTools = slices.Clone(cfg.AllowedTools)
+	cloned.KnowledgeBases = slices.Clone(cfg.KnowledgeBases)
+	cloned.KnowledgeIDs = slices.Clone(cfg.KnowledgeIDs)
+	cloned.SearchTargets = cfg.SearchTargets.Clone()
+	cloned.FAQPreflightQuestions = slices.Clone(cfg.FAQPreflightQuestions)
+	cloned.MCPServices = slices.Clone(cfg.MCPServices)
+	cloned.SkillDirs = slices.Clone(cfg.SkillDirs)
+	cloned.AllowedSkills = slices.Clone(cfg.AllowedSkills)
+	cloned.TenantSkills = slices.Clone(cfg.TenantSkills)
+	cloned.PinnedMCPServiceIDs = slices.Clone(cfg.PinnedMCPServiceIDs)
+	cloned.PinnedSkillNames = slices.Clone(cfg.PinnedSkillNames)
+	cloned.WritableKBIDs = slices.Clone(cfg.WritableKBIDs)
+	cloned.AttachmentSandboxCopies = nil
+	if cfg.FAQPreflightUsage != nil {
+		usage := *cfg.FAQPreflightUsage
+		cloned.FAQPreflightUsage = &usage
+	}
+	return &cloned
 }
 
 type dataURIImageDescriber interface {
