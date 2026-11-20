@@ -32,6 +32,9 @@ Shapes of a question:
 Options and field labels are shown to the user as written, and the chosen text comes back as the answer. Write
 them in the user's language as a person would say them ("No authentication", "API key"), never as internal ids
 ("api_key"), and offer only choices the next step accepts. Leave out a field you can fill yourself.
+When choosing an implementation or procedure to perform based on documents, offer only applicable options
+the documents support and exclude those they say are unsupported for that action. If the available evidence
+does not establish a complete set, use free-text input for that choice.
 
 This tool returns the question for publication without waiting, opening an interactive card, or creating a suspended run.
 Do not call another tool or generate a second version of the question after it. Continue when the user sends their next message.`
