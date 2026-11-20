@@ -21,7 +21,7 @@ import (
 var errFAQMatchUnavailable = errors.New("FAQ matching unavailable")
 var errFAQTurnChanged = errors.New("FAQ evaluation interrupted by a changed user turn")
 
-const faqPreflightTimeout = 5 * time.Second
+const faqPreflightTimeout = 10 * time.Second
 
 type agentFAQOutcome struct {
 	answered bool
