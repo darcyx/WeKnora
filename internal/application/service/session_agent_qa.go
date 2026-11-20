@@ -20,6 +20,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	modelruntime "github.com/Tencent/WeKnora/internal/models/runtime"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
@@ -49,7 +50,7 @@ func (s *sessionService) AgentQA(
 	ctx context.Context,
 	req *types.QARequest,
 	eventBus *event.EventBus,
-) error {
+) (qaErr error) {
 	if s.cfg != nil && s.cfg.Agent != nil && s.cfg.Agent.QATotalTimeoutSeconds > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.Agent.QATotalTimeoutSeconds)*time.Second)
@@ -254,10 +255,27 @@ func (s *sessionService) AgentQA(
 		llmContext = []chat.Message{}
 	}
 
-	// FAQ matching belongs to the incoming question, before restoring the Agent's retrieval state.
-	if answered, err := s.tryAgentFAQ(ctx, req, agentConfig, eventBus, summaryModel, rerankModel, llmContext); answered || err != nil {
-		return err
-	}
+	// FAQ matching belongs to the incoming question. It runs on its own config
+	// copy while the turn is prepared and joins before the Agent starts.
+	faqCfg := *agentConfig
+	faqCfg.FAQPreflightUsage, faqCfg.FAQPreflightQuestions = nil, nil
+	faqCtx, cancelFAQ := context.WithCancel(ctx)
+	faqDone := make(chan agentFAQOutcome, 1)
+	go func() {
+		var outcome agentFAQOutcome
+		defer func() { faqDone <- outcome }()
+		defer tools.RecoverGoroutine(faqCtx, "Agent FAQ preflight", func() { outcome = agentFAQOutcome{} })
+		outcome.answered, outcome.err = s.tryAgentFAQ(faqCtx, req, &faqCfg, eventBus, summaryModel, rerankModel, llmContext)
+	}()
+	faqPending := true
+	defer func() {
+		cancelFAQ()
+		// Preparation failed before the join: a FAQ that already answered
+		// still owns the turn, as it did when it ran first.
+		if faqPending && (<-faqDone).answered {
+			qaErr = nil
+		}
+	}()
 
 	// Hold the sandbox across this turn so an install that finishes while we
 	// are running cannot rebuild the VM between tool calls. Staging below is
@@ -353,21 +371,11 @@ func (s *sessionService) AgentQA(
 
 	// Recall long-term memory for this turn. Like the RAG path this is a
 	// no-model read, and an agent may opt out of it entirely.
+	// It is applied after the FAQ preflight misses, so a FAQ answer shows no recall.
 	memoryCtx := types.ApplyAgentMemoryPreference(ctx, agentConfig.MemoryEnabled)
+	var recall interfaces.MemoryRecall
 	if s.memoryService != nil {
-		recall := s.memoryService.Recall(memoryCtx, req.Query)
-		if recall.Prompt != "" {
-			engine.SetMemoryPrompt(recall.Prompt)
-			used := types.UsedMemoriesFromItems(recall.Items)
-			if err := eventBus.Emit(ctx, event.Event{
-				Type:      event.EventMemoryRecalled,
-				SessionID: sessionID,
-				Data:      event.MemoryRecalledData{Memories: used},
-			}); err != nil {
-				logger.Warnf(ctx, "Failed to emit memory recalled event: %v", err)
-			}
-			logger.Infof(ctx, "Injected %d long-term memories into agent context", len(used))
-		}
+		recall = s.memoryService.Recall(memoryCtx, req.Query)
 	}
 
 	// Mid-run steering: when the caller supplied a sink, the engine will drain
@@ -445,6 +453,36 @@ func (s *sessionService) AgentQA(
 	// Scope envelopes (runtime_context / must_use) are injected per LLM call inside
 	// the agent engine only; we intentionally do not persist them on user messages
 	// so multi-turn history stays clean and is not skewed by stale @mention scope.
+
+	// Join the FAQ preflight: a direct answer or a failure ends the turn here.
+	faqPending = false
+	if outcome := <-faqDone; outcome.answered || outcome.err != nil {
+		if cleaner, ok := engine.(interface{ Cleanup(context.Context) }); ok {
+			cleaner.Cleanup(ctx)
+		}
+		return outcome.err
+	}
+	if faqCfg.FAQPreflightUsage != nil {
+		addFAQPreflightUsage(agentConfig, *faqCfg.FAQPreflightUsage)
+	}
+	if len(faqCfg.FAQPreflightQuestions) > 0 {
+		agentConfig.FAQPreflightQuestions = append(agentConfig.FAQPreflightQuestions, faqCfg.FAQPreflightQuestions...)
+		if receiver, ok := engine.(interface{ SetFAQPreflightQuestions([]string) }); ok {
+			receiver.SetFAQPreflightQuestions(agentConfig.FAQPreflightQuestions)
+		}
+	}
+	if recall.Prompt != "" {
+		engine.SetMemoryPrompt(recall.Prompt)
+		used := types.UsedMemoriesFromItems(recall.Items)
+		if err := eventBus.Emit(ctx, event.Event{
+			Type:      event.EventMemoryRecalled,
+			SessionID: sessionID,
+			Data:      event.MemoryRecalledData{Memories: used},
+		}); err != nil {
+			logger.Warnf(ctx, "Failed to emit memory recalled event: %v", err)
+		}
+		logger.Infof(ctx, "Injected %d long-term memories into agent context", len(used))
+	}
 
 	// Execute agent with streaming (asynchronously)
 	// Events will be emitted to EventBus and handled by the Handler layer

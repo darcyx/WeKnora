@@ -284,6 +284,27 @@ func (e *AgentEngine) SetMemoryPrompt(prompt string) {
 	e.memoryPrompt = prompt
 }
 
+// SetFAQPreflightQuestions hands search_knowledge the FAQ titles a preflight
+// that finished after the engine was built has already shown this turn.
+func (e *AgentEngine) SetFAQPreflightQuestions(questions []string) {
+	if e.toolRegistry == nil {
+		return
+	}
+	if tool, err := e.toolRegistry.GetTool(agenttools.ToolSearchKnowledge); err == nil {
+		if search, ok := tool.(*agenttools.SearchKnowledgeTool); ok {
+			search.WithFAQPreflightQuestions(questions)
+		}
+	}
+}
+
+// Cleanup releases tool resources of an engine that will not run.
+// Execute and Resume clean up on their own.
+func (e *AgentEngine) Cleanup(ctx context.Context) {
+	if e.toolRegistry != nil {
+		e.toolRegistry.Cleanup(ctx)
+	}
+}
+
 // NewAgentEngineWithSkills creates a new agent engine with skills support
 func NewAgentEngineWithSkills(
 	config *types.AgentConfig,

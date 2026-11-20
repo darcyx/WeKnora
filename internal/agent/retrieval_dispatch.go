@@ -597,7 +597,7 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 		}
 	}
 	if e.runtimeRetrievalFor(s) {
-		statePrompt += "The ordinary search allowance is spent. Read an available document using its original arguments without retrieval metadata. "
+		statePrompt += "The ordinary search allowance is spent. Only read an available document that directly addresses the requested fact (do not read unrelated or placeholder docs); pass its original arguments without retrieval metadata. "
 		for _, gap := range s.Gaps {
 			if e.retrievalSearchGapID != "" && gap.ID != e.retrievalSearchGapID {
 				continue
@@ -606,7 +606,8 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 				statePrompt += fmt.Sprintf("For %s, a supplementary search needs a grounded lead and a no_progress review (review.call_id = last_call_id). ", gap.ID)
 			}
 		}
-		return statePrompt + "Recover a needed transient failure only within its remaining allowance and recorded scope, using its original arguments. You can finish from available evidence without a review."
+		return statePrompt + "Recover a needed transient failure only within its remaining allowance and recorded scope, using its original arguments. You can finish from applicable evidence or directly use the configured no-answer response without a review when no relevant evidence exists." +
+			e.configuredNoAnswerPrompt()
 	}
 	return statePrompt +
 		"Use these harness-issued identities and allowances. Closed gaps cannot be searched again. " +

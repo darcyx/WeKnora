@@ -496,8 +496,8 @@ func TestFAQPreflightSharesBudgetAcrossStagesAndSteer(t *testing.T) {
 			require.NotNil(t, evaluation.Match)
 		}
 		require.False(t, scopeDeadline.IsZero())
-		// Exact lookup has a 10s cap; scope's 15s cap must share the original 12s deadline.
-		require.LessOrEqual(t, scopeDeadline.Sub(exactDeadline), faqPreflightTimeout-10*time.Second)
+		// Exact lookup has a 10s cap; scope's 15s cap must share the original preflight deadline.
+		require.LessOrEqual(t, scopeDeadline.Sub(exactDeadline), max(0, faqPreflightTimeout-10*time.Second))
 	}
 }
 
