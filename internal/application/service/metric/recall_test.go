@@ -26,9 +26,7 @@ func TestRecallMetric_Compute(t *testing.T) {
 				RetrievalGT:  [][]int{{1, 2, 3}, {4, 5}},
 				RetrievalIDs: []int{1, 4, 6},
 			},
-			// 命中2个ground truth集合中的元素(a和d)
-			expected: 0.41666666666666663, // (1/3 + 1/2) / 2 = 0.41666 (每个ground truth集合只要命中一个就算召回)
-
+			expected: 0.41666666666666663,
 		},
 		{
 			name: "no recall - no ground truth retrieved",
@@ -52,8 +50,7 @@ func TestRecallMetric_Compute(t *testing.T) {
 				RetrievalGT:  [][]int{{1, 2}, {3, 4}, {5, 6}},
 				RetrievalIDs: []int{1, 3, 7},
 			},
-			// 命中了前两个ground truth集合(a和c)
-			expected: 0.3333333333333333, // 1/3≈0.333...
+			expected: 0.3333333333333333,
 		},
 	}
 

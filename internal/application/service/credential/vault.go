@@ -17,15 +17,11 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
-// Owner is whose credentials a call touches. It always comes from the
-// authenticated context, never from a request body.
 type Owner struct {
 	TenantID uint64
 	UserID   string
 }
 
-// OwnerFromContext returns the signed-in web user acting in person. Embed
-// visitors, API keys, IM users and automations own no vault.
 func OwnerFromContext(ctx context.Context) (Owner, error) {
 	tenantID, ok := types.TenantIDFromContext(ctx)
 	if !ok || tenantID == 0 {
@@ -38,8 +34,6 @@ func OwnerFromContext(ctx context.Context) (Owner, error) {
 	return Owner{TenantID: tenantID, UserID: p.StorageID()}, nil
 }
 
-// Available reports whether secrets can be stored. EncryptAESGCM returns its
-// input unchanged without a key, so nothing here may run without one.
 func Available() bool { return utils.GetAESKey() != nil }
 
 func errUnavailable() error {
@@ -48,7 +42,6 @@ func errUnavailable() error {
 
 func badRequest(err error) error { return apperrors.NewBadRequestError(err.Error()) }
 
-// LoginInput is a login to store.
 type LoginInput struct {
 	Title    string
 	Site     string
@@ -57,8 +50,6 @@ type LoginInput struct {
 	Password string
 }
 
-// LoginPatch changes some fields of a saved login. Nil leaves a field as is;
-// a non-nil empty Domains resets the list to the site alone.
 type LoginPatch struct {
 	Title    *string
 	Domains  []string
@@ -66,20 +57,16 @@ type LoginPatch struct {
 	Password *string
 }
 
-// Vault stores logins for their owner.
 type Vault struct {
 	repo     interfaces.CredentialVaultRepository
 	now      func() time.Time
 	maxItems int
 }
 
-// NewVault builds a vault over repo.
 func NewVault(repo interfaces.CredentialVaultRepository) *Vault {
 	return &Vault{repo: repo, now: time.Now, maxItems: types.CredentialVaultMaxItems}
 }
 
-// sealed binds the password to its row so a ciphertext copied onto another
-// row does not open.
 type sealed struct {
 	ItemID   string `json:"item_id"`
 	UserID   string `json:"user_id"`
@@ -155,7 +142,6 @@ func mapRepoErr(err error) error {
 	return err
 }
 
-// List returns the owner's saved logins, optionally for one site.
 func (v *Vault) List(ctx context.Context, owner Owner, site string) ([]*types.CredentialVaultItem, error) {
 	if site != "" {
 		s, err := types.NormalizeHost(site)
@@ -174,7 +160,6 @@ func (v *Vault) List(ctx context.Context, owner Owner, site string) ([]*types.Cr
 	return items, nil
 }
 
-// Get returns one saved login of the owner.
 func (v *Vault) Get(ctx context.Context, owner Owner, id string) (*types.CredentialVaultItem, error) {
 	item, err := v.repo.Get(ctx, owner.TenantID, owner.UserID, strings.TrimSpace(id))
 	if err != nil {
@@ -186,7 +171,6 @@ func (v *Vault) Get(ctx context.Context, owner Owner, id string) (*types.Credent
 	return item, nil
 }
 
-// Create stores a new login.
 func (v *Vault) Create(ctx context.Context, owner Owner, in LoginInput) (*types.CredentialVaultItem, error) {
 	if !Available() {
 		return nil, errUnavailable()
@@ -234,9 +218,6 @@ func (v *Vault) Create(ctx context.Context, owner Owner, in LoginInput) (*types.
 	return item, nil
 }
 
-// Upsert stores a login, replacing only the password of the owner's existing
-// login for the same site and username. Its domains stay as they are: the
-// card's domains come from the agent, and only the vault settings widen them.
 func (v *Vault) Upsert(ctx context.Context, owner Owner, in LoginInput) (*types.CredentialVaultItem, error) {
 	if !Available() {
 		return nil, errUnavailable()
@@ -271,7 +252,6 @@ func (v *Vault) Upsert(ctx context.Context, owner Owner, in LoginInput) (*types.
 	return existing, nil
 }
 
-// Update applies a patch to a saved login.
 func (v *Vault) Update(ctx context.Context, owner Owner, id string, p LoginPatch) (*types.CredentialVaultItem, error) {
 	if !Available() {
 		return nil, errUnavailable()
@@ -312,7 +292,6 @@ func (v *Vault) Update(ctx context.Context, owner Owner, id string, p LoginPatch
 	return item, nil
 }
 
-// Delete removes a saved login.
 func (v *Vault) Delete(ctx context.Context, owner Owner, id string) error {
 	ok, err := v.repo.Delete(ctx, owner.TenantID, owner.UserID, strings.TrimSpace(id))
 	if err != nil {
@@ -324,8 +303,6 @@ func (v *Vault) Delete(ctx context.Context, owner Owner, id string) error {
 	return nil
 }
 
-// Password opens a saved login. Any failure reads as ErrCredentialUnavailable
-// so the caller cannot tell a deleted row from a rotated key.
 func (v *Vault) Password(ctx context.Context, owner Owner, id string) (*types.CredentialVaultItem, string, error) {
 	item, err := v.repo.Get(ctx, owner.TenantID, owner.UserID, id)
 	if err != nil || item == nil {
@@ -338,7 +315,6 @@ func (v *Vault) Password(ctx context.Context, owner Owner, id string) (*types.Cr
 	return item, pw, nil
 }
 
-// Touch records that a saved login was just filled.
 func (v *Vault) Touch(ctx context.Context, owner Owner, id string) error {
 	return v.repo.Touch(ctx, owner.TenantID, owner.UserID, id, v.now())
 }

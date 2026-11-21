@@ -50,7 +50,6 @@ func (r fakeResolver) Resolve(context.Context, uint64, string) (sandbox.Manager,
 	return r.mgr, nil
 }
 
-// pendingCleanups names the sessions in ids whose directory cleanup is still due.
 func pendingCleanups(t *testing.T, e *testEnv, ids ...string) []string {
 	t.Helper()
 	var out []string
@@ -91,9 +90,6 @@ func TestReleaseSessionsPersistsIntentAndSkipsSessionMode(t *testing.T) {
 	require.Empty(t, pendingCleanups(t, e, a, b))
 }
 
-// deleteOnlyMachine is what *sandbox.SessionBoundManager can do today:
-// DeleteSessionWorkspaces exists, ReclaimUserMachine does not until the
-// empty-machine GC. Cleanup must not require the later method.
 type deleteOnlyMachine struct {
 	sandbox.Manager
 	deleted [][]string
@@ -235,9 +231,6 @@ func TestReleaseMachineReclaimsAnEmptyMachine(t *testing.T) {
 	require.Nil(t, m, "an empty machine's registry row goes with it")
 }
 
-// busyReclaimer is what ReclaimUserMachine returns when work is still
-// registered: false, and it never destroys. ReleaseMachine must not add a
-// second path that deletes the machine anyway.
 type busyReclaimer struct{ fakeMachineOps }
 
 func (busyReclaimer) ReclaimUserMachine(

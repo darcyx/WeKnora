@@ -1,4 +1,3 @@
-// Tests that a password never appears in tool output, logs, or Redis.
 package credential
 
 import (
@@ -18,8 +17,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// The sentinel includes \" so a log redactor that stops at the first quote
-// would be caught leaking its tail.
 const canary = `canary-\"pw-7f3a`
 
 type recordingBrowser struct {

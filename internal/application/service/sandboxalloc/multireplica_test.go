@@ -22,9 +22,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// integrationEnv returns an integration dependency's address. Missing, the
-// test is skipped — unless WEKNORA_REQUIRE_INTEGRATION=1, which turns the
-// skip into a failure so an enablement run cannot pass by skipping.
 func integrationEnv(t *testing.T, name string) string {
 	t.Helper()
 	v := strings.TrimSpace(os.Getenv(name))
@@ -38,8 +35,6 @@ func integrationEnv(t *testing.T, name string) string {
 	return ""
 }
 
-// gatingReclaim blocks inside ReclaimUserMachine until release is closed, so
-// the replica that won the GC lock is still holding it when the other runs.
 type gatingReclaim struct {
 	reclaimRecorder
 	entered chan struct{}
@@ -128,9 +123,6 @@ func TestMultiReplicaRealRedisGCRunsOnOneReplica(t *testing.T) {
 	require.Equal(t, 1, winner.report.Reclaimed)
 }
 
-// placementDatabase is Postgres when WEKNORA_REPOSITORY_TEST_POSTGRES_DSN is
-// set, and the shared-cache sqlite pool otherwise. The sqlite path is still a
-// regression test; only WEKNORA_REQUIRE_INTEGRATION=1 demands Postgres.
 func placementDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("WEKNORA_REPOSITORY_TEST_POSTGRES_DSN"))

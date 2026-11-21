@@ -34,7 +34,6 @@ func TestMAPMetric_Compute(t *testing.T) {
 				RetrievalGT:  [][]int{{1, 2, 3}},
 				RetrievalIDs: []int{2, 5, 1, 3},
 			},
-			// AP = (1/1 + 2/3 + 3/4)/3 ≈ 0.80555555
 			expected: 0.8055555555555555,
 		},
 		{
@@ -117,9 +116,6 @@ func TestMAPMetric_Compute(t *testing.T) {
 				},
 				RetrievalIDs: []int{1, 3, 2, 4},
 			},
-			// Query1 AP: (1/1 + 2/3)/2 ≈ 0.8333
-			// Query2 AP: (1/2 + 2/4)/2 = 0.5
-			// MAP: (0.8333 + 0.5)/2 ≈ 0.6667
 			expected: 0.6666666666666666,
 		},
 	}
@@ -135,7 +131,6 @@ func TestMAPMetric_Compute(t *testing.T) {
 	}
 }
 
-// Helper function to compare floating point numbers with tolerance
 func almostEqual(a, b, tolerance float64) bool {
 	if a == b {
 		return true

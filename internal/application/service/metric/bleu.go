@@ -1,20 +1,5 @@
 package metric
 
-// references: https://github.com/waygo/bleu
-
-// Package bleu implements the BLEU method, which is used to evaluate
-// the quality of machine translation. [1]
-//
-// The code in this package was largely ported from the corresponding package
-// in Python NLTK. [2]
-//
-// [1] Papineni, Kishore, et al. "BLEU: a method for automatic evaluation of
-//     machine translation." Proceedings of the 40th annual meeting on
-//     association for computational linguistics. Association for Computational
-//     Linguistics, 2002.
-//
-// [2] http://www.nltk.org/_modules/nltk/align/bleu.html
-
 import (
 	"encoding/json"
 	"log"

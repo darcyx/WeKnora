@@ -18,7 +18,6 @@ func TestMRRMetric_Compute(t *testing.T) {
 				RetrievalGT:  [][]int{{1, 2}},
 				RetrievalIDs: []int{1, 2, 3},
 			},
-			// RR = 1/1 = 1.0
 			expected: 1.0,
 		},
 		{
@@ -27,7 +26,6 @@ func TestMRRMetric_Compute(t *testing.T) {
 				RetrievalGT:  [][]int{{1, 2}},
 				RetrievalIDs: []int{3, 1, 2},
 			},
-			// RR = 1/2 = 0.5
 			expected: 0.5,
 		},
 		{
@@ -42,12 +40,11 @@ func TestMRRMetric_Compute(t *testing.T) {
 			name: "multiple queries",
 			input: &types.MetricInput{
 				RetrievalGT: [][]int{
-					{1, 2}, // RR = 1/1 = 1.0
-					{3, 4}, // RR = 1/2 = 0.5
+					{1, 2},
+					{3, 4},
 				},
 				RetrievalIDs: []int{1, 3, 2, 4},
 			},
-			// MRR = (1.0 + 0.5)/2 = 0.75
 			expected: 0.75,
 		},
 		{
