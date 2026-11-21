@@ -37,6 +37,7 @@ type agentFAQEvaluation struct {
 	Answer       string
 	Usage        *types.TokenUsage
 	ModelID      string
+	Outcome      string
 }
 
 func (e *agentFAQEvaluation) captureUsage(cfg *types.AgentConfig, model chat.Chat) {
@@ -99,15 +100,24 @@ func emitAgentFAQEvaluation(ctx context.Context, req *types.QARequest, bus *even
 		return false, err
 	}
 	if evaluation == nil || bus == nil || !faqTurnUnsteered(ctx, req) {
+		if evaluation != nil && evaluation.Match != nil && req != nil && req.Session != nil {
+			logger.Infof(ctx, "FAQ direct answer not published: session=%s user_message=%s message=%s outcome=%s published=false",
+				req.Session.ID, req.UserMessageID, req.AssistantMessageID, evaluation.Outcome)
+		}
 		return false, nil
 	}
 	reply := evaluation.reply()
 	if reply.Answer == "" {
+		if evaluation.Match != nil && req != nil && req.Session != nil {
+			logger.Infof(ctx, "FAQ direct answer filtered: session=%s user_message=%s message=%s outcome=%s published=false",
+				req.Session.ID, req.UserMessageID, req.AssistantMessageID, evaluation.Outcome)
+		}
 		return false, nil
 	}
 	id := req.AssistantMessageID + "-faq-answer"
 	if match := evaluation.Match; match != nil {
-		logger.Infof(ctx, "FAQ direct answer: session=%s message=%s kb=%s chunk=%s", req.Session.ID, req.AssistantMessageID, match.Result.KnowledgeBaseID, match.Result.ID)
+		logger.Infof(ctx, "FAQ direct answer: session=%s user_message=%s message=%s kb=%s chunk=%s outcome=%s published=true",
+			req.Session.ID, req.UserMessageID, req.AssistantMessageID, match.Result.KnowledgeBaseID, match.Result.ID, evaluation.Outcome)
 	}
 	if err := bus.Emit(ctx, event.Event{ID: id, Type: event.EventAgentFinalAnswer,
 		SessionID: req.Session.ID, Data: event.AgentFinalAnswerData{Content: reply.Answer, Done: true}}); err != nil {

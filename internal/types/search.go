@@ -46,8 +46,8 @@ type SearchTarget struct {
 	// keyword thresholds cannot erase the whole explicit scope before reranking.
 	DisableRecallThresholds bool `json:"disable_recall_thresholds,omitempty"`
 	// KnowledgeBaseType caches the resolved KB type (e.g. "faq", "document")
-	// when known at target-build time; empty means unknown. Runtime only.
-	KnowledgeBaseType string `json:"-"`
+	// when known at target-build time; empty means unknown.
+	KnowledgeBaseType string `json:"knowledge_base_type,omitempty"`
 }
 
 // SearchTargets is a list of search targets, pre-computed at request entry point

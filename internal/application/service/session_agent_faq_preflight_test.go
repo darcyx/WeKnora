@@ -106,23 +106,25 @@ const preflightQuestion = `{"question":"哪个平台？","scope_match":"missing"
 
 func TestFAQExactFastPath(t *testing.T) {
 	for _, tc := range []struct {
-		name, question, query, certification string
-		semantic, ambiguous, changed         bool
-		wantReviews                          int
-		wantAnswer                           bool
+		name, question, query, certification, appInfo string
+		semantic, ambiguous, changed                  bool
+		wantReviews                                   int
+		wantAnswer                                    bool
 	}{
-		{"exact standalone", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, false, false, false, 0, true},
-		{"conditional", "支付问题", "支付问题", `false`, false, false, false, 1, true},
-		{"missing certification", "支付问题", "支付问题", ``, false, false, false, 1, true},
-		{"malformed certification", "支付问题", "支付问题", `"yes"`, false, false, false, 1, true},
-		{"similar question", "支付问题", "支付出错", `true`, false, false, false, 1, true},
-		{"semantic recall", "支付问题", "支付问题", `true`, true, false, false, 1, true},
-		{"ambiguous candidates", "支付问题", "支付问题", `true`, false, true, false, 1, true},
-		{"changed after selection", "支付问题", "支付问题", `true`, false, false, true, 0, false},
+		{"exact standalone", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, "", false, false, false, 0, true},
+		{"exact standalone with app_info", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, `{"env":"production","gameInfo":{"app_id":"50100336"}}`, false, false, false, 0, true},
+		{"conditional", "支付问题", "支付问题", `false`, "", false, false, false, 1, true},
+		{"missing certification", "支付问题", "支付问题", ``, "", false, false, false, 1, true},
+		{"malformed certification", "支付问题", "支付问题", `"yes"`, "", false, false, false, 1, true},
+		{"similar question", "支付问题", "支付出错", `true`, "", false, false, false, 1, true},
+		{"semantic recall", "支付问题", "支付问题", `true`, "", true, false, false, 1, true},
+		{"ambiguous candidates", "支付问题", "支付问题", `true`, "", false, true, false, 1, true},
+		{"changed after selection", "支付问题", "支付问题", `true`, "", false, false, true, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, req, cfg, repo := preflightFixture(t)
 			req.Query = tc.query
+			req.AppInfo = tc.appInfo
 			repo.chunk.Metadata = types.JSON(`{"standard_question":"` + tc.question + `","similar_questions":["支付出错"],"answers":["标准答案"]}`)
 			s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
 			original := *repo.chunk
@@ -389,6 +391,21 @@ func TestFAQSemanticDirectAnswerUsesModelScore(t *testing.T) {
 			require.Equal(t, row.ID, evaluation.Match.Result.ID)
 		}
 	}
+}
+
+func TestFAQSemanticBelowFloorSkipsCoverageLLM(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	req.CustomAgent = &types.CustomAgent{Config: types.CustomAgentConfig{FAQPriorityEnabled: true, FAQDirectAnswerThreshold: 0.9}}
+	calls := 0
+	model := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		calls++
+		return &types.ChatResponse{Content: preflightSelection}, nil
+	}}
+	evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.6}}, nil)
+	require.Nil(t, evaluation.Match)
+	require.Zero(t, calls)
+	require.Equal(t, "miss_below_floor", evaluation.Outcome)
+	require.Empty(t, cfg.FAQPreflightQuestions)
 }
 
 func TestFAQSemanticDirectAnswerRequiresGroundedFacts(t *testing.T) {

@@ -59,9 +59,26 @@ func (s *sessionService) preflightAgentFAQ(ctx context.Context, req *types.QAReq
 }
 
 func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, model chat.Chat, reranker rerank.Reranker, history []chat.Message) *agentFAQEvaluation {
+	started := time.Now()
 	evaluation := &agentFAQEvaluation{}
-	defer evaluation.captureUsage(cfg, model)
+	defer func() {
+		evaluation.captureUsage(cfg, model)
+		if req == nil || req.Session == nil {
+			return
+		}
+		outcome := evaluation.Outcome
+		if outcome == "" {
+			outcome = "miss"
+		}
+		tokens := 0
+		if evaluation.Usage != nil {
+			tokens = evaluation.Usage.TotalTokens
+		}
+		logger.Infof(ctx, "FAQ preflight finished: session=%s user_message=%s message=%s outcome=%s duration_ms=%d tokens=%d",
+			req.Session.ID, req.UserMessageID, req.AssistantMessageID, outcome, time.Since(started).Milliseconds(), tokens)
+	}()
 	if !faqRequestEligible(req, cfg) || len(cfg.SearchTargets) == 0 || model == nil {
+		evaluation.Outcome = "skip_ineligible"
 		return evaluation
 	}
 	ctx, cancel := context.WithTimeout(ctx, faqPreflightTimeout)
@@ -69,11 +86,17 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 	defer func() {
 		if err := ctx.Err(); err != nil {
 			evaluation.Match, evaluation.Answer = nil, ""
+			if errors.Is(err, context.DeadlineExceeded) {
+				evaluation.Outcome = "err_timeout"
+			} else {
+				evaluation.Outcome = "err_interrupted"
+			}
 			evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		}
 	}()
 	evaluation.Query = req.Query
 	if err := faqEvaluationInterrupted(ctx, req); err != nil {
+		evaluation.Outcome = "err_interrupted"
 		evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		return evaluation
 	}
@@ -123,6 +146,11 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 		}
 	}
 	if err != nil || len(result.CompletedTargets) == 0 {
+		if err != nil {
+			evaluation.Outcome = "err_exact_search"
+		} else {
+			evaluation.Outcome = "miss_no_target"
+		}
 		return evaluation
 	}
 	if len(result.Matches) == 0 {
@@ -130,6 +158,7 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 			evaluation.observe("faq_rewrite", req.Query, nil, nil, rewrite.err)
 		}
 		if err := faqEvaluationInterrupted(ctx, req); err != nil {
+			evaluation.Outcome = "err_interrupted"
 			evaluation.observe("faq_interrupted", query, nil, nil, err)
 			return evaluation
 		}
@@ -138,6 +167,7 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 			result, err = s.findAgentExactFAQs(ctx, query, cfg)
 			evaluation.observeSearch("faq_exact", query, result, err)
 			if err != nil {
+				evaluation.Outcome = "err_exact_search"
 				return evaluation
 			}
 		}
@@ -163,7 +193,7 @@ func faqSearchQuery(ctx context.Context, cfg *types.AgentConfig, model chat.Chat
 	}
 	modelCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	response, err := model.Chat(types.WithLLMCallMetadata(modelCtx, "query_rewrite", ""),
+	response, err := model.Chat(types.WithLLMCallMetadata(modelCtx, "faq_query_rewrite", ""),
 		[]chat.Message{{Role: "system", Content: faqRewritePrompt}, {Role: "user", Content: string(input)}},
 		&chat.ChatOptions{Temperature: 0, MaxTokens: 150})
 	if response != nil {

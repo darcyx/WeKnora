@@ -280,6 +280,11 @@ fmt:
 lint:
 	golangci-lint run
 
+# Ratchet comment lines in internal/application/service against .comment-baseline.json
+.PHONY: lint-comments
+lint-comments:
+	go run ./cmd/nocomment
+
 # Install dependencies
 deps:
 	go mod download
