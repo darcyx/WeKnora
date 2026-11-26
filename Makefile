@@ -1,4 +1,4 @@
-.PHONY: help build run test test-local clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs docs-check install-swagger build-lite run-lite package-lite anydoc-lib build-anydoc
+.PHONY: help build run test test-local clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs docs-check install-swagger build-lite run-lite package-lite anydoc-lib build-anydoc harbor-build-push harbor-build-push-app harbor-build-push-app-base harbor-build-push-frontend harbor-deploy harbor-rollback harbor-status
 
 # Show help
 help:
@@ -33,6 +33,17 @@ help:
 	@echo "  build-images-docreader 从源码构建文档读取器镜像"
 	@echo "  build-images-frontend  从源码构建前端镜像"
 	@echo "  clean-images      清理本地镜像"
+	@echo ""
+	@echo "Harbor 构建与线上部署 (harbor.dobest.com/sdk):"
+	@echo "  harbor-build-push          构建 linux/amd64 的 app + frontend 并推送至 Harbor"
+	@echo "                             可选: TAG=v0.9.1 PLATFORM=linux/amd64 HARBOR_ARGS=\"--fast\""
+	@echo "                             HARBOR_ARGS 支持: --fast / --no-anydoc / --no-browserskill / --browserskill-image <img>"
+	@echo "  harbor-build-push-app      仅构建并推送 weknora-app 至 Harbor（默认复用 weknora-app-base 基础镜像）"
+	@echo "  harbor-build-push-app-base 构建并推送 weknora-app-base 运行环境基础镜像（含 apt/python/node/uv/browserskill）"
+	@echo "  harbor-build-push-frontend 仅构建并推送 weknora-ui 至 Harbor"
+	@echo "  harbor-deploy              线上 Linux 拉取 Harbor 镜像并平滑更新 (可选 TAG=xxx)"
+	@echo "  harbor-rollback            线上 Linux 回滚至上次发布前版本"
+	@echo "  harbor-status              查看线上 app / frontend 运行镜像与健康状态"
 	@echo ""
 	@echo "数据库:"
 	@echo "  migrate-up        执行数据库迁移"
@@ -414,3 +425,25 @@ dev-app:
 
 dev-frontend:
 	./scripts/dev.sh frontend
+
+# Harbor build/push & Linux production compose deployment
+harbor-build-push:
+	./scripts/build_push_harbor.sh $(if $(TAG),--tag $(TAG),) $(HARBOR_ARGS)
+
+harbor-build-push-app:
+	./scripts/build_push_harbor.sh --app $(if $(TAG),--tag $(TAG),) $(HARBOR_ARGS)
+
+harbor-build-push-app-base:
+	./scripts/build_push_harbor.sh --app-base $(if $(BASE_TAG),--base-tag $(BASE_TAG),) $(HARBOR_ARGS)
+
+harbor-build-push-frontend:
+	./scripts/build_push_harbor.sh --frontend $(if $(TAG),--tag $(TAG),) $(HARBOR_ARGS)
+
+harbor-deploy:
+	./scripts/deploy_harbor.sh $(if $(TAG),--tag $(TAG),) $(HARBOR_ARGS)
+
+harbor-rollback:
+	./scripts/deploy_harbor.sh --rollback $(HARBOR_ARGS)
+
+harbor-status:
+	./scripts/deploy_harbor.sh --status

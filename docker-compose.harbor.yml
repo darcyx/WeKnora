@@ -1,0 +1,18 @@
+# Harbor 生产镜像覆盖配置（配合 docker-compose.yml 使用，不修改上游 compose 主文件）
+#
+# 线上 Linux 升级示例（默认 tag 为 main）：
+#   docker compose -f docker-compose.yml -f docker-compose.harbor.yml pull app frontend
+#   docker compose -f docker-compose.yml -f docker-compose.harbor.yml up -d --no-build app frontend
+#
+# 或在生产服务器 .env 中增加一行后，直接使用原生 docker compose 命令：
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.harbor.yml
+#
+# 也支持直接使用封装脚本（含发布记录、健康检查与一键回滚）：
+#   ./scripts/deploy_harbor.sh
+
+services:
+  frontend:
+    image: ${HARBOR_REGISTRY:-harbor.dobest.com}/${HARBOR_PROJECT:-sdk}/weknora-ui:${WEKNORA_UI_VERSION:-${WEKNORA_VERSION:-main}}
+
+  app:
+    image: ${HARBOR_REGISTRY:-harbor.dobest.com}/${HARBOR_PROJECT:-sdk}/weknora-app:${WEKNORA_APP_VERSION:-${WEKNORA_VERSION:-main}}

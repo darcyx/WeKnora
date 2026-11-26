@@ -36,10 +36,13 @@ ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}"
 
 # The lockfile pins the remote SheetJS archive and its integrity hash.
 COPY package.json package-lock.json ./
-RUN if [ -n "$NPM_REGISTRY" ]; then \
-      npm ci --registry="$NPM_REGISTRY"; \
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -n "$NPM_REGISTRY" ]; then \
+      reg="${NPM_REGISTRY%/}"; \
+      sed -i "s|https://registry.npmjs.org/|${reg}/|g" package-lock.json; \
+      npm ci --registry="$NPM_REGISTRY" --prefer-offline --no-audit --no-fund; \
     else \
-      npm ci; \
+      npm ci --prefer-offline --no-audit --no-fund; \
     fi
 
 COPY . .

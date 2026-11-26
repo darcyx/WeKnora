@@ -1,27 +1,69 @@
+# BrowserSkill selection:
+#   WITH_BROWSERSKILL=1        (default) build extension & daemon from source
+#   WITH_BROWSERSKILL=0        skip BrowserSkill build (empty directory, fast dev/hotfix)
+#   WITH_BROWSERSKILL=prebuilt copy /opt/weknora/browserskill from BROWSERSKILL_IMAGE
+ARG WITH_BROWSERSKILL=1
+ARG BROWSERSKILL_IMAGE=debian:12.12-slim
+
+# Runtime base selection:
+#   USE_PREBUILT_BASE=0 (default) build runtime-base from debian:12.12-slim + apt + browserskill
+#   USE_PREBUILT_BASE=1 start final stage from APP_BASE_IMAGE (skips 1.1GB apt + browserskill)
+ARG USE_PREBUILT_BASE=0
+ARG APP_BASE_IMAGE=debian:12.12-slim
+
 # Build extension and daemon from the same pinned source on the runtime architecture.
-FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+FROM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill-1
 WORKDIR /build
 # Use the same optional Debian mirror as the Go builder and runtime stages.
 ARG APK_MIRROR_ARG
-# This base image has no CA certificates. Install them from the original HTTP
-# Debian source before swapping in a mirror: mirrors.tencent.com redirects
-# apt to HTTPS, and that handshake fails without a trust store.
+ARG NPM_REGISTRY
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ARG CARGO_MIRROR_ARG
+# Try the configured mirror over HTTP first (e.g. mirrors.aliyun.com serves HTTP
+# directly without needing ca-certificates). If the mirror redirects to HTTPS
+# (e.g. mirrors.tencent.com), fall back to deb.debian.org only to bootstrap
+# ca-certificates before switching to the mirror.
 RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends ca-certificates && \
-        rm -rf /var/lib/apt/lists/* && \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+        cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.orig && \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources && \
+        { (apt-get update && apt-get install -y --no-install-recommends ca-certificates) || \
+          (mv /tmp/debian.sources.orig /etc/apt/sources.list.d/debian.sources && \
+           apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+           sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources); } && \
+        rm -f /tmp/debian.sources.orig; \
     fi && \
     apt-get update && \
     apt-get install -y --no-install-recommends git python3 ca-certificates curl build-essential cmake pkg-config && \
     rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN if [ -n "$RUSTUP_DIST_SERVER" ]; then export RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER"; fi && \
+    if [ -n "$RUSTUP_UPDATE_ROOT" ]; then export RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT"; fi && \
+    if [ -n "$RUSTUP_DIST_SERVER" ]; then \
+        curl --proto '=https' --tlsv1.2 -sSf "${RUSTUP_DIST_SERVER%/}/rustup-init.sh" | sh -s -- -y --profile minimal --default-toolchain stable; \
+    else \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; \
+    fi && \
+    if [ -n "$CARGO_MIRROR_ARG" ]; then \
+        mkdir -p "$CARGO_HOME" && \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' "$CARGO_MIRROR_ARG" > "$CARGO_HOME/config.toml"; \
+    fi
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 ARG TARGETOS
 ARG TARGETARCH
-RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/root/.local/share/pnpm/store \
+    if [ -n "$NPM_REGISTRY" ]; then export npm_config_registry="$NPM_REGISTRY"; fi && \
+    bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
+
+FROM debian:12.12-slim AS browserskill-0
+RUN mkdir -p /opt/weknora/browserskill
+
+FROM ${BROWSERSKILL_IMAGE} AS browserskill-prebuilt
+
+FROM browserskill-${WITH_BROWSERSKILL} AS browserskill
 
 # Build stage
 FROM golang:1.26-bookworm AS builder
@@ -53,16 +95,23 @@ RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate
 # so that module's go.mod must exist before `go mod download`.
 COPY go.mod go.sum ./
 COPY third_party/anydoc-go/go.mod third_party/anydoc-go/go.mod
-# GHA exports ordinary layers, not the contents of cache mounts.
-RUN go mod download
+# Mount /go/pkg/mod as a BuildKit cache across all Go steps so modules are never
+# re-downloaded and do not bloat image layers (~2.5 GB saved from GC quota).
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY cmd/download cmd/download
-RUN go run cmd/download/duckdb/duckdb.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go run cmd/download/duckdb/duckdb.go
 
 # Link the anydoc parser engine (office docs converted in-process, no
 # Python docreader). Default on so Hub / compose images ship a working
 # engine; pass WITH_ANYDOC=0 to skip the Rust toolchain (~few minutes and
 # ~1 GB of build-stage layers).
 ARG WITH_ANYDOC=1
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ARG CARGO_MIRROR_ARG
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
 COPY third_party/anydoc-go third_party/anydoc-go
@@ -70,13 +119,25 @@ COPY scripts/build-anydoc-lib.sh scripts/build-anydoc-lib.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable && \
+        if [ -n "$RUSTUP_DIST_SERVER" ]; then export RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER"; fi && \
+        if [ -n "$RUSTUP_UPDATE_ROOT" ]; then export RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT"; fi && \
+        if [ -n "$RUSTUP_DIST_SERVER" ]; then \
+            curl --proto '=https' --tlsv1.2 -sSf "${RUSTUP_DIST_SERVER%/}/rustup-init.sh" \
+                | sh -s -- -y --profile minimal --default-toolchain stable; \
+        else \
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable; \
+        fi && \
+        if [ -n "$CARGO_MIRROR_ARG" ]; then \
+            mkdir -p "$CARGO_HOME" && \
+            printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' "$CARGO_MIRROR_ARG" > "$CARGO_HOME/config.toml"; \
+        fi && \
         ./scripts/build-anydoc-lib.sh; \
     fi
 
 COPY . .
-RUN bash ./scripts/copy-licenses.sh /license-bundle
+RUN --mount=type=cache,target=/go/pkg/mod \
+    bash ./scripts/copy-licenses.sh /license-bundle
 
 # Only the final Go build depends on application source and version metadata.
 ARG VERSION_ARG
@@ -88,7 +149,8 @@ ENV BUILD_TIME=${BUILD_TIME_ARG}
 
 # Isolate cached cgo outputs when installed native libraries or AnyDoc change.
 # Read the Go version here so host machines without Go still report it correctly.
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     export GO_VERSION="$(go version)"; \
     native_cache_key="$( { dpkg-query -W -f='${Package}=${Version}\n'; go env GOOS GOARCH; echo "$GO_VERSION"; \
         if [ "$WITH_ANYDOC" = "1" ]; then sha256sum third_party/anydoc-go/lib/linux_*_gnu/libanydoc_go.a; fi; \
@@ -100,33 +162,39 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     else \
         make build-prod; \
     fi
-RUN cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
 
-# Final stage
-FROM debian:12.12-slim
+# Runtime base stage (can be built once with `--target runtime-base` and pushed
+# to a registry as a shared base image, e.g. harbor.dobest.com/sdk/weknora-app-base:v1).
+FROM debian:12.12-slim AS runtime-base-0
 
 WORKDIR /app
 
 ARG APK_MIRROR_ARG
-
-# Pairing derives the gateway URL from the user's page origin by default.
-ENV BROWSERSKILL_BINARY=/opt/weknora/browserskill/bsk \
-    BROWSERSKILL_EXTENSION_PATH=/opt/weknora/browserskill/browser-skill-weknora-0.4.1.zip
-COPY --from=browserskill /opt/weknora/browserskill /opt/weknora/browserskill
+ARG PIP_INDEX_URL
 
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
 
-# First, install ca-certificates without mirror to ensure HTTPS works
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+# Install ca-certificates (try configured mirror over HTTP first; fall back to
+# deb.debian.org only if the mirror forces HTTPS before a trust store exists).
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.orig && \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources && \
+        { (apt-get update && apt-get install -y --no-install-recommends ca-certificates) || \
+          (mv /tmp/debian.sources.orig /etc/apt/sources.list.d/debian.sources && \
+           apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+           sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources); } && \
+        rm -f /tmp/debian.sources.orig; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends ca-certificates; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
-# Then switch to mirror if specified and install other packages
-RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && \
+# Install runtime dependencies (kept before COPY --from=browserskill/builder so
+# rebuilding application or browserskill layers never invalidates this layer).
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential postgresql-client default-mysql-client tzdata sed curl bash vim wget \
         libsqlite3-0 \
@@ -134,7 +202,11 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
         nodejs npm \
         gosu \
         ffmpeg qpdf && \
-    python3 -m pip install --break-system-packages --upgrade pip setuptools wheel && \
+    if [ -n "$PIP_INDEX_URL" ]; then \
+        python3 -m pip install --no-cache-dir --break-system-packages -i "$PIP_INDEX_URL" --upgrade pip setuptools wheel; \
+    else \
+        python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip setuptools wheel; \
+    fi && \
     mkdir -p /home/appuser/.local/bin && \
     curl -LsSf https://astral.sh/uv/install.sh | CARGO_HOME=/home/appuser/.cargo UV_INSTALL_DIR=/home/appuser/.local/bin sh && \
     chown -R appuser:appuser /home/appuser && \
@@ -146,6 +218,20 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
 # Create data directories and set permissions
 RUN mkdir -p /data/files && \
     chown -R appuser:appuser /app /data/files
+
+# Pairing derives the gateway URL from the user's page origin by default.
+ENV BROWSERSKILL_BINARY=/opt/weknora/browserskill/bsk \
+    BROWSERSKILL_EXTENSION_PATH=/opt/weknora/browserskill/browser-skill-weknora-0.4.1.zip
+COPY --from=browserskill /opt/weknora/browserskill /opt/weknora/browserskill
+
+FROM runtime-base-0 AS runtime-base
+
+FROM ${APP_BASE_IMAGE} AS runtime-base-1
+
+# Final stage
+FROM runtime-base-${USE_PREBUILT_BASE} AS final
+
+WORKDIR /app
 
 # Copy migrate tool from builder stage
 COPY --from=builder /go/bin/migrate /usr/local/bin/
