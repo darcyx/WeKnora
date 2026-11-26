@@ -68,6 +68,9 @@ func (e *AgentEngine) drainSteerMessages(
 			// recovers. Unprocessed events stay pending for the next boundary.
 			break
 		}
+		// The accepted correction changes the question these findings assessed.
+		// Clear them even when the new preflight is skipped or finds no FAQ.
+		e.clearFAQPreflightFindings()
 		*messagesPtr = append(*messagesPtr, chat.Message{Role: "user", Content: types.SteerMessageContent(content)})
 		state.PendingSteerMessages = append(state.PendingSteerMessages, userMessageID)
 		e.recordSteerMessage(userMessageID, content)
@@ -96,6 +99,9 @@ func (e *AgentEngine) drainSteerMessages(
 type SteerFAQReply struct {
 	Answer string
 	Usage  *types.TokenUsage
+	// Questions and Rejections are the steer review's findings for the running tools.
+	Questions  []string
+	Rejections map[string]types.FAQPreflightRejection
 }
 
 type SteerFAQFunc func(ctx context.Context, id, query string, dialogue []chat.Message) (SteerFAQReply, error)
@@ -128,6 +134,8 @@ func (e *AgentEngine) finishSteerFAQ(ctx context.Context, state *types.AgentStat
 		state.AddUsage(*reply.Usage)
 		state.TurnUsage.Accumulate(*reply.Usage)
 	}
+	// Usage is already on the state; only the review findings go to the config and tools.
+	e.ApplyFAQPreflight(nil, reply.Questions, reply.Rejections)
 	if err != nil || reply.Answer == "" {
 		return false, err
 	}

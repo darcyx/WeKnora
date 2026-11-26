@@ -6,17 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	webfetch "github.com/Tencent/WeKnora/internal/infrastructure/web_fetch"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 const (
 	// defaultTavilySearchURL is the hardcoded Tavily API URL.
 	// Not configurable by tenants — prevents SSRF.
-	defaultTavilySearchURL = "https://api.tavily.com/search"
+	defaultTavilySearchURL  = "https://api.tavily.com/search"
+	defaultTavilyExtractURL = "https://api.tavily.com/extract"
 )
 
 // tavilyMaxResults is the largest max_results value the Tavily search API accepts.
@@ -28,9 +32,11 @@ var (
 
 // TavilyProvider implements web search using Tavily Search API
 type TavilyProvider struct {
-	client  *http.Client
-	baseURL string
-	apiKey  string
+	client      *http.Client
+	baseURL     string
+	apiKey      string
+	extractURL  string
+	checkTarget func(string) error
 }
 
 // NewTavilyProvider creates a new Tavily provider from parameters (no environment variables).
@@ -43,10 +49,81 @@ func NewTavilyProvider(params types.WebSearchProviderParameters) (interfaces.Web
 		return nil, err
 	}
 	return &TavilyProvider{
-		client:  client,
-		baseURL: defaultTavilySearchURL,
-		apiKey:  params.APIKey,
+		client:     client,
+		baseURL:    defaultTavilySearchURL,
+		apiKey:     params.APIKey,
+		extractURL: defaultTavilyExtractURL,
 	}, nil
+}
+
+func NewTavilyFetch(params types.WebSearchProviderParameters) (interfaces.WebFetcher, error) {
+	provider, err := NewTavilyProvider(params)
+	if err != nil {
+		return nil, err
+	}
+	return provider.(*TavilyProvider), nil
+}
+
+func (p *TavilyProvider) Fetch(ctx context.Context, pageURL string) (*types.WebPage, error) {
+	pageURL = strings.TrimSpace(pageURL)
+	if _, err := validateDeepSeekFetchURL(pageURL); err != nil {
+		return nil, err
+	}
+	checkTarget := p.checkTarget
+	if checkTarget == nil {
+		checkTarget = utils.ValidateURLForSSRF
+	}
+	if err := checkTarget(pageURL); err != nil {
+		return nil, &webfetch.FetchError{Code: webfetch.ErrorSSRFRejected, Err: fmt.Errorf("URL rejected: %w", err)}
+	}
+	body, err := json.Marshal(map[string]any{"urls": []string{pageURL}, "format": "markdown"})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.extractURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		code, retryable := webfetch.ErrorHTTPStatus, false
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			code = webfetch.ErrorProviderAuth
+		case resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == 432 || resp.StatusCode == 433:
+			code = webfetch.ErrorProviderFetch
+		case resp.StatusCode == http.StatusTooManyRequests:
+			code, retryable = webfetch.ErrorHTTP429, true
+		case resp.StatusCode >= 500:
+			code, retryable = webfetch.ErrorHTTP5xx, true
+		}
+		return nil, &webfetch.FetchError{Code: code, Retryable: retryable, Err: fmt.Errorf("Tavily extract returned HTTP %d", resp.StatusCode)}
+	}
+	raw, err := readCapped(resp.Body, 0)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Results []struct {
+			URL        string `json:"url"`
+			RawContent string `json:"raw_content"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	for _, page := range result.Results {
+		if page.URL == pageURL && strings.TrimSpace(page.RawContent) != "" {
+			return &types.WebPage{Content: page.RawContent, Source: p.Name()}, nil
+		}
+	}
+	return nil, &webfetch.FetchError{Code: webfetch.ErrorProviderFetch, Retryable: true, Err: fmt.Errorf("Tavily did not return page content")}
 }
 
 // Name returns the provider name

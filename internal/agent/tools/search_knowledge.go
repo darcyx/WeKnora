@@ -53,8 +53,9 @@ var searchKnowledgeTool = BaseTool{
 		"In hybrid and semantic mode write query as one complete natural-language question or statement that " +
 		"names the subject and what you want to know (\"Why does Echo use open-weight models to cut cost?\"), " +
 		"not a keyword list (\"Echo open-weight cost\"): results are ranked by a relevance model that scores " +
-		"meaning. In keyword mode write the exact terms. Pass knowledge_base_ids to focus on the bases whose " +
-		"profile fits the question. Start with the user's question, resolving only necessary references or " +
+		"meaning. In keyword mode write the exact terms. Omit knowledge_base_ids by default to search all " +
+		"authorized bases in scope; pass knowledge_base_ids only when the user names a specific base or you are " +
+		"verifying a previously matched base. Start with the user's question, resolving only necessary references or " +
 		"omissions. Preserve its subjects, comparison dimensions and constraints; do not introduce new goals " +
 		"or broaden the task to related topics. Each follow-up search must address a specific evidence gap " +
 		"needed to answer the original question; it may focus on a comparison subject whose evidence is missing. " +
@@ -86,7 +87,7 @@ var searchKnowledgeTool = BaseTool{
     },
     "knowledge_base_ids": {
       "type": "array",
-      "description": "Optional kb://N knowledge-base handles from the runtime context to restrict the search",
+      "description": "Optional kb://N knowledge-base handles from the runtime context; omit by default to search all authorized bases, pass only when the user specifies a source or to re-check a matched base",
       "items": { "type": "string" },
       "maxItems": 10
     },
@@ -138,8 +139,9 @@ type SearchKnowledgeTool struct {
 	// patternFilter, when set, keeps only results whose text matches it.
 	// It is not exposed to the model; the MCP grep_chunks endpoint uses it
 	// to keep grep semantics on top of index-backed retrieval.
-	patternFilter      *regexp.Regexp
-	preflightQuestions []string
+	patternFilter       *regexp.Regexp
+	preflightQuestions  []string
+	preflightRejections map[string]types.FAQPreflightRejection
 	// contextImages attaches the images of results found by an image's own
 	// vector, for a model that can see them; see WithContextImages.
 	contextImages bool
@@ -164,6 +166,11 @@ func (t *SearchKnowledgeTool) WithContextImages(enabled bool) *SearchKnowledgeTo
 
 func (t *SearchKnowledgeTool) WithFAQPreflightQuestions(questions []string) *SearchKnowledgeTool {
 	t.preflightQuestions = questions
+	return t
+}
+
+func (t *SearchKnowledgeTool) WithFAQPreflightRejections(rejections map[string]types.FAQPreflightRejection) *SearchKnowledgeTool {
+	t.preflightRejections = rejections
 	return t
 }
 
@@ -309,8 +316,45 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 		"[Tool][SearchKnowledge] query=%q mode=%s limit=%d top_k=%d targets=%d kbs=%d",
 		query, mode, limit, topK, len(searchTargets), len(kbIDs))
 
-	allResults, searchFailures, searchCalls, embedFallbacks, completed := t.concurrentSearchByTargets(ctx, query, mode,
-		kbModes, searchTargets, kbList, topK, vectorThreshold, keywordThreshold, kbTypeMap)
+	var (
+		allResults     []*searchResultWithMeta
+		searchFailures []types.RetrievalFailure
+		searchCalls    int
+		embedFallbacks map[string]string
+		completed      types.SearchTargets
+	)
+	uncachedTargets := searchTargets
+	if cache := faqPreflightCacheFromContext(ctx); cache != nil && t.patternFilter == nil {
+		var remaining types.SearchTargets
+		for _, st := range searchTargets {
+			if st != nil && kbTypeMap[st.KnowledgeBaseID] == types.KnowledgeBaseTypeFAQ {
+				if cachedRows, hit := cache.lookup(query, st, limit); hit {
+					for _, r := range cachedRows {
+						allResults = append(allResults, &searchResultWithMeta{
+							SearchResult:      r,
+							SourceQuery:       query,
+							QueryType:         SearchModeSemantic,
+							KnowledgeBaseID:   r.KnowledgeBaseID,
+							KnowledgeBaseType: types.KnowledgeBaseTypeFAQ,
+						})
+					}
+					completed = append(completed, types.SearchTargets{st}.Clone()...)
+					continue
+				}
+			}
+			remaining = append(remaining, st)
+		}
+		uncachedTargets = remaining
+	}
+	if len(uncachedTargets) > 0 {
+		fetched, failures, calls, fallbacks, fetchedCompleted := t.concurrentSearchByTargets(ctx, query, mode,
+			kbModes, uncachedTargets, kbList, topK, vectorThreshold, keywordThreshold, kbTypeMap)
+		allResults = append(allResults, fetched...)
+		searchFailures = failures
+		searchCalls = calls
+		embedFallbacks = fallbacks
+		completed = append(completed, fetchedCompleted...)
+	}
 	completedIDs := completed.GetAllKnowledgeBaseIDs()
 	var skipped []map[string]interface{}
 	for _, kb := range kbList {
@@ -349,7 +393,7 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	var rerankOutcome types.RerankOutcome
 	var rerankFailure error
 	if t.rerankModel != nil && len(deduplicated) > 0 {
-		reranked, outcome, err := t.rerankResultsWithPolicy(ctx, query, deduplicated, mode == SearchModeKeyword, false)
+		reranked, outcome, err := t.rerankResultsWithKBs(ctx, query, deduplicated, kbList, mode == SearchModeKeyword, false)
 		rerankOutcome = outcome
 		if err != nil {
 			rerankFailure = err
@@ -367,7 +411,11 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	// ranked results.
 	ranked, keptOutside := splitKeptOutsideTopK(ranked)
 	if len(ranked) > 0 {
-		if selected := selectMMR(ctx, ranked, min(len(ranked), retrievalLimit)); len(selected) > 0 {
+		var seen map[string]bool
+		if execution != nil {
+			seen = execution.SeenChunkIDs
+		}
+		if selected := selectMMRWithSeen(ctx, ranked, min(len(ranked), retrievalLimit), seen); len(selected) > 0 {
 			ranked = selected
 		}
 	}
@@ -382,6 +430,9 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	if t.patternFilter != nil {
 		final = t.matchingPattern(ctx, final)
 		keptOutside = t.matchingPattern(ctx, keptOutside)
+	}
+	if execution != nil && len(execution.SeenChunkIDs) > 0 {
+		final = deprioritizeSeenResults(final, execution.SeenChunkIDs)
 	}
 	if len(final) > limit {
 		final = final[:limit]
@@ -429,7 +480,7 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	if rerankFailure != nil {
 		failure := newRetrievalFailure(searchTargets, "rerank", rerankFailure)
 		failure.Retry = func(ctx context.Context) (*types.ToolResult, error) {
-			rows, _, err := t.rerankResultsWithPolicy(ctx, query, deduplicated, mode == SearchModeKeyword, false)
+			rows, _, err := t.rerankResultsWithKBs(ctx, query, deduplicated, kbList, mode == SearchModeKeyword, false)
 			if err != nil {
 				return &types.ToolResult{Output: "Reranking the retained candidates failed", Error: err.Error()}, err
 			}
@@ -540,7 +591,35 @@ func (t *SearchKnowledgeTool) formatWithinBudget(
 			if len(candidates) == 3 {
 				break
 			}
-			if row.KnowledgeID == "" || row.KnowledgeBaseType == types.KnowledgeBaseTypeFAQ || seen[row.KnowledgeID] {
+			if row.KnowledgeBaseType == types.KnowledgeBaseTypeFAQ {
+				if row.ID == "" || seen["faq:"+row.ID] {
+					continue
+				}
+				titleText := row.KnowledgeTitle
+				if meta, err := faqMetadataFromResult(row.SearchResult); err == nil && meta != nil && strings.TrimSpace(meta.StandardQuestion) != "" {
+					titleText = strings.TrimSpace(meta.StandardQuestion)
+				}
+				title := []rune(titleText)
+				if len(title) > 80 {
+					title = title[:80]
+				}
+				line := fmt.Sprintf("<candidate chunk_id=\"%s\" knowledge_id=\"%s\" knowledge_base_id=\"%s\" chunk_type=\"faq\" title=\"%s\"/>\n", xmlEscape(row.ID), xmlEscape(row.KnowledgeID), xmlEscape(row.KnowledgeBaseID), xmlEscape(string(title)))
+				if utf8.RuneCountInString(out.Output)+index.Len()+utf8.RuneCountInString(line)+80 > budget {
+					break
+				}
+				seen["faq:"+row.ID] = true
+				index.WriteString(line)
+				candidates = append(candidates, map[string]interface{}{
+					"chunk_id":          row.ID,
+					"knowledge_id":      row.KnowledgeID,
+					"knowledge_base_id": row.KnowledgeBaseID,
+					"chunk_type":        "faq",
+					"title":             string(title),
+				})
+				out.PublishedSources = append(out.PublishedSources, types.PublishedSourceRef{ID: row.ID})
+				continue
+			}
+			if row.KnowledgeID == "" || seen[row.KnowledgeID] {
 				continue
 			}
 			title := []rune(row.KnowledgeTitle)
@@ -554,6 +633,7 @@ func (t *SearchKnowledgeTool) formatWithinBudget(
 			seen[row.KnowledgeID] = true
 			index.WriteString(line)
 			candidates = append(candidates, map[string]interface{}{"knowledge_id": row.KnowledgeID, "knowledge_base_id": row.KnowledgeBaseID, "title": string(title)})
+			out.PublishedSources = append(out.PublishedSources, types.PublishedSourceRef{ID: row.KnowledgeID})
 		}
 		if len(candidates) > 0 {
 			out.Output += "\n<omitted_candidates>\n" + index.String() + "</omitted_candidates>"
@@ -574,6 +654,25 @@ func (t *SearchKnowledgeTool) formatWithinBudget(
 		}
 	}
 	return result, len(results) - best
+}
+
+func deprioritizeSeenResults(results []*searchResultWithMeta, seen map[string]bool) []*searchResultWithMeta {
+	if len(results) <= 1 || len(seen) == 0 {
+		return results
+	}
+	unseen := make([]*searchResultWithMeta, 0, len(results))
+	repeated := make([]*searchResultWithMeta, 0, len(results))
+	for _, r := range results {
+		if r != nil && r.SearchResult != nil && seen[r.ID] {
+			repeated = append(repeated, r)
+		} else {
+			unseen = append(unseen, r)
+		}
+	}
+	if len(unseen) == 0 || len(repeated) == 0 {
+		return results
+	}
+	return append(unseen, repeated...)
 }
 
 // emptySearchStatement describes an empty result, including any mode
@@ -1005,6 +1104,17 @@ func (t *SearchKnowledgeTool) rerankResultsWithPolicy(
 	orderOnly bool,
 	requireThreshold bool,
 ) ([]*searchResultWithMeta, types.RerankOutcome, error) {
+	return t.rerankResultsWithKBs(ctx, query, results, nil, orderOnly, requireThreshold)
+}
+
+func (t *SearchKnowledgeTool) rerankResultsWithKBs(
+	ctx context.Context,
+	query string,
+	results []*searchResultWithMeta,
+	knownKBs []*types.KnowledgeBase,
+	orderOnly bool,
+	requireThreshold bool,
+) ([]*searchResultWithMeta, types.RerankOutcome, error) {
 	if len(results) == 0 || t.rerankModel == nil {
 		return results, "", nil
 	}
@@ -1019,15 +1129,16 @@ func (t *SearchKnowledgeTool) rerankResultsWithPolicy(
 	}
 	_, vectorThreshold, _ := t.retrievalParams(0)
 	opts := reranking.Options{
-		Threshold:        threshold,
-		FallbackMinScore: reranking.FallbackMinScore(t.searchTargets.HasRecallThresholdOverride()),
-		MaxCandidates:    reranking.DefaultMaxCandidates,
-		ImageKeepScore:   reranking.ImageKeepScoreFor(vectorThreshold),
+		Threshold:           threshold,
+		FallbackMinScore:    reranking.FallbackMinScore(t.searchTargets.HasRecallThresholdOverride()),
+		MaxCandidates:       reranking.DefaultMaxCandidates,
+		ImageKeepScore:      reranking.ImageKeepScoreFor(vectorThreshold),
+		ImageOCRScoreFactor: reranking.DefaultImageOCRScoreFactor,
 	}
 	if t.knowledgeBaseService != nil {
 		opts.LoadImage = t.knowledgeBaseService.ReadChunkImage
 		if ids := types.SearchResultKnowledgeBaseIDs(rows); len(ids) > 0 {
-			kbs, err := t.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, ids)
+			kbs, err := t.resolveKnowledgeBasesForRerank(ctx, ids, knownKBs)
 			if err != nil {
 				logger.Warnf(ctx, "[Tool][SearchKnowledge] Failed to read question generation config: %v", err)
 			} else {
@@ -1057,6 +1168,36 @@ func (t *SearchKnowledgeTool) rerankResultsWithPolicy(
 	logger.Infof(ctx, "[Tool][SearchKnowledge] Reranked %d/%d results above threshold %.2f (%s)",
 		len(reranked), len(results), threshold, res.Diagnostics.Outcome)
 	return reranked, res.Diagnostics.Outcome, nil
+}
+
+func (t *SearchKnowledgeTool) resolveKnowledgeBasesForRerank(
+	ctx context.Context,
+	ids []string,
+	knownKBs []*types.KnowledgeBase,
+) ([]*types.KnowledgeBase, error) {
+	byID := make(map[string]*types.KnowledgeBase, len(knownKBs))
+	for _, kb := range knownKBs {
+		if kb != nil && kb.ID != "" {
+			byID[kb.ID] = kb
+		}
+	}
+	resolved := make([]*types.KnowledgeBase, 0, len(ids))
+	var missing []string
+	for _, id := range ids {
+		if kb, ok := byID[id]; ok {
+			resolved = append(resolved, kb)
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return resolved, nil
+	}
+	fetched, err := t.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, missing)
+	if err != nil {
+		return nil, err
+	}
+	return append(resolved, fetched...), nil
 }
 
 // faqMetadataFromResult parses FAQ metadata carried on the search result.
@@ -1221,7 +1362,8 @@ func (t *SearchKnowledgeTool) formatOutput(
 	}
 	if len(results) == 0 {
 		return &types.ToolResult{
-			Success: true,
+			Success:          true,
+			PublishedSources: []types.PublishedSourceRef{},
 			Output: fmt.Sprintf("No matching chunks for %q (mode=%s) in %d knowledge base(s).",
 				query, mode, len(kbsToSearch)),
 			Data: data,
@@ -1239,9 +1381,12 @@ func (t *SearchKnowledgeTool) formatOutput(
 	writeKnowledgeMetadataHeader(&ob, results)
 
 	formattedResults := make([]map[string]interface{}, 0, len(results))
+	publishedSources := make([]types.PublishedSourceRef, 0, len(results)*2)
+	var preflightRejections []string
 	queries := []string{query}
 
 	for i, result := range results {
+		publishedSources = append(publishedSources, types.PublishedSourceRef{ID: result.ID, Citable: true}, types.PublishedSourceRef{ID: result.KnowledgeID, Citable: true})
 		var faqMeta *types.FAQChunkMetadata
 		if result.KnowledgeBaseType == types.KnowledgeBaseTypeFAQ {
 			meta, err := faqMetadataFromResult(result.SearchResult)
@@ -1316,6 +1461,9 @@ func (t *SearchKnowledgeTool) formatOutput(
 			row["images"] = images
 		}
 		if isFAQ {
+			if reason := strings.TrimSpace(t.preflightRejections[result.ID].Reason); reason != "" {
+				preflightRejections = append(preflightRejections, faqMeta.StandardQuestion+": "+reason)
+			}
 			row["faq_id"] = result.ID
 			row["index"] = result.ChunkIndex
 			if faqMeta.StandardQuestion != "" {
@@ -1340,9 +1488,12 @@ func (t *SearchKnowledgeTool) formatOutput(
 	ob.WriteString("</search_results>")
 
 	data["results"] = formattedResults
+	if len(preflightRejections) > 0 {
+		data["preflight_rejection_reason"] = strings.Join(preflightRejections, "; ")
+	}
 	data["count"] = len(formattedResults)
 	data["kb_counts"] = kbCounts
-	return &types.ToolResult{Success: true, Output: ob.String(), Data: data}
+	return &types.ToolResult{Success: true, Output: ob.String(), Data: data, PublishedSources: publishedSources}
 }
 
 // getEnrichedPassage merges the raw chunk content with image captions / OCR
@@ -1392,6 +1543,31 @@ func selectMMR(ctx context.Context, results []*searchResultWithMeta, k int) []*s
 	selected := make([]*searchResultWithMeta, len(picks))
 	for i, p := range picks {
 		selected[i] = results[p]
+	}
+	return selected
+}
+
+func selectMMRWithSeen(ctx context.Context, results []*searchResultWithMeta, k int, seen map[string]bool) []*searchResultWithMeta {
+	if len(seen) == 0 || len(results) <= k {
+		return selectMMR(ctx, results, k)
+	}
+	minScore, maxScore := results[0].Score, results[0].Score
+	for _, result := range results[1:] {
+		minScore = min(minScore, result.Score)
+		maxScore = max(maxScore, result.Score)
+	}
+	rows := make([]*types.SearchResult, len(results))
+	for i, result := range results {
+		copyResult := *result.SearchResult
+		if seen[result.ID] {
+			copyResult.Score -= maxScore - minScore + 2
+		}
+		rows[i] = &copyResult
+	}
+	picks := reranking.SelectMMR(ctx, rows, k, reranking.DefaultMMRLambda)
+	selected := make([]*searchResultWithMeta, len(picks))
+	for i, pick := range picks {
+		selected[i] = results[pick]
 	}
 	return selected
 }

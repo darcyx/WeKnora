@@ -220,3 +220,20 @@ func fmtBool(value bool) string {
 	}
 	return "off"
 }
+
+func TestRuntimeContractEnforcesNoUnsupportedNegationAndGeneralTroubleshooting(t *testing.T) {
+	for _, custom := range []string{"", "Custom assistant prompt."} {
+		sections := BuildSystemPromptSections(
+			[]*KnowledgeBaseInfo{{ID: "kb", Capabilities: []string{"chunks"}}},
+			false,
+			&BuildSystemPromptOptions{SelectedTools: []string{tools.ToolSearchKnowledge}},
+			custom,
+		)
+		prompt := renderSystemPromptSections(sections)
+		require.Contains(t, prompt, "never infer or assert that it is unsupported")
+		require.Contains(t, prompt, "follow the base workflow for searching and asking the user")
+		require.Contains(t, prompt, "do not give steps that depend on an unresolved condition")
+		require.Contains(t, prompt, "ask the user to clarify rather than expanding multiple branches at once")
+		require.Contains(t, prompt, "Honor explicit requests to compare multiple branches")
+	}
+}

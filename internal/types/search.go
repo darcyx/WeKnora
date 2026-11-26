@@ -45,10 +45,28 @@ type SearchTarget struct {
 	// user-selected scope. The reranker still orders candidates, but vector and
 	// keyword thresholds cannot erase the whole explicit scope before reranking.
 	DisableRecallThresholds bool `json:"disable_recall_thresholds,omitempty"`
+	// KnowledgeBaseType caches the resolved KB type (e.g. "faq", "document")
+	// when known at target-build time; empty means unknown.
+	KnowledgeBaseType string `json:"knowledge_base_type,omitempty"`
 }
 
 // SearchTargets is a list of search targets, pre-computed at request entry point
 type SearchTargets []*SearchTarget
+
+// MayContainFAQ reports whether any target is an FAQ knowledge base or has an
+// unknown KB type (so callers must not skip FAQ matching). Returns false only
+// when every target is known to be a non-FAQ knowledge base (or targets is empty).
+func (st SearchTargets) MayContainFAQ() bool {
+	for _, target := range st {
+		if target == nil || target.KnowledgeBaseID == "" {
+			continue
+		}
+		if target.KnowledgeBaseType == "" || target.KnowledgeBaseType == KnowledgeBaseTypeFAQ {
+			return true
+		}
+	}
+	return false
+}
 
 // Clone keeps runtime reservations independent of later scope changes.
 func (st SearchTargets) Clone() SearchTargets {

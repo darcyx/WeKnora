@@ -545,7 +545,7 @@ type WikiConfig struct {
 	AutoGenerate *bool `yaml:"auto_generate,omitempty" json:"auto_generate,omitempty" default:"true" extensions:"x-agent=wiki_auto_generate"`
 	// SynthesisModelID is the model that writes Wiki pages. Empty uses summary_model_id.
 	SynthesisModelID string `yaml:"synthesis_model_id" json:"synthesis_model_id" extensions:"x-agent=wiki_synthesis_model_id"`
-	// MaxPagesPerIngest limits pages created or updated per ingest. 0 means no limit.
+	// MaxPagesPerIngest limits new entity and concept pages per document. Existing pages and summaries are not counted. 0 means no limit.
 	MaxPagesPerIngest int `yaml:"max_pages_per_ingest" json:"max_pages_per_ingest" minimum:"0" maximum:"1000" extensions:"x-agent=wiki_max_pages"`
 	// ExtractionGranularity is focused, standard or exhaustive. Empty means standard.
 	ExtractionGranularity WikiExtractionGranularity `yaml:"extraction_granularity" json:"extraction_granularity,omitempty" enums:"focused,standard,exhaustive" extensions:"x-agent=wiki_granularity"`

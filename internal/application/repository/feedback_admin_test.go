@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
@@ -43,7 +44,7 @@ func feedbackAdminFixture(t *testing.T) (*FeedbackRepository, types.FeedbackQuer
 		`CREATE TABLE sessions (id TEXT PRIMARY KEY, tenant_id INTEGER, user_id TEXT, title TEXT, deleted_at DATETIME)`,
 		`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, deleted_at DATETIME)`,
 		`CREATE TABLE knowledge_bases (id TEXT PRIMARY KEY, tenant_id INTEGER, name TEXT, deleted_at DATETIME)`,
-		`CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, request_id TEXT, role TEXT, content TEXT, knowledge_references TEXT, feedback TEXT, created_at DATETIME, deleted_at DATETIME)`,
+		`CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, request_id TEXT, role TEXT, content TEXT, knowledge_references TEXT, feedback TEXT, created_at DATETIME, updated_at DATETIME, deleted_at DATETIME)`,
 		`INSERT INTO sessions VALUES ('s1',1,'alice','one',NULL),('s2',1,'bob','two',NULL),('s3',2,'eve','secret',NULL)`,
 		`INSERT INTO users VALUES ('alice','Alice',NULL),('bob','Bob',NULL),('eve','Eve',NULL)`,
 		`INSERT INTO knowledge_bases VALUES ('kb1',1,'Support',NULL)`,
@@ -100,13 +101,13 @@ func TestFeedbackAdminUnifiedPaginationAndDetail(t *testing.T) {
 			require.Empty(t, v.Answers)
 		}
 	}
-	rows, err := r.Detail(ctx, 1, "message", "s1", "req1", "m3")
+	rows, err := r.Detail(ctx, 1, "message", "s1", "m3", "m3")
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Equal(t, "real question", rows[0].Question)
 	require.Equal(t, []string{"third reply"}, rows[0].Answers)
 	require.Len(t, rows[0].References, 1)
-	rows, err = r.Detail(ctx, 1, "message", "s3", "req1", "m4")
+	rows, err = r.Detail(ctx, 1, "message", "s3", "m4", "m4")
 	require.NoError(t, err)
 	require.Empty(t, rows)
 	rows, err = r.Detail(ctx, 1, "faq", "s1", "10", "")
@@ -170,4 +171,18 @@ func TestFeedbackAdminExportLimitAndSoftDeletes(t *testing.T) {
 	require.Len(t, rows, 1)
 	require.Equal(t, "new FAQ", rows[0].Question)
 	require.NotEmpty(t, rows[0].Answers)
+}
+
+func TestMessageFeedbackUsesMessageID(t *testing.T) {
+	r, _ := feedbackAdminFixture(t)
+	require.NoError(t, r.db.Exec("UPDATE messages SET feedback=NULL WHERE id IN ('m1','m3')").Error)
+	messages := NewMessageRepository(r.db)
+	vote := types.MessageFeedback{Type: types.MessageFeedbackLike, CreatedAt: time.Now()}
+	require.NoError(t, messages.UpdateMessageFeedback(context.Background(), "s1", "m1", vote))
+	var count int64
+	require.NoError(t, r.db.Raw("SELECT COUNT(*) FROM messages WHERE id='m3' AND feedback IS NULL").Scan(&count).Error)
+	require.EqualValues(t, 1, count)
+	require.ErrorIs(t, messages.UpdateMessageFeedback(context.Background(), "s1", "m1", vote), apperrors.ErrMessageFeedbackAlreadySubmitted)
+	require.ErrorIs(t, messages.UpdateMessageFeedback(context.Background(), "s1", "req1", vote), gorm.ErrRecordNotFound)
+	require.ErrorIs(t, messages.UpdateMessageFeedback(context.Background(), "s2", "m3", vote), gorm.ErrRecordNotFound)
 }

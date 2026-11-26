@@ -147,7 +147,7 @@ func (e *AgentEngine) runtimeDocumentObserved(state retrievalState, id string) b
 			if observation.Tool == "read_document" && json.Unmarshal([]byte(observation.Arguments), &args) == nil && args.ID == id {
 				return true // Current tool authorization still applies when reloading.
 			}
-			if !observedDocumentReference(observation.Content, id) {
+			if !attemptObservedDocument(observation, id) {
 				continue
 			}
 			return true

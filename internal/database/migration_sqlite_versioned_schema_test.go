@@ -87,15 +87,15 @@ var versionedSQLiteColumns = map[string][]string{
 	"mcp_services":                {"usage_instructions"},               // 000092
 	"message_artifacts":           {"deleted_at"},                       // 000107
 	"tenant_skills": {
-		"envs", "served", "catalog_id", "install_session_id", "install_message_id",
-	}, // 000028
+		"envs", "served", "catalog_id", "install_session_id", "install_message_id", "required_tools",
+	}, // 000028, 999004
 	"tenant_skill_snapshots": {"planned_name"}, // 000028
 	"tenant_user_env_vars": {
 		"principal_type", "principal_id", "sandbox_config_id", "skill_id", "name", "value",
 	}, // 000028
 }
 
-const expectedSQLiteMigrationVersion = 999003
+const expectedSQLiteMigrationVersion = 999004
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
@@ -510,4 +510,30 @@ func TestSQLiteSessionKindBackfillAndRollback(t *testing.T) {
 	var count int
 	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&count))
 	require.Equal(t, len(configs), count)
+}
+
+func TestSQLiteSkillRequiredToolsMigrationRollbackAndReapply(t *testing.T) {
+	repoRoot := sqliteRepoRoot(t)
+	chdirAndRestore(t, repoRoot)
+	dbPath := filepath.Join(t.TempDir(), "skills.db")
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	driver, err := sqlite3migrate.WithInstance(db, &sqlite3migrate.Config{})
+	require.NoError(t, err)
+	m, err := migrate.NewWithDatabaseInstance("file://migrations/sqlite", "sqlite3", driver)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+
+	for _, table := range []string{"tenant_skills", "tenant_skill_catalog"} {
+		require.True(t, sqliteColumnExists(t, db, table, "required_tools"))
+	}
+	require.NoError(t, m.Steps(-1))
+	for _, table := range []string{"tenant_skills", "tenant_skill_catalog"} {
+		require.False(t, sqliteColumnExists(t, db, table, "required_tools"))
+	}
+	require.NoError(t, m.Steps(1))
+	for _, table := range []string{"tenant_skills", "tenant_skill_catalog"} {
+		require.True(t, sqliteColumnExists(t, db, table, "required_tools"))
+	}
 }

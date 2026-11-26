@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/config"
@@ -90,6 +92,8 @@ type webClient struct {
 	timeout      time.Duration
 	blacklist    []string
 	fetcher      interfaces.WebFetcher
+	seenMu       sync.RWMutex
+	seenURLs     map[string]struct{}
 }
 
 func (c *webClient) Capabilities() types.WebSearchCapabilities {
@@ -117,14 +121,46 @@ func (c *webClient) Search(ctx context.Context, req types.WebSearchRequest) ([]*
 	if err != nil {
 		return nil, fmt.Errorf("web search failed: %w", err)
 	}
-	return filterBlacklist(results, c.blacklist), nil
+	results = filterBlacklist(results, c.blacklist)
+	if c.providerType == "tavily" {
+		c.seenMu.Lock()
+		if c.seenURLs == nil {
+			c.seenURLs = make(map[string]struct{})
+		}
+		for _, result := range results {
+			if result != nil {
+				c.seenURLs[tavilyURLKey(result.URL)] = struct{}{}
+			}
+		}
+		c.seenMu.Unlock()
+	}
+	return results, nil
 }
 
 func (c *webClient) Fetch(ctx context.Context, pageURL string) (*types.WebPage, error) {
+	if c.providerType == "tavily" {
+		c.seenMu.RLock()
+		_, seen := c.seenURLs[tavilyURLKey(pageURL)]
+		c.seenMu.RUnlock()
+		if !seen {
+			return infra_web_search.LocalFetcher().Fetch(ctx, pageURL)
+		}
+	}
 	return c.fetcher.Fetch(ctx, pageURL)
 }
 
-// resolveProviderCall loads the saved WebSearchProviderEntity for this call.
+func tavilyURLKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return trimmed
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
 // The provider ID is chosen by the caller: an agent override, or the tenant's
 // default provider. WebSearchConfig no longer selects the engine or its API key.
 func resolveProviderCall(

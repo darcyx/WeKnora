@@ -13,7 +13,7 @@ import (
 
 // SubmitMessageFeedback records a vote on a FAQ (numeric ID) or assistant message.
 // FAQ votes validate the session owner and tenant before resolving the entry.
-// Other IDs identify a request; resolve its assistant reply within the session.
+// Other IDs identify an assistant message within the session.
 func (s *messageService) SubmitMessageFeedback(
 	ctx context.Context,
 	sessionID string,
@@ -88,14 +88,13 @@ func (s *messageService) SubmitMessageFeedback(
 	return message, nil
 }
 
-// getAssistantMessageForFeedback checks ownership before looking up a request's
-// assistant reply. Feedback is a write operation, so no admin read fallback.
-func (s *messageService) getAssistantMessageForFeedback(ctx context.Context, sessionID, requestID string) (*types.Message, error) {
+// getAssistantMessageForFeedback checks session ownership before looking up the message.
+func (s *messageService) getAssistantMessageForFeedback(ctx context.Context, sessionID, messageID string) (*types.Message, error) {
 	tenantID := types.MustTenantIDFromContext(ctx)
 	if _, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID); err != nil {
 		return nil, err
 	}
-	return s.messageRepo.GetAssistantMessageByRequestID(ctx, sessionID, requestID)
+	return s.messageRepo.GetMessage(ctx, sessionID, messageID)
 }
 
 // buildMessageFeedback validates and normalizes a feedback submission. It has

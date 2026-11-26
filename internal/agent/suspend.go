@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/agent/collaboration"
@@ -52,8 +53,34 @@ type RunSnapshot struct {
 	Plan            *types.ExecutionPlan  `json:"plan,omitempty"`
 	Retrieval       *retrievalState       `json:"retrieval,omitempty"`
 	RetrievalTurnID string                `json:"retrieval_turn_id,omitempty"`
+	// FAQPreflight carries the reviewed FAQ candidates: a resumed run skips the preflight.
+	FAQPreflight *FAQPreflightState `json:"faq_preflight,omitempty"`
 
 	PendingRound PendingRound `json:"pending_round"`
+}
+
+// FAQPreflightState is the FAQ preflight outcome a resumed run must still see.
+type FAQPreflightState struct {
+	Questions  []string                               `json:"questions,omitempty"`
+	Rejections map[string]types.FAQPreflightRejection `json:"rejections,omitempty"`
+}
+
+func (e *AgentEngine) faqPreflightSnapshot() *FAQPreflightState {
+	if e.config == nil || len(e.config.FAQPreflightQuestions) == 0 && len(e.config.FAQPreflightRejections) == 0 {
+		return nil
+	}
+	return &FAQPreflightState{
+		Questions:  slices.Clone(e.config.FAQPreflightQuestions),
+		Rejections: maps.Clone(e.config.FAQPreflightRejections),
+	}
+}
+
+func (e *AgentEngine) restoreFAQPreflight(state *FAQPreflightState) {
+	// The snapshot is authoritative even when the latest review found nothing.
+	e.clearFAQPreflightFindings()
+	if state != nil {
+		e.ApplyFAQPreflight(nil, state.Questions, state.Rejections)
+	}
 }
 
 // PendingRound is the round interrupted by the prompt.
@@ -169,6 +196,7 @@ func (e *AgentEngine) beginTurn(query string, imageURLs []string, state *types.A
 	e.retrievalProjectReviewed = ""
 	e.retrievalSearchGapID = ""
 	e.retrievalSearchInputID = ""
+	e.turnShownChunks = nil
 	e.initRetrieval(query)
 }
 
@@ -301,6 +329,7 @@ func (e *AgentEngine) snapshot(blocked int) (*RunSnapshot, error) {
 		Plan:                    p.state.Plan,
 		Retrieval:               e.retrievalSnapshot(),
 		RetrievalTurnID:         e.retrievalTurnID,
+		FAQPreflight:            e.faqPreflightSnapshot(),
 		PendingRound:            PendingRound{Step: step, Calls: calls, BlockedIndex: blocked},
 	}, nil
 }

@@ -69,7 +69,9 @@ type AgentConfig struct {
 	// UnlimitedIterationCap bounds a run whose agent declares unlimited rounds
 	// (smart-reasoning). 0 means default 40; a negative value keeps such runs
 	// truly unbounded.
-	UnlimitedIterationCap int `yaml:"unlimited_iteration_cap" json:"unlimited_iteration_cap"`
+	UnlimitedIterationCap      int    `yaml:"unlimited_iteration_cap" json:"unlimited_iteration_cap"`
+	FAQPreflightModelID        string `yaml:"faq_preflight_model_id" json:"faq_preflight_model_id"`
+	FAQPreflightTimeoutSeconds int    `yaml:"faq_preflight_timeout_seconds" json:"faq_preflight_timeout_seconds"`
 }
 
 // Defaults for suspendable agent prompts.
@@ -941,6 +943,16 @@ func applyAgentEnvOverrides(cfg *Config) error {
 	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_PROMPT_SUSPEND")); value != "" {
 		enabled := strings.EqualFold(value, "true")
 		cfg.Agent.PromptSuspendEnabled = &enabled
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_FAQ_PREFLIGHT_MODEL_ID")); value != "" {
+		cfg.Agent.FAQPreflightModelID = value
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_FAQ_PREFLIGHT_TIMEOUT")); value != "" {
+		if d, err := time.ParseDuration(value); err == nil && d >= time.Second {
+			cfg.Agent.FAQPreflightTimeoutSeconds = int(d / time.Second)
+		} else if sec, err := time.ParseDuration(value + "s"); err == nil && sec >= time.Second {
+			cfg.Agent.FAQPreflightTimeoutSeconds = int(sec / time.Second)
+		}
 	}
 	return nil
 }

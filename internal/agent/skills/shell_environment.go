@@ -14,7 +14,7 @@ func (m *Manager) PrepareShellEnvironment(ctx context.Context, sessionID, skillN
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
 	}
-	if m == nil || !m.enabled || !m.isSkillAllowed(skillName) {
+	if m == nil || !m.enabled || !m.isSkillUsable(skillName) {
 		return "", nil, fmt.Errorf("skill %q is not available to this agent", skillName)
 	}
 	dir, ok := m.SandboxSkillDir(skillName)

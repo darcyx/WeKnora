@@ -748,6 +748,14 @@ export default {
       hint: '留空或填 0 表示使用默认值（120 秒）',
       placeholder: '输入秒数，建议范围 60-1800'
     },
+    faqPreflight: {
+      modelLabel: 'FAQ 预检快模型',
+      modelDesc: '用于 FAQ 预检与快速判定的对话模型，留空表示使用系统默认模型',
+      modelPlaceholder: '选择模型（留空使用系统默认）',
+      policyLabel: 'FAQ 预检直出规则',
+      policyDesc: '自定义 FAQ 预检命中后的直出与回复约束规则，留空表示回退系统提示词',
+      policyPlaceholder: '留空表示回退系统提示词，例如：仅在问题与 FAQ 完全匹配时直接作答，保留原始步骤与链接'
+    },
     mcp: {
       label: 'MCP 服务',
       desc: '选择 Agent 可以调用的 MCP 服务',

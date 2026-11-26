@@ -7,10 +7,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// ownerFromSession maps the session's persisted owner onto allocation.Owner.
-// Only the authentication source is stored; the kind follows from it, and is
-// cross-checked against the owner id's shape so a row whose source disagrees
-// with its owner can never look like a verified person.
 func ownerFromSession(s *types.Session) allocation.Owner {
 	src := allocation.AuthSource(strings.TrimSpace(s.OwnerAuthSource))
 	if src == "" {

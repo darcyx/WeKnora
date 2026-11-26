@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/models/rerank"
@@ -241,4 +243,136 @@ func TestFAQSearchDistinguishesFailureFromEmptyResults(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMatchFAQQuestionsSplitsChineseEnumerationComma(t *testing.T) {
+	row := func(id string, meta types.FAQChunkMetadata) *types.SearchResult {
+		b, err := json.Marshal(meta)
+		require.NoError(t, err)
+		return &types.SearchResult{ID: id, ChunkType: string(types.ChunkTypeFAQ), ChunkMetadata: b}
+	}
+	packed := row("packed", types.FAQChunkMetadata{
+		StandardQuestion: "丢单处理说明",
+		SimilarQuestions: []string{"丢单怎么补单、怎么补单、充值不到账怎么补单"},
+		Answers:          []string{"核对订单号后按补单流程处理"},
+	})
+	blocked := row("blocked", types.FAQChunkMetadata{
+		StandardQuestion:  "补单相关",
+		SimilarQuestions:  []string{"怎么补单"},
+		NegativeQuestions: []string{"无关问法、怎么补单"},
+		Answers:           []string{"不应命中"},
+	})
+	require.Len(t, MatchFAQQuestions("怎么补单", []*types.SearchResult{packed, blocked}), 1)
+	require.Equal(t, "packed", MatchFAQQuestions("丢单怎么补单", []*types.SearchResult{packed})[0].Result.ID)
+	require.Empty(t, MatchFAQQuestions("怎么补单、退款", []*types.SearchResult{packed}))
+}
+
+type countingFAQCacheKBService struct {
+	interfaces.KnowledgeBaseService
+	kbs        []*types.KnowledgeBase
+	faqRows    []*types.SearchResult
+	docRows    []*types.SearchResult
+	embedCalls atomic.Int32
+	faqCalls   atomic.Int32
+	docCalls   atomic.Int32
+}
+
+func (s *countingFAQCacheKBService) GetKnowledgeBasesByIDsOnly(_ context.Context, ids []string) ([]*types.KnowledgeBase, error) {
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	var out []*types.KnowledgeBase
+	for _, kb := range s.kbs {
+		if wanted[kb.ID] {
+			out = append(out, kb)
+		}
+	}
+	return out, nil
+}
+
+func (s *countingFAQCacheKBService) ResolveEmbeddingModelKeys(_ context.Context, kbs []*types.KnowledgeBase) map[string]string {
+	m := make(map[string]string, len(kbs))
+	for _, kb := range kbs {
+		if kb != nil {
+			m[kb.ID] = "embed-model-" + kb.ID
+		}
+	}
+	return m
+}
+
+func (s *countingFAQCacheKBService) GetQueryEmbedding(_ context.Context, _ string, _ string) ([]float32, error) {
+	s.embedCalls.Add(1)
+	return []float32{0.1, 0.2}, nil
+}
+
+func (s *countingFAQCacheKBService) HybridSearch(_ context.Context, kbID string, _ types.SearchParams) ([]*types.SearchResult, error) {
+	if kbID == "kb-faq" {
+		s.faqCalls.Add(1)
+		return s.faqRows, nil
+	}
+	s.docCalls.Add(1)
+	return s.docRows, nil
+}
+
+func TestFAQPreflightCacheReusedBySearchKnowledgeTool(t *testing.T) {
+	faqMeta, err := json.Marshal(types.FAQChunkMetadata{
+		StandardQuestion: "丢单怎么补单",
+		Answers:          []string{"先核对支付回调再补单"},
+	})
+	require.NoError(t, err)
+	faqKB := &types.KnowledgeBase{ID: "kb-faq", TenantID: 1, Type: types.KnowledgeBaseTypeFAQ}
+	faqKB.IndexingStrategy.VectorEnabled = true
+	docKB := &types.KnowledgeBase{ID: "kb-doc", TenantID: 1, Type: types.KnowledgeBaseTypeDocument}
+	docKB.IndexingStrategy.VectorEnabled = true
+	docKB.IndexingStrategy.KeywordEnabled = true
+
+	svc := &countingFAQCacheKBService{
+		kbs: []*types.KnowledgeBase{faqKB, docKB},
+		faqRows: []*types.SearchResult{{
+			ID: "faq-1", KnowledgeID: "k-faq", KnowledgeBaseID: "kb-faq",
+			ChunkType: string(types.ChunkTypeFAQ), Content: "丢单怎么补单", ChunkMetadata: faqMeta, Score: 0.9,
+		}},
+		docRows: []*types.SearchResult{{
+			ID: "doc-1", KnowledgeID: "k-doc", KnowledgeBaseID: "kb-doc",
+			ChunkType: string(types.ChunkTypeText), Content: "支付补单文档说明", Score: 0.8,
+		}},
+	}
+	targets := types.SearchTargets{
+		{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-faq", TenantID: 1},
+		{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-doc", TenantID: 1},
+	}
+	ctx := WithFAQPreflightCache(t.Context())
+	tool := NewSearchKnowledgeTool(svc, nil, nil, targets, &stubReranker{scores: []float64{0.9, 0.85}}, nil)
+
+	preflightRes, err := tool.FindFAQCandidates(ctx, " 丢单怎么补单？ ")
+	require.NoError(t, err)
+	require.Len(t, preflightRes.Matches, 1)
+	require.Equal(t, int32(1), svc.faqCalls.Load())
+	require.Equal(t, int32(1), svc.embedCalls.Load())
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			execTool := NewSearchKnowledgeTool(svc, nil, nil, targets, &stubReranker{scores: []float64{0.9, 0.85}}, nil)
+			res, execErr := execTool.Execute(ctx, json.RawMessage(`{"query":"丢单怎么补单","knowledge_base_ids":["kb-faq"]}`))
+			require.NoError(t, execErr)
+			require.True(t, res.Success)
+			require.Contains(t, res.Output, "先核对支付回调再补单")
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int32(1), svc.faqCalls.Load())
+	require.Equal(t, int32(1), svc.embedCalls.Load())
+
+	mixedRes, err := tool.Execute(ctx, json.RawMessage(`{"query":"丢单怎么补单"}`))
+	require.NoError(t, err)
+	require.True(t, mixedRes.Success)
+	require.Contains(t, mixedRes.Output, "先核对支付回调再补单")
+	require.Contains(t, mixedRes.Output, "支付补单文档说明")
+	require.Equal(t, int32(1), svc.faqCalls.Load())
+	require.Equal(t, int32(1), svc.docCalls.Load())
+	require.Equal(t, int32(2), svc.embedCalls.Load())
 }

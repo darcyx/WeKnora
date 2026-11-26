@@ -40,3 +40,30 @@ func TestReadDocumentPageBudgetsEscapedContentAndPreservesCursor(t *testing.T) {
 		t.Fatalf("unexpected pages: %v", got)
 	}
 }
+
+func TestReadDocumentPageIgnoresUnrenderedImageOCRInBudget(t *testing.T) {
+	tool, repo := newReadDocumentFixture(4)
+	imgJSON := fmt.Sprintf(
+		`[{"url":"resource://img-1","caption":"Steam API 权限截图","ocr_text":%q},{"url":"resource://img-2","caption":"Steam IP 白名单截图","ocr_text":%q}]`,
+		strings.Repeat("OCR菜单文字", 300),
+		strings.Repeat("OCR配置文字", 300),
+	)
+	for i, c := range repo.ordered {
+		c.Content = fmt.Sprintf("chunk %d body: %s", i, strings.Repeat("正文", 120))
+		c.ImageInfo = imgJSON
+	}
+	const budget = 4000
+	ctx := WithOutputBudget(t.Context(), budget)
+	res, err := tool.Execute(ctx, json.RawMessage(`{"id":"doc-1","offset":0,"limit":20}`))
+	if err != nil || !res.Success {
+		t.Fatalf("read failed: res=%+v err=%v", res, err)
+	}
+	ids := chunkIDsFromData(t, res.Data)
+	if len(ids) != 4 {
+		t.Fatalf("expected all 4 chunks in one page when OCR is unrendered, got %d (%v)", len(ids), ids)
+	}
+	output := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolReadDocument, res)
+	if size := utf8.RuneCountInString(output); size > budget {
+		t.Fatalf("model output %d runes exceeded budget %d", size, budget)
+	}
+}

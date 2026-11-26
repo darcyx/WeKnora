@@ -11,8 +11,8 @@ import (
 	"github.com/yuin/goldmark/text"
 )
 
-// Candidate-only document stubs are read leads, never quoted factual evidence.
-var candidateOnlyDocument = regexp.MustCompile(`(?m)^[ \t]*<document id="[^"]*" kb="[^"]*" title="[^"]*" view="candidate_only" />\n?`)
+// Candidate-only stubs are read leads, never quoted factual evidence.
+var candidateOnlyDocument = regexp.MustCompile(`(?m)^[ \t]*<(?:document|chunk) [^\n>]* view="candidate_only" />\n?`)
 
 func observedEvidenceContains(source, quote string) bool {
 	return evidenceContains(candidateOnlyDocument.ReplaceAllString(source, ""), quote)

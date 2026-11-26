@@ -31,11 +31,13 @@ func TestAskUserEndsTurnWithoutAnotherModelCall(t *testing.T) {
 			dependent := newCountingTool("dependent_action")
 			e.toolRegistry.RegisterTool(dependent)
 			questions, complete, prompts := 0, 0, 0
+			published := ""
 			e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
 				data := ev.Data.(event.AgentFinalAnswerData)
 				if data.Content != "" {
 					questions++
 					require.Equal(t, "请提供订单号。", data.Content)
+					published = data.PublishedQuestion
 				}
 				return nil
 			})
@@ -49,6 +51,14 @@ func TestAskUserEndsTurnWithoutAnotherModelCall(t *testing.T) {
 			require.Equal(t, 1, model.callCount)
 			require.Zero(t, dependent.calls, "no dependent operation may run after asking")
 			require.Equal(t, 1, questions)
+			require.NotEmpty(t, published)
+			steps := agenttools.SanitizeAgentStepsForStorage(state.RoundSteps)
+			require.Equal(t, published, steps[len(steps)-1].ToolCalls[0].Result.Data["published_question"])
+			encoded, err := json.Marshal(steps)
+			require.NoError(t, err)
+			var restored []types.AgentStep
+			require.NoError(t, json.Unmarshal(encoded, &restored))
+			require.Equal(t, published, restored[len(restored)-1].ToolCalls[0].Result.Data["published_question"])
 			require.Equal(t, 1, complete)
 			require.Zero(t, prompts)
 		})
@@ -135,6 +145,18 @@ func TestAskUserDefersToCollaborationFinishProtocol(t *testing.T) {
 	require.False(t, state.IsComplete)
 	require.Empty(t, state.FinalAnswer)
 	require.Contains(t, messages[0].Content, "collect delegated results")
+}
+
+func TestAskUserDoesNotMarkQuestionWhenPublicationFails(t *testing.T) {
+	e := newTestEngine(t, &mockChat{})
+	e.eventBus.On(event.EventAgentFinalAnswer, func(context.Context, event.Event) error { return errors.New("stream failed") })
+	step := types.AgentStep{ToolCalls: []types.ToolCall{{Name: agenttools.ToolAskUser, Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请选择平台？", Options: []string{"Android", "iOS"}})}}}
+	state := &types.AgentState{RoundSteps: []types.AgentStep{step}}
+	messages := []chat.Message{}
+	finished, err := e.finishUserQuestion(t.Context(), state, step, &messages, "session", "message")
+	require.Error(t, err)
+	require.False(t, finished)
+	require.NotContains(t, state.RoundSteps[0].ToolCalls[0].Result.Data, "published_question")
 }
 
 func TestAskUserSteerAtFinalIterationGetsExecutionRound(t *testing.T) {
@@ -228,6 +250,7 @@ func TestAskUserResolvesKnownProjectFields(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, finished)
 	require.Equal(t, "方便提供一下订单号吗？", state.FinalAnswer, "guard calls=%d", len(model.calls))
+	require.NotContains(t, step.ToolCalls[0].Result.Data, "published_question")
 }
 
 func TestAskUserPlanPreservesIndependentDeliverable(t *testing.T) {
@@ -269,4 +292,46 @@ func TestAskUserContinuesWhenProjectResolvesEveryBlocker(t *testing.T) {
 	require.Empty(t, (&retrievalControl{state: e.retrieval.snapshot()}).missingUserFields())
 	require.Len(t, model.calls, 1)
 	require.Contains(t, messages[len(messages)-1].Content, "without asking")
+}
+
+func TestAskUserPreservesAssistantAnswerPrelude(t *testing.T) {
+	e := newTestEngine(t, &mockChat{})
+	state := &types.AgentState{}
+	messages := []chat.Message{}
+	step := types.AgentStep{
+		Thought: "<think>internal reasoning</think>\n1. 先在平台订单查询核对订单状态。\n2. 确认发货通知是否送达游戏服务端。",
+		ToolCalls: []types.ToolCall{{
+			Name:   agenttools.ToolAskUser,
+			Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请补充订单号和渠道。"}),
+		}},
+	}
+	finished, err := e.finishUserQuestion(t.Context(), state, step, &messages, "session", "message")
+	require.NoError(t, err)
+	require.True(t, finished)
+	require.True(t, state.IsComplete)
+	require.NotContains(t, state.FinalAnswer, "internal reasoning")
+	require.Contains(t, state.FinalAnswer, "先在平台订单查询核对订单状态")
+	require.Contains(t, state.FinalAnswer, "请补充订单号和渠道。")
+}
+
+func TestAskUserStripsFollowUpButtonsFromPrelude(t *testing.T) {
+	e := newTestEngine(t, &mockChat{})
+	state := &types.AgentState{}
+	messages := []chat.Message{}
+	step := types.AgentStep{
+		Thought: "先核对渠道配置。\n\n## 相关问题\n1. <button-send>Android 怎么接</button-send>\n2. <button-send>iOS 怎么接</button-send>",
+		ToolCalls: []types.ToolCall{{
+			Name:   agenttools.ToolAskUser,
+			Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请问您接入的是哪个平台？"}),
+		}},
+	}
+	finished, err := e.finishUserQuestion(t.Context(), state, step, &messages, "session", "message")
+	require.NoError(t, err)
+	require.True(t, finished)
+	require.Equal(t, "先核对渠道配置。\n\n请问您接入的是哪个平台？", state.FinalAnswer)
+	require.NotContains(t, state.FinalAnswer, "<button-send>")
+	require.NotContains(t, state.FinalAnswer, "相关问题")
+	rawPublished, ok := step.ToolCalls[0].Result.Data["published_question"].(string)
+	require.True(t, ok)
+	require.NotContains(t, rawPublished, "<button-send>")
 }

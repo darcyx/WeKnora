@@ -1393,7 +1393,8 @@ type docIngestResult struct {
 	Summary     string // one-line summary of the document (from summary page)
 	// Pages records the wiki pages this document touched, carrying both
 	// the slug used for link/retract bookkeeping and its human-readable title.
-	Pages []wikiIngestPageRef
+	Pages              []wikiIngestPageRef
+	BudgetDroppedSlugs []string
 	// MapStats are the per-doc map-phase metrics captured at the moment
 	// mapOneDocument finishes. Surfaced into the postprocess.wiki span's
 	// output so the trace viewer can show "what the map phase produced"
@@ -1447,6 +1448,12 @@ type WikiBatchContext struct {
 	// Already Normalize()'d — consumers can assume it is one of the
 	// three valid values.
 	ExtractionGranularity types.WikiExtractionGranularity
+
+	// MaxPagesPerIngest caps how many brand-new canonical entity/concept wiki
+	// pages a single source document may materialize across Pass 0, Pass 1
+	// new_slugs, and fallback extraction. Updates to already-existing pages and
+	// the document's summary/* page are always preserved. 0 means unlimited.
+	MaxPagesPerIngest int
 
 	// ContentInstructions and ExtractionInstructions are KB-scoped business
 	// guidance. Stable citation, merge, taxonomy and JSON rules remain in the
@@ -2693,7 +2700,7 @@ var errWikiPageRewriteTruncated = errors.New("wiki page rewrite truncated at the
 // vocabulary as the agent loop (internal/agent/observe.go, compaction/overflow.go).
 func isLengthStopFinishReason(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "length", "max_tokens", "max_output_tokens":
+	case "length", "max_tokens", "max_output_tokens", "model_context_window_exceeded":
 		return true
 	default:
 		return false

@@ -3,11 +3,153 @@ package tools
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+type faqPreflightCacheKey struct{}
+
+type faqPreflightCacheEntry struct {
+	topK    int
+	results []*types.SearchResult
+}
+
+type faqPreflightCache struct {
+	mu      sync.Mutex
+	entries map[string]faqPreflightCacheEntry
+}
+
+func WithFAQPreflightCache(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Value(faqPreflightCacheKey{}).(*faqPreflightCache); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, faqPreflightCacheKey{}, &faqPreflightCache{
+		entries: make(map[string]faqPreflightCacheEntry),
+	})
+}
+
+func faqPreflightCacheFromContext(ctx context.Context) *faqPreflightCache {
+	if ctx == nil {
+		return nil
+	}
+	cache, _ := ctx.Value(faqPreflightCacheKey{}).(*faqPreflightCache)
+	return cache
+}
+
+func normalizeFAQCacheQuery(query string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(query)), " ")
+	normalized = strings.TrimRight(normalized, "?？。.!！")
+	normalized = strings.TrimSpace(normalized)
+	return strings.ToLower(normalized)
+}
+
+func faqTargetCacheKey(query string, target *types.SearchTarget) string {
+	normalizedQuery := normalizeFAQCacheQuery(query)
+	if normalizedQuery == "" || target == nil || target.KnowledgeBaseID == "" {
+		return ""
+	}
+	knowledgeIDs := slices.Clone(target.KnowledgeIDs)
+	sort.Strings(knowledgeIDs)
+	tagIDs := slices.Clone(target.TagIDs)
+	sort.Strings(tagIDs)
+	scopeTagIDs := slices.Clone(target.ScopeTagIDs)
+	sort.Strings(scopeTagIDs)
+	return fmt.Sprintf("%s|%s|%d|%s|%s|%s|%s",
+		normalizedQuery,
+		target.Type,
+		target.TenantID,
+		target.KnowledgeBaseID,
+		strings.Join(knowledgeIDs, ","),
+		strings.Join(tagIDs, ","),
+		strings.Join(scopeTagIDs, ","),
+	)
+}
+
+func cloneSearchResult(r *types.SearchResult) *types.SearchResult {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	if r.Metadata != nil {
+		cp.Metadata = make(map[string]string, len(r.Metadata))
+		for k, v := range r.Metadata {
+			cp.Metadata[k] = v
+		}
+	}
+	if r.ChunkMetadata != nil {
+		cp.ChunkMetadata = slices.Clone(r.ChunkMetadata)
+	}
+	return &cp
+}
+
+func (c *faqPreflightCache) store(query string, completed types.SearchTargets, rows []*searchResultWithMeta, topK int) {
+	if c == nil || len(completed) == 0 || topK <= 0 {
+		return
+	}
+	kbCount := make(map[string]int, len(completed))
+	for _, target := range completed {
+		if target != nil && target.KnowledgeBaseID != "" {
+			kbCount[target.KnowledgeBaseID]++
+		}
+	}
+	byKB := make(map[string][]*types.SearchResult, len(kbCount))
+	for _, row := range rows {
+		if row == nil || row.SearchResult == nil {
+			continue
+		}
+		kbID := row.KnowledgeBaseID
+		if kbID == "" {
+			kbID = row.SearchResult.KnowledgeBaseID
+		}
+		byKB[kbID] = append(byKB[kbID], cloneSearchResult(row.SearchResult))
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, target := range completed {
+		if target == nil || kbCount[target.KnowledgeBaseID] != 1 {
+			continue
+		}
+		key := faqTargetCacheKey(query, target)
+		if key == "" {
+			continue
+		}
+		c.entries[key] = faqPreflightCacheEntry{
+			topK:    topK,
+			results: byKB[target.KnowledgeBaseID],
+		}
+	}
+}
+
+func (c *faqPreflightCache) lookup(query string, target *types.SearchTarget, minTopK int) ([]*types.SearchResult, bool) {
+	if c == nil || target == nil {
+		return nil, false
+	}
+	key := faqTargetCacheKey(query, target)
+	if key == "" {
+		return nil, false
+	}
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	c.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	if minTopK > entry.topK && len(entry.results) >= entry.topK {
+		return nil, false
+	}
+	cloned := make([]*types.SearchResult, len(entry.results))
+	for i, row := range entry.results {
+		cloned[i] = cloneSearchResult(row)
+	}
+	return cloned, true
+}
 
 // faqCandidateLimit caps FAQ retrieval candidates independently of the
 // document-search topK configuration.
@@ -179,16 +321,19 @@ func (t *SearchKnowledgeTool) FindFAQCandidates(ctx context.Context, query strin
 		result.Candidates = append(result.Candidates, &candidate)
 	}
 	rows = unique
+	if cache := faqPreflightCacheFromContext(ctx); cache != nil && len(completed) > 0 {
+		cache.store(query, completed, rows, topK)
+	}
 	if len(rows) > 0 {
 		if t.rerankModel == nil {
 			return result, faqSearchError(failures, result.Candidates, "faq_rerank", fmt.Errorf("FAQ semantic matching requires a rerank model"))
 		}
-		reranked, _, err := t.rerankResultsWithPolicy(ctx, query, rows, false, true)
+		reranked, _, err := t.rerankResultsWithKBs(ctx, query, rows, faqKBs, false, true)
 		if err != nil {
 			failure := newRetrievalFailure(result.CompletedTargets, "faq_rerank", err)
 			original := append([]*searchResultWithMeta(nil), rows...)
 			failure.Retry = func(ctx context.Context) (*types.ToolResult, error) {
-				recovered, _, err := t.rerankResultsWithPolicy(ctx, query, original, false, true)
+				recovered, _, err := t.rerankResultsWithKBs(ctx, query, original, faqKBs, false, true)
 				if err != nil {
 					return &types.ToolResult{Output: "FAQ reranking did not complete", Error: err.Error()}, err
 				}
@@ -315,21 +460,33 @@ func MatchFAQQuestions(query string, candidates []*types.SearchResult) []FAQMatc
 			continue
 		}
 		exact := func(question string) bool { return strings.TrimSpace(question) == query }
-		negative := false
-		for _, question := range meta.NegativeQuestions {
-			negative = negative || strings.EqualFold(strings.TrimSpace(question), query)
-		}
+		negative := matchFAQQuestionList(meta.NegativeQuestions, func(question string) bool {
+			return strings.EqualFold(strings.TrimSpace(question), query)
+		})
 		if negative {
 			continue
 		}
-		matched := exact(meta.StandardQuestion)
-		for _, question := range meta.SimilarQuestions {
-			matched = matched || exact(question)
-		}
+		matched := exact(meta.StandardQuestion) || matchFAQQuestionList(meta.SimilarQuestions, exact)
 		if matched {
 			seen[candidate.ID] = true
 			matches = append(matches, FAQMatch{Result: candidate, Metadata: meta})
 		}
 	}
 	return matches
+}
+
+func matchFAQQuestionList(questions []string, match func(string) bool) bool {
+	for _, question := range questions {
+		if match(question) {
+			return true
+		}
+		if strings.Contains(question, "、") {
+			for _, part := range strings.Split(question, "、") {
+				if match(part) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

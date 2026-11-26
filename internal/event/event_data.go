@@ -252,10 +252,11 @@ func (a *AnswerText) String() string {
 // AgentFinalAnswerData represents final answer streaming data
 type AgentFinalAnswerData struct {
 	// Replace retracts only this event ID after explicit provider protocol evidence.
-	Replace    bool   `json:"replace,omitempty"`
-	Content    string `json:"content"`
-	Done       bool   `json:"done"`
-	IsFallback bool   `json:"is_fallback,omitempty"` // True when response is a fallback (no knowledge base match)
+	Replace           bool   `json:"replace,omitempty"`
+	Content           string `json:"content"`
+	PublishedQuestion string `json:"published_question,omitempty"`
+	Done              bool   `json:"done"`
+	IsFallback        bool   `json:"is_fallback,omitempty"` // True when response is a fallback (no knowledge base match)
 	// Truncated marks an answer the provider cut off at the completion-token
 	// cap. The text is what the model had produced when the cap hit, not a
 	// finished answer, so a client should say so rather than present it as

@@ -103,9 +103,12 @@ type Manager struct {
 	tenantSource SkillSource
 
 	// Configuration
-	skillDirs     []string
-	allowedSkills []string // Empty means all skills are allowed
-	enabled       bool
+	skillDirs          []string
+	allowedSkills      []string        // Empty means all skills are allowed
+	availableTools     map[string]bool // Static fallback set when availableToolsFunc is nil
+	availableToolsFunc func() []string // Live session tool registry lookup (optional)
+	hasToolFilter      bool
+	enabled            bool
 	// skillsRoot overrides the installed-skill root used for discovery and
 	// shell env. Empty means the remote image root.
 	skillsRoot string
@@ -119,9 +122,11 @@ type Manager struct {
 
 // ManagerConfig holds configuration for the skill manager
 type ManagerConfig struct {
-	SkillDirs     []string // Directories to search for skills
-	AllowedSkills []string // Skill names whitelist (empty = allow all)
-	Enabled       bool     // Whether skills are enabled
+	SkillDirs          []string        // Directories to search for skills
+	AllowedSkills      []string        // Skill names whitelist (empty = allow all)
+	AvailableTools     []string        // Static registered tools for this session; non-nil enables tool-based skill gating
+	AvailableToolsFunc func() []string // Optional live lookup for registered session tools (takes precedence over AvailableTools)
+	Enabled            bool            // Whether skills are enabled
 }
 
 // NewManager creates a new skill manager with the given configuration
@@ -132,12 +137,26 @@ func NewManager(config *ManagerConfig, sandboxMgr sandbox.Manager) *Manager {
 		}
 	}
 
+	var avail map[string]bool
+	hasToolFilter := config.AvailableTools != nil || config.AvailableToolsFunc != nil
+	if config.AvailableTools != nil {
+		avail = make(map[string]bool, len(config.AvailableTools))
+		for _, toolName := range config.AvailableTools {
+			if name := strings.TrimSpace(toolName); name != "" {
+				avail[name] = true
+			}
+		}
+	}
+
 	return &Manager{
-		loader:        NewLoader(config.SkillDirs),
-		sandboxMgr:    sandboxMgr,
-		skillDirs:     config.SkillDirs,
-		allowedSkills: config.AllowedSkills,
-		enabled:       config.Enabled,
+		loader:             NewLoader(config.SkillDirs),
+		sandboxMgr:         sandboxMgr,
+		skillDirs:          config.SkillDirs,
+		allowedSkills:      config.AllowedSkills,
+		availableTools:     avail,
+		availableToolsFunc: config.AvailableToolsFunc,
+		hasToolFilter:      hasToolFilter,
+		enabled:            config.Enabled,
 	}
 }
 
@@ -201,7 +220,9 @@ func (m *Manager) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to discover skills: %w", err)
 	}
 
-	// Filter by allowed skills if specified
+	// Filter by allowed skills if specified. Tool-based filtering runs live in
+	// GetAllMetadata / isSkillUsable so tools registered after Initialize
+	// (local_browser, collaboration, background, refreshed MCP tools) are honored.
 	if len(m.allowedSkills) > 0 {
 		metadata = m.filterAllowedSkills(metadata)
 	}
@@ -211,6 +232,123 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	m.mu.Unlock()
 
 	return nil
+}
+
+func (m *Manager) currentAvailableTools() map[string]bool {
+	if m.availableToolsFunc != nil {
+		names := m.availableToolsFunc()
+		avail := make(map[string]bool, len(names))
+		for _, toolName := range names {
+			if name := strings.TrimSpace(toolName); name != "" {
+				avail[name] = true
+			}
+		}
+		return avail
+	}
+	return m.availableTools
+}
+
+func (m *Manager) filterAvailableToolSkills(metadata []*SkillMetadata) []*SkillMetadata {
+	if !m.hasToolFilter {
+		return metadata
+	}
+	avail := m.currentAvailableTools()
+	filtered := make([]*SkillMetadata, 0, len(metadata))
+	for _, meta := range metadata {
+		if m.isSkillToolsSatisfiedWith(meta.RequiredTools, avail) {
+			filtered = append(filtered, meta)
+		}
+	}
+	return filtered
+}
+
+func (m *Manager) isSkillToolsSatisfied(requiredTools []string) bool {
+	if !m.hasToolFilter {
+		return true
+	}
+	return m.isSkillToolsSatisfiedWith(requiredTools, m.currentAvailableTools())
+}
+
+func (m *Manager) isSkillToolsSatisfiedWith(requiredTools []string, avail map[string]bool) bool {
+	if !m.hasToolFilter {
+		return true
+	}
+	if len(requiredTools) == 0 {
+		return true
+	}
+	for _, expr := range requiredTools {
+		if !matchesAnyToolPattern(expr, avail) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesAnyToolPattern(expr string, avail map[string]bool) bool {
+	for _, alt := range strings.Split(expr, "|") {
+		pat := strings.TrimSpace(alt)
+		if pat == "" {
+			continue
+		}
+		if strings.HasSuffix(pat, "*") {
+			prefix := strings.TrimSuffix(pat, "*")
+			for toolName := range avail {
+				if strings.HasPrefix(toolName, prefix) {
+					return true
+				}
+			}
+			continue
+		}
+		if avail[pat] {
+			return true
+		}
+	}
+	return false
+}
+
+// isSkillUsable is the single availability gate shared by discovery, reading,
+// pinned-skill hints, and shell environment preparation.
+func (m *Manager) isSkillUsable(skillName string) bool {
+	if m == nil || !m.enabled || !m.isSkillAllowed(skillName) {
+		return false
+	}
+	// Resolve skill metadata from the discovered cache first; fall back to the
+	// source only when Initialize has not been called yet. A missing or
+	// unloadable skill must never be reported as available.
+	var meta *SkillMetadata
+	m.mu.RLock()
+	hasCache := m.metadataCache != nil
+	for _, item := range m.metadataCache {
+		if item != nil && item.Name == skillName {
+			meta = item
+			break
+		}
+	}
+	m.mu.RUnlock()
+
+	var reqTools []string
+	if meta != nil {
+		reqTools = meta.RequiredTools
+	} else if hasCache {
+		return false
+	} else {
+		skill, err := m.resolveSource(skillName).LoadSkillInstructions(skillName)
+		if err != nil || skill == nil {
+			return false
+		}
+		reqTools = skill.RequiredTools
+	}
+	if !m.hasToolFilter {
+		return true
+	}
+	avail := m.currentAvailableTools()
+	return m.isSkillToolsSatisfiedWith(reqTools, avail)
+}
+
+// IsSkillAvailable reports whether skillName is enabled, allowed, and satisfies
+// its tool dependencies in the current session.
+func (m *Manager) IsSkillAvailable(skillName string) bool {
+	return m.isSkillUsable(skillName)
 }
 
 // filterAllowedSkills filters metadata to only include allowed skills
@@ -233,20 +371,22 @@ func (m *Manager) filterAllowedSkills(metadata []*SkillMetadata) []*SkillMetadat
 	return filtered
 }
 
-// GetAllMetadata returns metadata for all discovered skills
-// This is used for system prompt injection (Level 1)
+// GetAllMetadata returns metadata for all discovered skills currently usable
+// with the session's registered tools (Level 1).
 func (m *Manager) GetAllMetadata() []*SkillMetadata {
 	if !m.enabled {
 		return nil
 	}
 
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	cached := make([]*SkillMetadata, len(m.metadataCache))
+	copy(cached, m.metadataCache)
+	m.mu.RUnlock()
 
-	// Return a copy to prevent external modification
-	result := make([]*SkillMetadata, len(m.metadataCache))
-	copy(result, m.metadataCache)
-	return result
+	if m.hasToolFilter {
+		return m.filterAvailableToolSkills(cached)
+	}
+	return cached
 }
 
 // LoadSkill loads the full instructions of a skill (Level 2)
@@ -259,8 +399,18 @@ func (m *Manager) LoadSkill(ctx context.Context, skillName string) (*Skill, erro
 	if !m.isSkillAllowed(skillName) {
 		return nil, fmt.Errorf("skill not allowed: %s", skillName)
 	}
+	if !m.isSkillUsable(skillName) {
+		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
+	}
 
-	return m.resolveSource(skillName).LoadSkillInstructions(skillName)
+	skill, err := m.resolveSource(skillName).LoadSkillInstructions(skillName)
+	if err != nil {
+		return nil, err
+	}
+	if !m.isSkillToolsSatisfied(skill.RequiredTools) {
+		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
+	}
+	return skill, nil
 }
 
 // isSkillAllowed checks if a skill is in the allowed list
@@ -285,6 +435,9 @@ func (m *Manager) ReadSkillFile(ctx context.Context, skillName, filePath string)
 	if !m.isSkillAllowed(skillName) {
 		return "", fmt.Errorf("skill not allowed: %s", skillName)
 	}
+	if !m.isSkillUsable(skillName) {
+		return "", fmt.Errorf("skill unavailable without required tools: %s", skillName)
+	}
 
 	file, err := m.resolveSource(skillName).LoadSkillFile(skillName, filePath)
 	if err != nil {
@@ -303,6 +456,9 @@ func (m *Manager) ListSkillFiles(ctx context.Context, skillName string) ([]strin
 	if !m.isSkillAllowed(skillName) {
 		return nil, fmt.Errorf("skill not allowed: %s", skillName)
 	}
+	if !m.isSkillUsable(skillName) {
+		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
+	}
 
 	return m.resolveSource(skillName).ListSkillFiles(skillName)
 }
@@ -315,7 +471,7 @@ func (m *Manager) ListSkillFiles(ctx context.Context, skillName string) ([]strin
 // sandbox shell command can reach — telling the model about it would be worse
 // than saying nothing.
 func (m *Manager) SandboxSkillDir(skillName string) (string, bool) {
-	if m == nil || !m.enabled || !m.isSkillAllowed(skillName) {
+	if m == nil || !m.enabled || !m.isSkillUsable(skillName) {
 		return "", false
 	}
 	image, ok := m.resolveSource(skillName).(imageSkillSource)
@@ -350,11 +506,17 @@ func (m *Manager) GetSkillInfo(ctx context.Context, skillName string) (*SkillInf
 	if !m.isSkillAllowed(skillName) {
 		return nil, fmt.Errorf("skill not allowed: %s", skillName)
 	}
+	if !m.isSkillUsable(skillName) {
+		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
+	}
 
 	source := m.resolveSource(skillName)
 	skill, err := source.LoadSkillInstructions(skillName)
 	if err != nil {
 		return nil, err
+	}
+	if !m.isSkillToolsSatisfied(skill.RequiredTools) {
+		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
 	}
 
 	files, err := source.ListSkillFiles(skillName)

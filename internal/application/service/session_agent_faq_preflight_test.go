@@ -46,7 +46,7 @@ func TestFAQSemanticPreflightUsesAgentEmbeddingTopK(t *testing.T) {
 			kbs.rows = nil
 			s.cfg = &config.Config{Conversation: &config.ConversationConfig{EmbeddingTopK: 200}}
 			cfg.EmbeddingTopK = tc.configured
-			s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, &agentFAQEvaluation{})
+			s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, false, &agentFAQEvaluation{})
 			require.Equal(t, tc.want, kbs.matchCount)
 		})
 	}
@@ -77,15 +77,161 @@ func (r *preflightRepo) GetVisibleFAQByID(context.Context, *types.SearchTarget, 
 
 type preflightChat struct {
 	graphReplyChat
-	call func(context.Context, []chat.Message) (*types.ChatResponse, error)
+	call         func(context.Context, []chat.Message) (*types.ChatResponse, error)
+	review       func(context.Context, []chat.Message) (*types.ChatResponse, error)
+	checkOptions func([]chat.Message, *chat.ChatOptions)
 }
 
-func (c preflightChat) Chat(ctx context.Context, messages []chat.Message, _ *chat.ChatOptions) (*types.ChatResponse, error) {
+func (c preflightChat) Chat(ctx context.Context, messages []chat.Message, opts *chat.ChatOptions) (*types.ChatResponse, error) {
+	if c.checkOptions != nil {
+		c.checkOptions(messages, opts)
+	}
+	if messages[0].Content == faqReviewPrompt {
+		if c.review != nil {
+			return c.review(ctx, messages)
+		}
+		var input struct {
+			UserMessage string `json:"user_message"`
+			Candidate   struct {
+				Answer string `json:"answer"`
+			} `json:"candidate"`
+		}
+		if err := json.Unmarshal([]byte(messages[1].Content), &input); err != nil {
+			return nil, err
+		}
+		content, _ := json.Marshal(map[string]any{"reason": "fixture approval", "coverage": []map[string]string{{"request_quote": input.UserMessage, "answer_quote": input.Candidate.Answer}}, "preconditions": []any{}, "supported": true})
+		return &types.ChatResponse{Content: string(content)}, nil
+	}
 	return c.call(ctx, messages)
 }
 
 const preflightSelection = `{"decision":"direct_answer","selected_id":"1","matched_facts":["支付"],"requires_steps":false,"answer_kind":"other","unanswered_parts_of_original_request":[]}`
 const preflightQuestion = `{"question":"哪个平台？","scope_match":"missing","missing_user_fields":["平台"],"unanswered_parts_of_original_request":[]}`
+
+func TestFAQExactFastPath(t *testing.T) {
+	for _, tc := range []struct {
+		name, question, query, certification, appInfo string
+		semantic, ambiguous, changed                  bool
+		wantReviews                                   int
+		wantAnswer                                    bool
+	}{
+		{"exact standalone", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, "", false, false, false, 0, true},
+		{"exact standalone with app_info", "微信登录后闪退是什么原因？", "微信登录后闪退是什么原因？", `true`, `{"env":"production","gameInfo":{"app_id":"50100336"}}`, false, false, false, 0, true},
+		{"conditional", "支付问题", "支付问题", `false`, "", false, false, false, 1, true},
+		{"missing certification", "支付问题", "支付问题", ``, "", false, false, false, 1, true},
+		{"malformed certification", "支付问题", "支付问题", `"yes"`, "", false, false, false, 1, true},
+		{"similar question", "支付问题", "支付出错", `true`, "", false, false, false, 1, true},
+		{"semantic recall", "支付问题", "支付问题", `true`, "", true, false, false, 1, true},
+		{"ambiguous candidates", "支付问题", "支付问题", `true`, "", false, true, false, 1, true},
+		{"changed after selection", "支付问题", "支付问题", `true`, "", false, false, true, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, req, cfg, repo := preflightFixture(t)
+			req.Query = tc.query
+			req.AppInfo = tc.appInfo
+			repo.chunk.Metadata = types.JSON(`{"standard_question":"` + tc.question + `","similar_questions":["支付出错"],"answers":["标准答案"]}`)
+			s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+			original := *repo.chunk
+			if !tc.semantic {
+				repo.exact = func(context.Context, string) ([]*types.Chunk, error) {
+					if tc.ambiguous {
+						other := original
+						other.ID = "other"
+						return []*types.Chunk{&original, &other}, nil
+					}
+					return []*types.Chunk{&original}, nil
+				}
+			}
+			selection := preflightSelection
+			if strings.Contains(tc.query, "微信") {
+				selection = strings.Replace(selection, "支付", "微信登录后闪退", 1)
+			}
+			if tc.certification != "" {
+				selection = strings.TrimSuffix(selection, "}") + `,"standalone_unconditional":` + tc.certification + `}`
+			}
+			reviews := 0
+			model := preflightChat{
+				call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					if tc.changed {
+						repo.chunk.Metadata = types.JSON(`{"standard_question":"支付问题","answers":["新答案"]}`)
+					}
+					return &types.ChatResponse{Content: selection}, nil
+				},
+				review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					reviews++
+					return &types.ChatResponse{Content: `{"reason":"matched","coverage":[{"request_quote":"支付","answer_quote":"标准答案"}],"preconditions":[],"supported":true}`}, nil
+				},
+			}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.99}}, nil)
+			require.Equal(t, tc.wantReviews, reviews)
+			require.Equal(t, tc.wantAnswer, evaluation.Match != nil)
+		})
+	}
+}
+
+func TestFAQIndependentReview(t *testing.T) {
+	for _, tc := range []struct {
+		name, review string
+		reviewErr    error
+		want         bool
+	}{
+		{"accepted with answer quote", `{"reason":"target and conditions match", "coverage":[{"request_quote":"支付", "answer_quote":"标准答案"}], "preconditions":[], "supported":true}`, nil, true},
+		{"accepted with echoed input fields", `[{"version":1,"candidate_answer":"标准答案","reason":"matched","coverage":[{"request_quote":"支付","answer_quote":"标准答案"}],"preconditions":[],"supported":true}]`, nil, true},
+		{"wrapped review", "```json\n[" + `{"reason":"matched", "coverage":[{"request_quote":"支付", "answer_quote":"标准答案"}], "preconditions":[], "supported":true}` + "]\n```", nil, true},
+		{"review rejects missing precondition", `{"reason":"missing condition", "coverage":[], "preconditions":[], "supported":false}`, nil, false},
+		{"review rejects incomplete coverage", `{"reason":"wrong target", "coverage":[], "preconditions":[], "supported":false}`, nil, false},
+		{"invented answer", `{"reason":"matched", "coverage":[{"request_quote":"支付", "answer_quote":"invented"}], "preconditions":[], "supported":true}`, nil, false},
+		{"invented request", `{"reason":"matched", "coverage":[{"request_quote":"invented", "answer_quote":"标准答案"}], "preconditions":[], "supported":true}`, nil, false},
+		{"missing precondition evidence", `{"reason":"matched", "coverage":[{"request_quote":"支付", "answer_quote":"标准答案"}], "preconditions":[{"condition_quote":"支付", "evidence_quote":""}], "supported":true}`, nil, false},
+		{"known precondition", `{"reason":"matched", "coverage":[{"request_quote":"支付", "answer_quote":"标准答案"}], "preconditions":[{"condition_quote":"支付", "evidence_quote":"支付"}], "supported":true}`, nil, true},
+		{"missing verdict", `{"reason":"matched", "coverage":[], "preconditions":[]}`, nil, false},
+		{"invalid JSON", `{`, nil, false},
+		{"timeout", "", context.DeadlineExceeded, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, req, cfg, repo := preflightFixture(t)
+			req.Query = "支付问题"
+			repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+			reviews := 0
+			model := preflightChat{
+				call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					return &types.ChatResponse{Content: preflightSelection}, nil
+				},
+				review: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+					reviews++
+					require.NotContains(t, messages[1].Content, "selected_id")
+					require.NotContains(t, messages[1].Content, "matched_facts")
+					require.Contains(t, messages[1].Content, req.Query)
+					require.Contains(t, messages[1].Content, "标准答案")
+					return &types.ChatResponse{Content: tc.review}, tc.reviewErr
+				},
+			}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, nil, nil)
+			require.Equal(t, 1, reviews)
+			require.Equal(t, tc.want, evaluation.Match != nil)
+		})
+	}
+}
+
+func TestFAQReviewAcceptsContextAndUnavailableAnswer(t *testing.T) {
+	s, req, cfg, repo := preflightFixture(t)
+	req.Query, req.AppInfo = "那怎么办", `{"account":"企业账号"}`
+	repo.chunk.Metadata = types.JSON(`{"standard_question":"企业账号能导出报表吗？","similar_questions":["那怎么办"],"answers":["企业账号不支持导出报表。"]}`)
+	repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+	model := preflightChat{
+		call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+			if messages[0].Content == faqRewritePrompt {
+				return &types.ChatResponse{Content: req.Query}, nil
+			}
+			return &types.ChatResponse{Content: strings.Replace(preflightSelection, "支付", req.Query, 1)}, nil
+		},
+		review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: `{"reason":"unavailable", "coverage":[{"request_quote":"那怎么办","answer_quote":"不支持导出报表"},{"request_quote":"导出报表","answer_quote":"不支持导出报表"}], "preconditions":[{"condition_quote":"企业账号","evidence_quote":"企业账号"}], "supported":true}`}, nil
+		},
+	}
+	evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, nil, []chat.Message{{Role: "user", Content: "如何导出报表？"}})
+	require.Equal(t, "企业账号不支持导出报表。", evaluation.Answer)
+}
 
 func preflightFixture(t *testing.T) (*sessionService, *types.QARequest, *types.AgentConfig, *preflightRepo) {
 	t.Helper()
@@ -143,6 +289,25 @@ func TestFAQFallsThroughForCurrentProjectState(t *testing.T) {
 		require.Empty(t, reply.Answer, decision)
 		require.Equal(t, 2, calls, "both entry points must reach the coverage judge")
 	}
+}
+
+func TestSteerFAQWithWebSearchEnabled(t *testing.T) {
+	s, req, cfg, repo := preflightFixture(t)
+	req.Query = "支付问题"
+	req.WebSearchEnabled = true
+	cfg.WebSearchEnabled = true
+	repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+	model := preflightChat{call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+		if messages[0].Content == faqRewritePrompt {
+			return &types.ChatResponse{Content: "支付问题"}, nil
+		}
+		return &types.ChatResponse{Content: preflightSelection}, nil
+	}}
+	steer := s.steerFAQ(req, cfg, event.NewEventBus(), model, nil, nil)
+	require.NotNil(t, steer)
+	reply, err := steer(t.Context(), "next", "支付问题", nil)
+	require.NoError(t, err)
+	require.Equal(t, "标准答案", reply.Answer)
 }
 
 func TestFAQFollowupSearchReadsCurrentExactEntry(t *testing.T) {
@@ -241,13 +406,30 @@ func TestFAQSemanticDirectAnswerUsesModelScore(t *testing.T) {
 		first.ID, second.ID = "related-first", "related-second"
 		kbs.rows = []*types.SearchResult{&first, &second, &row}
 		reranker := &scoredReranker{scores: []float64{0.99, 0.98, tc.score}}
-		selected := graphReplyChat{resp: &types.ChatResponse{Content: strings.Replace(preflightSelection, `"selected_id":"1"`, `"selected_id":"3"`, 1)}}
+		selected := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: strings.Replace(preflightSelection, `"selected_id":"1"`, `"selected_id":"3"`, 1)}, nil
+		}}
 		evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, selected, reranker, nil)
 		require.Equal(t, tc.want, evaluation.Match != nil, "the selected third candidate needs the raw score floor, not first rank or a higher fusion score")
 		if tc.want {
 			require.Equal(t, row.ID, evaluation.Match.Result.ID)
 		}
 	}
+}
+
+func TestFAQSemanticBelowFloorSkipsCoverageLLM(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	req.CustomAgent = &types.CustomAgent{Config: types.CustomAgentConfig{FAQPriorityEnabled: true, FAQDirectAnswerThreshold: 0.9}}
+	calls := 0
+	model := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		calls++
+		return &types.ChatResponse{Content: preflightSelection}, nil
+	}}
+	evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.6}}, nil)
+	require.Nil(t, evaluation.Match)
+	require.Zero(t, calls)
+	require.Equal(t, "miss_below_floor", evaluation.Outcome)
+	require.Empty(t, cfg.FAQPreflightQuestions)
 }
 
 func TestFAQSemanticDirectAnswerRequiresGroundedFacts(t *testing.T) {
@@ -289,10 +471,11 @@ func TestFAQSemanticDirectAnswerRequiresGroundedFacts(t *testing.T) {
 	}
 }
 
-func TestFAQPreflightOverlapsRewriteAndCancelsItOnExactHit(t *testing.T) {
+func TestFAQPreflightOverlapsRewriteAndSkipsItOnExactHit(t *testing.T) {
 	s, req, cfg, repo := preflightFixture(t)
 	req.Query = "支付问题"
 	started := make(chan struct{})
+	release := make(chan struct{})
 	finished := make(chan struct{})
 	repo.exact = func(ctx context.Context, _ string) ([]*types.Chunk, error) {
 		select {
@@ -305,22 +488,21 @@ func TestFAQPreflightOverlapsRewriteAndCancelsItOnExactHit(t *testing.T) {
 	model := preflightChat{call: func(ctx context.Context, messages []chat.Message) (*types.ChatResponse, error) {
 		if messages[0].Content == faqRewritePrompt {
 			close(started)
-			<-ctx.Done()
+			// Ignores cancellation: an exact hit must not wait for it.
+			<-release
 			close(finished)
-			return &types.ChatResponse{Usage: types.TokenUsage{TotalTokens: 3}}, ctx.Err()
+			return &types.ChatResponse{Usage: types.TokenUsage{TotalTokens: 3}}, nil
 		}
 		return &types.ChatResponse{Content: preflightSelection, Usage: types.TokenUsage{TotalTokens: 7}}, nil
 	}}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	evaluation := s.evaluateAgentFAQ(ctx, req, cfg, model, nil, []chat.Message{{Role: "user", Content: "支付问题"}})
+	close(release)
+	<-finished
 	require.NotNil(t, evaluation.Match)
-	select {
-	case <-finished:
-	default:
-		t.Fatal("exact hit must cancel and collect the rewrite before completing")
-	}
-	require.Equal(t, 10, evaluation.Usage.TotalTokens, "both calls must be counted without concurrent config writes")
+	require.NotEmpty(t, evaluation.reply().Answer)
+	require.Equal(t, 7, evaluation.Usage.TotalTokens, "the skipped rewrite is not counted")
 }
 
 func TestFAQPreflightUsesRewriteAfterExactMiss(t *testing.T) {
@@ -414,8 +596,8 @@ func TestFAQPreflightSharesBudgetAcrossStagesAndSteer(t *testing.T) {
 			require.NotNil(t, evaluation.Match)
 		}
 		require.False(t, scopeDeadline.IsZero())
-		// Exact lookup has a 10s cap; scope's 15s cap must share the original 12s deadline.
-		require.LessOrEqual(t, scopeDeadline.Sub(exactDeadline), faqPreflightTimeout-10*time.Second)
+		// Exact lookup has a 10s cap; scope's 15s cap must share the original preflight deadline.
+		require.LessOrEqual(t, scopeDeadline.Sub(exactDeadline), max(0, faqPreflightTimeout-10*time.Second))
 	}
 }
 
@@ -673,4 +855,344 @@ func TestFAQCoveragePromptRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFAQPreflightTimeoutConfig(t *testing.T) {
+	s := &sessionService{}
+	require.Equal(t, 10*time.Second, s.faqPreflightTimeout())
+	s.cfg = &config.Config{Agent: &config.AgentConfig{FAQPreflightTimeoutSeconds: 3}}
+	require.Equal(t, 3*time.Second, s.faqPreflightTimeout())
+}
+
+func TestFAQAnswerQuoteGrounded(t *testing.T) {
+	answer := "首先确认“充值不到账”发生在哪个阶段，不要只根据玩家截图直接补单。订单链路为：调用 pay → SDK 生单 → 渠道付款。"
+	require.True(t, faqAnswerQuoteGrounded(answer, "首先确认“充值不到账”发生在哪个阶段"))
+	require.True(t, faqAnswerQuoteGrounded(answer, "首先确认“充值不到账”发生在哪个阶段...订单链路为：调用 pay"))
+	require.True(t, faqAnswerQuoteGrounded(answer, "首先确认……订单链路为"))
+	require.False(t, faqAnswerQuoteGrounded(answer, "订单链路为...首先确认"))
+	require.False(t, faqAnswerQuoteGrounded(answer, "首先确认...不存在的内容"))
+	require.False(t, faqAnswerQuoteGrounded(answer, "..."))
+	require.False(t, faqAnswerQuoteGrounded(answer, "一...二"))
+}
+
+type faqModelLookupStub struct {
+	interfaces.ModelService
+	models map[string]chat.Chat
+	err    error
+	called []string
+}
+
+func (m *faqModelLookupStub) GetChatModel(_ context.Context, modelID string) (chat.Chat, error) {
+	m.called = append(m.called, modelID)
+	if m.err != nil {
+		return nil, m.err
+	}
+	if ch, ok := m.models[modelID]; ok {
+		return ch, nil
+	}
+	return nil, errors.New("not found")
+}
+
+func TestResolveFAQPreflightModel(t *testing.T) {
+	fallback := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		return &types.ChatResponse{Content: "fallback"}, nil
+	}}
+	agentFast := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		return &types.ChatResponse{Content: "agent-fast"}, nil
+	}}
+	globalFast := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		return &types.ChatResponse{Content: "global-fast"}, nil
+	}}
+
+	t.Run("agent config overrides global", func(t *testing.T) {
+		stub := &faqModelLookupStub{models: map[string]chat.Chat{"agent-model": agentFast, "global-model": globalFast}}
+		s := &sessionService{
+			cfg:          &config.Config{Agent: &config.AgentConfig{FAQPreflightModelID: "global-model"}},
+			modelService: stub,
+		}
+		req := &types.QARequest{CustomAgent: &types.CustomAgent{Config: types.CustomAgentConfig{FAQPreflightModelID: "agent-model"}}}
+		got := s.resolveFAQPreflightModel(t.Context(), t.Context(), req, fallback)
+		resp, err := got.Chat(t.Context(), []chat.Message{{Role: "user"}}, nil)
+		require.NoError(t, err)
+		require.Equal(t, "agent-fast", resp.Content)
+		require.Equal(t, []string{"agent-model"}, stub.called)
+	})
+
+	t.Run("falls back to global config", func(t *testing.T) {
+		stub := &faqModelLookupStub{models: map[string]chat.Chat{"global-model": globalFast}}
+		s := &sessionService{
+			cfg:          &config.Config{Agent: &config.AgentConfig{FAQPreflightModelID: "global-model"}},
+			modelService: stub,
+		}
+		req := &types.QARequest{CustomAgent: &types.CustomAgent{}}
+		got := s.resolveFAQPreflightModel(t.Context(), t.Context(), req, fallback)
+		resp, err := got.Chat(t.Context(), []chat.Message{{Role: "user"}}, nil)
+		require.NoError(t, err)
+		require.Equal(t, "global-fast", resp.Content)
+		require.Equal(t, []string{"global-model"}, stub.called)
+	})
+
+	t.Run("falls back to summary model on error", func(t *testing.T) {
+		stub := &faqModelLookupStub{err: errors.New("boom")}
+		s := &sessionService{
+			cfg:          &config.Config{Agent: &config.AgentConfig{FAQPreflightModelID: "missing-model"}},
+			modelService: stub,
+		}
+		got := s.resolveFAQPreflightModel(t.Context(), t.Context(), &types.QARequest{}, fallback)
+		resp, err := got.Chat(t.Context(), []chat.Message{{Role: "user"}}, nil)
+		require.NoError(t, err)
+		require.Equal(t, "fallback", resp.Content)
+	})
+}
+
+func TestFAQPreflightPolicyOverridesSystemPrompt(t *testing.T) {
+	t.Run("uses faq_preflight_policy when configured", func(t *testing.T) {
+		s, req, cfg, repo := preflightFixture(t)
+		req.Query = "支付问题"
+		cfg.SystemPrompt = "4812 chars react system prompt with tool workflows"
+		req.CustomAgent = &types.CustomAgent{Config: types.CustomAgentConfig{
+			FAQPreflightPolicy: "禁止断言不支持沙盒支付。",
+		}}
+		repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+		var seenCoverage, seenReview string
+		model := preflightChat{
+			call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+				var input map[string]any
+				require.NoError(t, json.Unmarshal([]byte(messages[1].Content), &input))
+				seenCoverage = input["assistant_requirements"].(string)
+				return &types.ChatResponse{Content: preflightSelection}, nil
+			},
+			review: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+				var input map[string]any
+				require.NoError(t, json.Unmarshal([]byte(messages[1].Content), &input))
+				seenReview = input["assistant_requirements"].(string)
+				return &types.ChatResponse{Content: `{"reason":"matched","coverage":[{"request_quote":"支付","answer_quote":"标准答案"}],"preconditions":[],"supported":true}`}, nil
+			},
+		}
+		evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, nil, nil)
+		require.Equal(t, "标准答案", evaluation.Answer)
+		require.Equal(t, "禁止断言不支持沙盒支付。", seenCoverage)
+		require.Equal(t, "禁止断言不支持沙盒支付。", seenReview)
+	})
+
+	t.Run("falls back to system_prompt when faq_preflight_policy is empty", func(t *testing.T) {
+		s, req, cfg, repo := preflightFixture(t)
+		req.Query = "支付问题"
+		cfg.SystemPrompt = "fallback system prompt"
+		req.CustomAgent = &types.CustomAgent{Config: types.CustomAgentConfig{
+			FAQPreflightPolicy: "   ",
+		}}
+		repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+		var seen string
+		model := preflightChat{call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+			var input map[string]any
+			require.NoError(t, json.Unmarshal([]byte(messages[1].Content), &input))
+			seen = input["assistant_requirements"].(string)
+			return &types.ChatResponse{Content: preflightSelection}, nil
+		}}
+		evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, nil, nil)
+		require.Equal(t, "标准答案", evaluation.Answer)
+		require.Equal(t, "fallback system prompt", seen)
+	})
+}
+
+func TestFAQPromptsDistinguishBindingRulesFromReActMechanics(t *testing.T) {
+	require.Contains(t, faqCoveragePrompt, "Distinguish binding rules from ReAct agent mechanics")
+	require.Contains(t, faqCoveragePrompt, "hard business prohibitions")
+	require.Contains(t, faqReviewPrompt, "hard business prohibitions")
+	require.Contains(t, faqReviewPrompt, "ReAct search/tool-orchestration instructions")
+}
+
+func TestFAQReviewPromptAllowsGeneralTroubleshootingWithoutLiveLookup(t *testing.T) {
+	require.Contains(t, faqReviewPrompt, "does not need live data even when application_context is present")
+	require.Contains(t, faqReviewPrompt, "general diagnostic or staged troubleshooting FAQ qualifies")
+	require.Contains(t, faqReviewPrompt, "merely explains how to obtain, create, or enable a feature without diagnosing failure causes")
+	require.Contains(t, faqReviewPrompt, "never repeat the same request_quote or copy the full FAQ")
+}
+
+func TestFAQReviewRejectionRetainsPreflightQuestionForAgent(t *testing.T) {
+	s, req, cfg, repo := preflightFixture(t)
+	req.Query = "支付未到账"
+	repo.chunk.Metadata = types.JSON(`{"standard_question":"充值不到账有哪些常见原因，应该如何排查？","answers":["分阶段排查。"]}`)
+	s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+	model := preflightChat{
+		call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: strings.Replace(preflightSelection, `["支付"]`, `["支付未到账"]`, 1)}, nil
+		},
+		review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: `{"reason":"rejected","coverage":[],"preconditions":[],"supported":false}`}, nil
+		},
+	}
+	evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.9}}, nil)
+	require.Nil(t, evaluation.Match)
+	require.Equal(t, "miss_review_rejected", evaluation.Outcome)
+	require.Equal(t, []string{"充值不到账有哪些常见原因，应该如何排查？"}, cfg.FAQPreflightQuestions)
+	require.Equal(t, map[string]types.FAQPreflightRejection{"faq": {Question: "充值不到账有哪些常见原因，应该如何排查？", Reason: "rejected"}}, cfg.FAQPreflightRejections)
+}
+
+func TestFAQReviewRejectsTruncatedCompleteJSON(t *testing.T) {
+	for _, finish := range []string{"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded"} {
+		t.Run(finish, func(t *testing.T) {
+			s, req, cfg, _ := preflightFixture(t)
+			model := preflightChat{
+				call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					return &types.ChatResponse{Content: preflightSelection}, nil
+				},
+				review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+					return &types.ChatResponse{Content: `{"reason":"ok","coverage":[{"request_quote":"支付","answer_quote":"支付"}],"preconditions":[],"supported":true}`, FinishReason: finish}, nil
+				},
+			}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.9}}, nil)
+			require.Nil(t, evaluation.Match)
+			require.Equal(t, "err_review_llm", evaluation.Outcome)
+		})
+	}
+}
+
+func TestFAQCoverageRejectsTruncatedCompleteJSON(t *testing.T) {
+	for _, finish := range []string{"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded", "stop"} {
+		t.Run(finish, func(t *testing.T) {
+			s, req, cfg, repo := preflightFixture(t)
+			req.Query = "支付问题"
+			repo.chunk.Metadata = types.JSON(`{"standard_question":"支付问题","answers":["标准答案"]}`)
+			s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+			repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
+			model := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+				return &types.ChatResponse{Content: strings.TrimSuffix(preflightSelection, "}") + `,"standalone_unconditional":true}`, FinishReason: finish, Usage: types.TokenUsage{TotalTokens: 7}}, nil
+			}}
+			evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.99}}, nil)
+			require.Equal(t, 7, cfg.FAQPreflightUsage.TotalTokens)
+			if finish == "stop" {
+				require.Equal(t, "hit_fast", evaluation.Outcome)
+				require.Equal(t, "标准答案", evaluation.Answer)
+			} else {
+				require.Equal(t, "err_scope_llm", evaluation.Outcome)
+				require.Empty(t, evaluation.Answer)
+				require.Nil(t, evaluation.Match)
+			}
+		})
+	}
+}
+
+func TestSteerFAQReviewRejectionIsReturnedToRunningAgent(t *testing.T) {
+	s, req, cfg, repo := preflightFixture(t)
+	req.Query = "支付未到账"
+	repo.chunk.Metadata = types.JSON(`{"standard_question":"充值不到账有哪些常见原因，应该如何排查？","answers":["分阶段排查。"]}`)
+	s.knowledgeBaseService.(*preflightKBs).rows[0].ChunkMetadata = repo.chunk.Metadata
+	model := preflightChat{
+		call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: strings.Replace(preflightSelection, `["支付"]`, `["支付未到账"]`, 1)}, nil
+		},
+		review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: `{"reason":"rejected","coverage":[],"preconditions":[],"supported":false}`}, nil
+		},
+	}
+	reply, err := s.steerFAQ(req, cfg, event.NewEventBus(), model, &scoredReranker{scores: []float64{0.9}}, nil)(t.Context(), "next-user", "是 iOS", nil)
+	require.NoError(t, err)
+	require.Empty(t, reply.Answer)
+	require.Equal(t, []string{"充值不到账有哪些常见原因，应该如何排查？"}, reply.Questions)
+	require.Equal(t, map[string]types.FAQPreflightRejection{"faq": {Question: "充值不到账有哪些常见原因，应该如何排查？", Reason: "rejected"}}, reply.Rejections)
+	require.Empty(t, cfg.FAQPreflightRejections, "the shared config stays untouched; the engine applies the reply")
+}
+
+func TestFAQPreflightSideCallOptions(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	seen := map[string]bool{}
+	model := preflightChat{
+		checkOptions: func(messages []chat.Message, opts *chat.ChatOptions) {
+			require.NotNil(t, opts)
+			require.True(t, opts.Isolated)
+			require.Zero(t, opts.Temperature)
+			seen[messages[0].Content] = true
+		},
+		call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+			if messages[0].Content == faqRewritePrompt {
+				return &types.ChatResponse{Content: "支付问题"}, nil
+			}
+			return &types.ChatResponse{Content: preflightSelection}, nil
+		},
+	}
+	_, err := faqSearchQuery(t.Context(), cfg, model, req.Query, []chat.Message{{Role: "user", Content: "支付问题"}})
+	require.NoError(t, err)
+	s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.9}}, nil)
+	require.True(t, seen[faqRewritePrompt])
+	require.True(t, seen[faqCoveragePrompt])
+	require.True(t, seen[faqReviewPrompt])
+}
+
+func TestFAQPreflightFallbackHints(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		err           error
+		live          bool
+	}{
+		{name: "insufficient", content: `{"decision":"insufficient"}`},
+		{name: "live data", content: `{"decision":"needs_live_data"}`, live: true},
+		{name: "invalid JSON", content: `{`},
+		{name: "timeout", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, req, cfg, _ := preflightFixture(t)
+			model := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+				return &types.ChatResponse{Content: tc.content}, tc.err
+			}}
+			s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.9}}, nil)
+			require.Equal(t, []string{"支付问题"}, cfg.FAQPreflightQuestions)
+			if tc.live {
+				require.Contains(t, cfg.FAQPreflightRejections["faq"].Reason, "requires live data")
+			} else {
+				require.Empty(t, cfg.FAQPreflightRejections)
+			}
+		})
+	}
+}
+
+func TestFAQReviewGroundingFailureDoesNotCreateRejection(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	model := preflightChat{
+		call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: preflightSelection}, nil
+		},
+		review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: `{"reason":"supported","coverage":[{"request_quote":"支付","answer_quote":"不存在"}],"preconditions":[],"supported":true}`}, nil
+		},
+	}
+	evaluation := s.evaluateAgentFAQ(t.Context(), req, cfg, model, &scoredReranker{scores: []float64{0.9}}, nil)
+	require.Equal(t, "miss_review_rejected", evaluation.Outcome)
+	require.Equal(t, []string{"支付问题"}, cfg.FAQPreflightQuestions)
+	require.Empty(t, cfg.FAQPreflightRejections)
+}
+
+func TestFAQCoverageReceivesUntruncatedSourceHistory(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	history := make([]chat.Message, 29)
+	for i := range history {
+		history[i] = chat.Message{Role: "user", Content: "支付只有一周以后才失败"}
+	}
+	history[0].Content = "本次会话支付问题依据《Google支付配置》作答，排除其他材料"
+	model := preflightChat{call: func(_ context.Context, messages []chat.Message) (*types.ChatResponse, error) {
+		var input struct {
+			SourceContext []string `json:"source_context"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(messages[len(messages)-1].Content), &input))
+		require.Len(t, input.SourceContext, 29)
+		require.Equal(t, history[0].Content, input.SourceContext[0])
+		return &types.ChatResponse{Content: `{"decision":"insufficient","broad_document_search":false}`}, nil
+	}}
+	evaluation := &agentFAQEvaluation{}
+	s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, model, &scoredReranker{scores: []float64{0.99}}, history, nil, false, evaluation)
+	require.Equal(t, "miss_insufficient", evaluation.Outcome)
+	require.False(t, evaluation.BroadDocumentSearch)
+}
+
+func TestFAQCoverageDoesNotEnableBroadSearchForOversizedHistory(t *testing.T) {
+	s, req, cfg, _ := preflightFixture(t)
+	history := []chat.Message{{Role: "user", Content: strings.Repeat("x", 16001)}}
+	model := preflightChat{call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+		return &types.ChatResponse{Content: `{"decision":"insufficient","broad_document_search":true}`}, nil
+	}}
+	evaluation := &agentFAQEvaluation{}
+	s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, model, &scoredReranker{scores: []float64{0.99}}, history, nil, false, evaluation)
+	require.Equal(t, "miss_insufficient", evaluation.Outcome)
+	require.False(t, evaluation.BroadDocumentSearch)
 }

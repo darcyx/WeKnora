@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 
@@ -37,6 +38,65 @@ import (
 const MAX_ITERATIONS = 100 // Max iterations for agent execution
 
 // dedupStrings removes duplicate strings while preserving the first occurrence order.
+func cloneBoolPtr(v *bool) *bool {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func cloneAgentConfig(cfg *types.AgentConfig) *types.AgentConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	cloned.AllowedTools = slices.Clone(cfg.AllowedTools)
+	cloned.KnowledgeBases = slices.Clone(cfg.KnowledgeBases)
+	cloned.KnowledgeIDs = slices.Clone(cfg.KnowledgeIDs)
+	cloned.MemoryEnabled = cloneBoolPtr(cfg.MemoryEnabled)
+	cloned.SearchTargets = cfg.SearchTargets.Clone()
+	if cfg.FAQPreflightUsage != nil {
+		usage := *cfg.FAQPreflightUsage
+		cloned.FAQPreflightUsage = &usage
+	}
+	cloned.FAQPreflightQuestions = slices.Clone(cfg.FAQPreflightQuestions)
+	cloned.FAQPreflightRejections = maps.Clone(cfg.FAQPreflightRejections)
+	cloned.FixedResponses = maps.Clone(cfg.FixedResponses)
+	cloned.MCPServices = slices.Clone(cfg.MCPServices)
+	cloned.AttachmentSandboxCopies = maps.Clone(cfg.AttachmentSandboxCopies)
+	cloned.Thinking = cloneBoolPtr(cfg.Thinking)
+	cloned.CitationEnabled = cloneBoolPtr(cfg.CitationEnabled)
+	cloned.SkillDirs = slices.Clone(cfg.SkillDirs)
+	cloned.AllowedSkills = slices.Clone(cfg.AllowedSkills)
+	if cfg.TenantSkills != nil {
+		cloned.TenantSkills = make([]*types.TenantSkillEntity, len(cfg.TenantSkills))
+		for i, skill := range cfg.TenantSkills {
+			if skill != nil {
+				copied := *skill
+				cloned.TenantSkills[i] = &copied
+			}
+		}
+	}
+	cloned.PinnedMCPServiceIDs = slices.Clone(cfg.PinnedMCPServiceIDs)
+	cloned.PinnedSkillNames = slices.Clone(cfg.PinnedSkillNames)
+	if cfg.QuestionOrigin != nil {
+		origin := *cfg.QuestionOrigin
+		cloned.QuestionOrigin = &origin
+	}
+	if cfg.PageContext != nil {
+		page := *cfg.PageContext
+		page.WikiIssueIDs = slices.Clone(cfg.PageContext.WikiIssueIDs)
+		if cfg.PageContext.Selection != nil {
+			sel := *cfg.PageContext.Selection
+			page.Selection = &sel
+		}
+		cloned.PageContext = &page
+	}
+	cloned.WritableKBIDs = slices.Clone(cfg.WritableKBIDs)
+	return &cloned
+}
+
 func dedupStrings(in []string) []string {
 	if len(in) == 0 {
 		return in
@@ -343,7 +403,8 @@ func (s *agentService) CreateAgentEngine(
 ) (interfaces.AgentEngine, error) {
 	logger.Infof(ctx, "Creating agent engine with custom EventBus")
 
-	// 1. Validate config
+	config = cloneAgentConfig(config)
+
 	if err := s.ValidateConfig(config); err != nil {
 		return nil, fmt.Errorf("invalid agent config: %w", err)
 	}
@@ -1017,11 +1078,14 @@ func (s *agentService) initializeSkillsManager(
 	logger.Infof(ctx, "Workspace sandbox in use: config=%s workspace=%d type=%s",
 		pin.ConfigID, pin.TenantOr(tenantID), sandboxMgr.GetType())
 
-	// Create skills manager
+	// Create skills manager with live tool registry lookup so skills requiring
+	// tools registered during initialization (e.g. read_file) or reloaded later
+	// always see the final session tool set.
 	skillsConfig := &skills.ManagerConfig{
-		SkillDirs:     config.SkillDirs,
-		AllowedSkills: config.AllowedSkills,
-		Enabled:       config.SkillsEnabled,
+		SkillDirs:          config.SkillDirs,
+		AllowedSkills:      config.AllowedSkills,
+		AvailableToolsFunc: toolRegistry.ListTools,
+		Enabled:            config.SkillsEnabled,
 	}
 
 	skillsManager := skills.NewManager(skillsConfig, sandboxMgr)
@@ -1032,15 +1096,11 @@ func (s *agentService) initializeSkillsManager(
 		skillsManager.WithTenantSource(source)
 	}
 
-	// Initialize (discover skills)
-	if err := skillsManager.Initialize(ctx); err != nil {
-		return nil, fmt.Errorf("failed to initialize skills: %w", err)
-	}
-
 	// Skill tools follow SkillsEnabled, not merely sandbox availability: the
 	// skill installer agent must have shell_exec WITHOUT execute_skill_script,
 	// since it is the thing installing skills. shell_exec itself is registered
-	// by registerSandboxShellIfAllowed, not here.
+	// by registerSandboxShellIfAllowed, not here. Register read_file BEFORE
+	// Initialize so skills declaring required_tools: [read_file] are visible.
 	shellEnabled := false
 	if tool, err := toolRegistry.GetTool(tools.ToolShellExec); err == nil {
 		if shell, ok := tool.(*tools.ShellExecTool); ok {
@@ -1065,6 +1125,11 @@ func (s *agentService) initializeSkillsManager(
 		}
 		reader.WithSkills(skillsManager, shellEnabled)
 		logger.Infof(ctx, "Attached skill resources to read_file")
+	}
+
+	// Initialize (discover skills) after all session tools are registered.
+	if err := skillsManager.Initialize(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize skills: %w", err)
 	}
 
 	return skillsManager, nil
@@ -1610,7 +1675,7 @@ func (s *agentService) registerTools(
 				rerankModel,
 				s.cfg,
 			).WithEmbeddingTopK(config.EmbeddingTopK).
-				WithContextImages(config.ChatModelSupportsVision).WithFAQPreflightQuestions(config.FAQPreflightQuestions)
+				WithContextImages(config.ChatModelSupportsVision).WithFAQPreflightQuestions(config.FAQPreflightQuestions).WithFAQPreflightRejections(config.FAQPreflightRejections)
 		case tools.ToolReadDocument:
 			toolToRegister = tools.NewReadDocumentTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolListDocuments:
@@ -1638,11 +1703,11 @@ func (s *agentService) registerTools(
 		case tools.ToolDatabaseQuery:
 			toolToRegister = tools.NewDatabaseQueryTool(s.db, config.SearchTargets)
 		case tools.ToolWebSearch:
-			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults)
+			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults).WithAppInfo(config.AppInfo)
 			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d, providerID: %s", sessionID, config.WebSearchMaxResults, config.WebSearchProviderID)
 
 		case tools.ToolWebFetch:
-			toolToRegister = tools.NewWebFetchTool(webClient)
+			toolToRegister = tools.NewWebFetchTool(webClient).WithAppInfo(config.AppInfo)
 			logger.Infof(ctx, "Registered web_fetch tool for session: %s, providerID: %s",
 				sessionID, config.WebSearchProviderID)
 
@@ -1772,7 +1837,7 @@ func (s *agentService) getKnowledgeBaseInfos(
 	kbTenantMap map[string]uint64,
 	snapshot *agentKnowledgeBaseSnapshot,
 ) ([]*agent.KnowledgeBaseInfo, error) {
-	if len(kbIDs) == 0 {
+	if len(kbIDs) == 0 || s.knowledgeBaseService == nil {
 		return []*agent.KnowledgeBaseInfo{}, nil
 	}
 	if snapshot == nil {
@@ -2228,7 +2293,7 @@ func (s *agentService) pageContextIssues(
 }
 
 func (s *agentService) getSelectedDocumentInfos(ctx context.Context, knowledgeIDs []string) ([]*agent.SelectedDocumentInfo, error) {
-	if len(knowledgeIDs) == 0 {
+	if len(knowledgeIDs) == 0 || s.knowledgeService == nil {
 		return []*agent.SelectedDocumentInfo{}, nil
 	}
 

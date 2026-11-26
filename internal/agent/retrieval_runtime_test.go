@@ -43,6 +43,7 @@ func TestRuntimeRetrievalUsesOriginalToolsAndRecordedOutcomes(t *testing.T) {
 	model := &runtimeRetrievalChat{mockChat: &mockChat{}}
 	e.chatModel = model
 	search.output = `<retrieval><document id="doc"><content>配置说明</content></document></retrieval>`
+	search.published = []types.PublishedSourceRef{{ID: "doc", Citable: true}}
 	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "完整配置步骤"}
 	e.toolRegistry.RegisterTool(reader)
 	for _, tool := range e.buildToolsForLLM() {
@@ -273,6 +274,7 @@ func TestRuntimeRetrievalReadBatchSharesQuestionWithoutInFlightRejection(t *test
 	e, search := newRuntimeRetrievalProbeEngine(t)
 	e.EnableRuntimeRetrieval()
 	search.output = `<retrieval><document id="one"/><document id="two"/></retrieval>`
+	search.published = []types.PublishedSourceRef{{ID: "one", Citable: true}, {ID: "two", Citable: true}}
 	require.True(t, retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
 	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "document content"}
 	e.toolRegistry.RegisterTool(reader)
@@ -295,7 +297,7 @@ func TestRuntimeRetrievalRecoversEarlierPartialFailureAfterReading(t *testing.T)
 	e.config.SearchTargets = targets
 	e.beginTurn("TapTap sandbox configuration", nil, &types.AgentState{})
 	e.EnableRuntimeRetrieval()
-	search.result = &types.ToolResult{Success: true, Output: `<retrieval><document id="doc"/></retrieval>`,
+	search.result = &types.ToolResult{Success: true, Output: `<retrieval><document id="doc"/></retrieval>`, PublishedSources: []types.PublishedSourceRef{{ID: "doc", Citable: true}},
 		RetrievalFailures: []types.RetrievalFailure{{KnowledgeBaseIDs: []string{"kb"}, Targets: targets, Stage: "embedding", Cause: context.DeadlineExceeded}}}
 	require.True(t, retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
 	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "usable evidence"}

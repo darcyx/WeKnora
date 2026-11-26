@@ -57,6 +57,9 @@ func TestListDocumentsRendersRowsForModelAndUI(t *testing.T) {
 	if len(rows) != 2 || rows[0]["knowledge_id"] != "doc-a" || rows[0]["is_faq"] != false {
 		t.Fatalf("rows = %+v", rows)
 	}
+	if len(res.PublishedSources) != 2 || res.PublishedSources[0].ID != "doc-a" || res.PublishedSources[0].Citable {
+		t.Fatalf("published sources = %+v", res.PublishedSources)
+	}
 	if res.Data["display_type"] != "document_info" || res.Data["total_docs"] != int64(3) || res.Data["page"] != 1 {
 		t.Fatalf("data = %+v", res.Data)
 	}

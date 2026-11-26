@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
@@ -23,9 +25,11 @@ func (e *AgentEngine) finishUserQuestion(ctx context.Context, state *types.Agent
 			return false, err
 		}
 		question := call.Result.Output
+		usesToolQuestion := true
 		if e.retrieval != nil {
 			if fields := (&retrievalControl{state: e.retrieval.snapshot()}).missingUserFields(); len(fields) > 0 {
 				question = missingConditionsQuestion(fields)
+				usesToolQuestion = false
 			} else if hadBlockers {
 				*messages = append(*messages, chat.Message{Role: "system", Content: "Project context supplies the missing fields. Continue using the established context without asking for them again."})
 				return false, nil
@@ -54,10 +58,31 @@ func (e *AgentEngine) finishUserQuestion(ctx context.Context, state *types.Agent
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		if err := e.eventBus.Emit(ctx, event.Event{ID: generateEventID("clarification"), Type: event.EventAgentFinalAnswer, SessionID: sessionID, Data: event.AgentFinalAnswerData{Content: question, Done: true}}); err != nil {
+		answer := stripFollowUpButtons(question)
+		prelude := strings.TrimSpace(stripFollowUpButtons(agenttools.StripThinkBlocks(step.Thought)))
+		if prelude != "" && !strings.Contains(prelude, strings.TrimSpace(answer)) {
+			answer = prelude + "\n\n" + answer
+		} else {
+			prelude = ""
+		}
+		var publishedQuestion string
+		if usesToolQuestion {
+			payload, err := json.Marshal(map[string]interface{}{"question": call.Result.UserQuestion, "prelude": prelude, "content": answer})
+			if err != nil {
+				return false, err
+			}
+			publishedQuestion = string(payload)
+		}
+		if err := e.eventBus.Emit(ctx, event.Event{ID: generateEventID("clarification"), Type: event.EventAgentFinalAnswer, SessionID: sessionID, Data: event.AgentFinalAnswerData{Content: answer, Done: true, PublishedQuestion: publishedQuestion}}); err != nil {
 			return false, err
 		}
-		state.FinalAnswer, state.IsComplete = question, true
+		if publishedQuestion != "" {
+			if call.Result.Data == nil {
+				call.Result.Data = make(map[string]interface{})
+			}
+			call.Result.Data["published_question"] = publishedQuestion
+		}
+		state.FinalAnswer, state.IsComplete = answer, true
 		return true, nil
 	}
 	return false, nil

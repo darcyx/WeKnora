@@ -107,3 +107,64 @@ func TestProjectIntegrationLibrariesAllowIndependentSearchAfterFailure(t *testin
 	require.True(t, next.Result.Success, next.Result.Error)
 	require.JSONEq(t, `{"query":"another","knowledge_base_ids":["healthy","pc"]}`, string(probe.calls[2]))
 }
+
+func TestProjectIntegrationLibrariesSkipFAQOnlySearch(t *testing.T) {
+	targets := types.SearchTargets{
+		retrievalScopeTarget("faq"),
+		retrievalScopeTarget("server"),
+		retrievalScopeTarget("mobile"),
+		retrievalScopeTarget("pc"),
+	}
+	kbInfos := []*KnowledgeBaseInfo{
+		{ID: "faq", Name: "docs-faq", Type: types.KnowledgeBaseTypeFAQ},
+		{ID: "server", Name: "docs-server", Type: types.KnowledgeBaseTypeDocument},
+		{ID: "mobile", Name: "docs-client", Type: types.KnowledgeBaseTypeDocument},
+		{ID: "pc", Name: "docs-pc", Type: types.KnowledgeBaseTypeDocument},
+	}
+	for _, tc := range []struct {
+		name string
+		ids  []any
+		want []any
+	}{
+		{"faq only", []any{"faq"}, []any{"faq"}},
+		{"mixed faq and mobile", []any{"faq", "mobile"}, []any{"faq", "mobile", "pc"}},
+		{"document kb still expands", []any{"server"}, []any{"server", "mobile", "pc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEngine(t, &mockChat{})
+			e.config.SearchTargets = targets
+			e.appInfo = `{"gameInfo":{"device_type":"手游、端游"}}`
+			e.knowledgeBasesInfo = kbInfos
+			e.retrieval = newRetrievalControl("支付未到账", retrievalScopeForTargets(targets))
+			e.retrieval.state.UserInputIDs = []string{"q"}
+			e.retrieval.state.Attempts = []retrievalAttempt{{QuestionID: "q", Tool: "search_knowledge", Completed: true, Outcome: retrievalSuccess}}
+			args := map[string]any{"knowledge_base_ids": tc.ids}
+			e.includeProjectIntegrationLibraries(args)
+			require.Equal(t, tc.want, args["knowledge_base_ids"])
+		})
+	}
+}
+
+func TestTurnShownChunksPropagatedAndResetOnBeginTurn(t *testing.T) {
+	e := newTestEngine(t, &mockChat{})
+	e.beginTurn("支付未到账", nil, &types.AgentState{})
+	require.Nil(t, e.snapshotTurnShownChunks())
+
+	e.recordTurnShownChunks(&types.ToolResult{
+		Success: true,
+		Data: map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"chunk_id": "chunk-1"},
+				{"faq_id": "faq-2"},
+			},
+		},
+	})
+	seen := e.snapshotTurnShownChunks()
+	require.Equal(t, map[string]bool{"chunk-1": true, "faq-2": true}, seen)
+
+	seen["chunk-1"] = false
+	require.True(t, e.snapshotTurnShownChunks()["chunk-1"], "snapshot must be isolated from caller mutation")
+
+	e.beginTurn("下一轮问题", nil, &types.AgentState{})
+	require.Nil(t, e.snapshotTurnShownChunks(), "new turn must clear shown chunks")
+}

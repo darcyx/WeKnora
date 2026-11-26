@@ -119,6 +119,11 @@ type Message struct {
 	// exactly on a stored turn, the only kind it can persist for later turns.
 	// Engine-internal like Kind, and kept off the wire for the same reason.
 	TurnID string `json:"-"`
+	// ReferenceURLs carries normalized HTTP(S) reference URLs extracted from
+	// persisted structured ToolResult.Data during history replay so multi-turn
+	// reference-section validation can verify surviving in-scope sources even
+	// when raw tool XML was compacted. Kept off the wire like TurnID.
+	ReferenceURLs []string `json:"-"`
 }
 
 // ToolCall represents a tool call in a message

@@ -46,6 +46,10 @@ type Skill struct {
 	// display title in name ("Word / DOCX") and the install id in slug
 	// ("word-docx"). When name is not a valid install identity, slug wins.
 	Slug string `yaml:"slug,omitempty"`
+	// RequiredTools lists tool requirements (exact name, prefix* wildcard, or
+	// pipe-separated alternatives like "call_mcp_tool|database_query|mcp_*")
+	// that must be present in the session for this skill to be exposed or loaded.
+	RequiredTools []string `yaml:"required_tools,omitempty"`
 
 	// Filesystem information
 	BasePath string // Absolute path to the skill directory
@@ -65,9 +69,10 @@ type Skill struct {
 // SkillMetadata represents the minimal metadata for system prompt injection (Level 1)
 // This is the lightweight representation used during skill discovery
 type SkillMetadata struct {
-	Name        string
-	Description string
-	BasePath    string // Path to skill directory for later loading
+	Name          string
+	Description   string
+	BasePath      string // Path to skill directory for later loading
+	RequiredTools []string
 }
 
 // SkillFile represents an additional file within a skill directory (Level 3)
@@ -149,10 +154,15 @@ func slugifySkillName(name string) string {
 
 // ToMetadata converts a Skill to its lightweight metadata representation
 func (s *Skill) ToMetadata() *SkillMetadata {
+	var req []string
+	if len(s.RequiredTools) > 0 {
+		req = append([]string(nil), s.RequiredTools...)
+	}
 	return &SkillMetadata{
-		Name:        s.Name,
-		Description: s.Description,
-		BasePath:    s.BasePath,
+		Name:          s.Name,
+		Description:   s.Description,
+		BasePath:      s.BasePath,
+		RequiredTools: req,
 	}
 }
 

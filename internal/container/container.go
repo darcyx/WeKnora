@@ -2054,7 +2054,7 @@ func registerWebSearchProviders(registry *infra_web_search.Registry) {
 		{Type: "duckduckgo", Search: infra_web_search.NewDuckDuckGoProvider},
 		{Type: "google", Search: infra_web_search.NewGoogleProvider},
 		{Type: "bing", Search: infra_web_search.NewBingProvider},
-		{Type: "tavily", Search: infra_web_search.NewTavilyProvider},
+		{Type: "tavily", Search: infra_web_search.NewTavilyProvider, Fetch: infra_web_search.NewTavilyFetch},
 		{Type: "ollama", Search: infra_web_search.NewOllamaProvider},
 		{Type: "baidu", Search: infra_web_search.NewBaiduProvider},
 		{Type: "searxng", Search: infra_web_search.NewSearxngProvider},

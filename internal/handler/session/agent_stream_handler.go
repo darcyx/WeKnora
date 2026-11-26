@@ -750,6 +750,9 @@ func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Ev
 	if data.Truncated {
 		metadata["truncated"] = true
 	}
+	if data.PublishedQuestion != "" {
+		metadata["published_question"] = data.PublishedQuestion
+	}
 	h.mu.Unlock()
 
 	// Append this chunk to stream (frontend will accumulate by event ID)

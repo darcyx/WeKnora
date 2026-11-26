@@ -4,21 +4,16 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// RecallMetric calculates recall for retrieval evaluation
 type RecallMetric struct{}
 
-// NewRecallMetric creates a new RecallMetric instance
 func NewRecallMetric() *RecallMetric {
 	return &RecallMetric{}
 }
 
-// Compute calculates the recall score
 func (r *RecallMetric) Compute(metricInput *types.MetricInput) float64 {
-	// Get ground truth and predicted IDs
 	gts := metricInput.RetrievalGT
 	ids := metricInput.RetrievalIDs
 
-	// Convert ground truth to sets for efficient lookup
 	gtSets := SliceMap(gts, ToSet)
 	if len(gtSets) == 0 {
 		return 0.0
@@ -36,6 +31,5 @@ func (r *RecallMetric) Compute(metricInput *types.MetricInput) float64 {
 		}
 	}
 
-	// Recall = average recall across all ground truth sets
 	return totalRecall / float64(len(gtSets))
 }

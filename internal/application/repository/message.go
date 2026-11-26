@@ -57,20 +57,6 @@ func (r *messageRepository) GetMessage(
 	return &message, nil
 }
 
-// GetAssistantMessageByRequestID selects the assistant reply, not the user
-// message that shares its request ID. GetMessage continues to query row IDs.
-func (r *messageRepository) GetAssistantMessageByRequestID(
-	ctx context.Context, sessionID, requestID string,
-) (*types.Message, error) {
-	var message types.Message
-	if err := r.db.WithContext(ctx).Where(
-		"session_id = ? AND request_id = ? AND role = ?", sessionID, requestID, "assistant",
-	).First(&message).Error; err != nil {
-		return nil, err
-	}
-	return &message, nil
-}
-
 // GetMessagesBySession retrieves all messages for a session with pagination.
 //
 // The secondary sort on id is not cosmetic: messages created in the same
@@ -698,11 +684,11 @@ func (r *messageRepository) GetSessionAttachments(
 // WHERE makes the "already voted" check atomic with the write instead of a
 // separate read-then-write that a concurrent request could race.
 func (r *messageRepository) UpdateMessageFeedback(
-	ctx context.Context, sessionID, requestID string, feedback types.MessageFeedback,
+	ctx context.Context, sessionID, messageID string, feedback types.MessageFeedback,
 ) error {
 	result := r.db.WithContext(ctx).
 		Model(&types.Message{}).
-		Where("request_id = ? AND session_id = ? and role='assistant' AND feedback IS NULL", requestID, sessionID).
+		Where("id = ? AND session_id = ? and role='assistant' AND feedback IS NULL", messageID, sessionID).
 		Update("feedback", &feedback)
 	if result.Error != nil {
 		return result.Error
@@ -716,7 +702,7 @@ func (r *messageRepository) UpdateMessageFeedback(
 	var exists int64
 	if err := r.db.WithContext(ctx).
 		Model(&types.Message{}).
-		Where("request_id = ? AND session_id = ? and role='assistant'", requestID, sessionID).
+		Where("id = ? AND session_id = ? and role='assistant'", messageID, sessionID).
 		Count(&exists).Error; err != nil {
 		return err
 	}

@@ -37,6 +37,12 @@ const (
 	// per-document or per-tag targets each add a full retrieval list, and
 	// every candidate is a billed passage and a share of the latency.
 	DefaultMaxCandidates = 200
+
+	// DefaultImageOCRScoreFactor moderately discounts image_ocr composite scores
+	// after threshold filtering when at least one text or FAQ chunk also passed,
+	// so UI-screenshot OCR does not outrank authoritative prose while scanned
+	// documents or image-only batches keep their full scores.
+	DefaultImageOCRScoreFactor = 0.85
 )
 
 // FallbackMinScore returns the score the best candidate needs to survive an
@@ -81,6 +87,10 @@ type Options struct {
 	// out; the vector can. Callers pass the text vector threshold or more.
 	// Kept results ride outside TopK; see types.MetadataKeptBy.
 	ImageKeepScore float64
+	// ImageOCRScoreFactor, when in (0, 1), multiplies the composite score of
+	// image_ocr hits after threshold filtering whenever at least one text or
+	// FAQ candidate also passed the threshold. Zero or >= 1 disables discounting.
+	ImageOCRScoreFactor float64
 }
 
 // Result is the outcome of a rerank run.
@@ -196,10 +206,11 @@ func Rerank(
 	res.Diagnostics.Outcome = outcome
 	res.Diagnostics.EffectiveThreshold = effective
 
+	ocrFactor := effectiveImageOCRScoreFactor(res.Candidates, passing, opts.ImageOCRScoreFactor)
 	scored := make([]*types.SearchResult, 0, len(passing))
 	scoredIdx := make([]int, 0, len(passing))
 	for _, rr := range passing {
-		scored = append(scored, scoredCopy(res.Candidates[rr.Index], rr.RelevanceScore, opts.FAQScoreBoost))
+		scored = append(scored, scoredCopy(res.Candidates[rr.Index], rr.RelevanceScore, opts.FAQScoreBoost, ocrFactor))
 		scoredIdx = append(scoredIdx, candidateIdx[rr.Index])
 	}
 	order := make([]int, len(scored))
@@ -235,7 +246,7 @@ func Rerank(
 		res.Indices = append(res.Indices, sortedIdx[p])
 	}
 	for _, k := range keptImages(ctx, res.Candidates, valid, passing, scoredAsImage, opts) {
-		kept := scoredCopy(res.Candidates[k.Index], k.RelevanceScore, opts.FAQScoreBoost)
+		kept := scoredCopy(res.Candidates[k.Index], k.RelevanceScore, opts.FAQScoreBoost, 0)
 		kept.Metadata[types.MetadataKeptBy] = types.KeptByImageVector
 		res.Results = append(res.Results, kept)
 		res.Indices = append(res.Indices, candidateIdx[k.Index])
@@ -369,9 +380,25 @@ func bestScore(scores []rerank.RankResult) (rerank.RankResult, bool) {
 // chat pipeline) changes Score.
 const CompositeScoreKey = "composite_score"
 
+// effectiveImageOCRScoreFactor returns factor only when discounting is enabled
+// and the passing batch contains at least one text or FAQ chunk, leaving pure
+// scanned-PDF or image-only batches untouched.
+func effectiveImageOCRScoreFactor(candidates []*types.SearchResult, passing []rerank.RankResult, factor float64) float64 {
+	if factor <= 0 || factor >= 1 {
+		return 0
+	}
+	for _, rr := range passing {
+		ct := candidates[rr.Index].ChunkType
+		if ct == "" || ct == string(types.ChunkTypeText) || ct == string(types.ChunkTypeFAQ) {
+			return factor
+		}
+	}
+	return 0
+}
+
 // scoredCopy returns a copy of r whose Score is the composite of the model
 // score and its retrieval score, recording both in Metadata.
-func scoredCopy(r *types.SearchResult, modelScore, faqBoost float64) *types.SearchResult {
+func scoredCopy(r *types.SearchResult, modelScore, faqBoost, ocrFactor float64) *types.SearchResult {
 	c := *r
 	c.Metadata = maps.Clone(r.Metadata)
 	if c.Metadata == nil {
@@ -386,6 +413,11 @@ func scoredCopy(r *types.SearchResult, modelScore, faqBoost float64) *types.Sear
 		c.Metadata["faq_boosted"] = "true"
 		c.Metadata["faq_original_score"] = strconv.FormatFloat(c.Score, 'f', 4, 64)
 		c.Score = math.Min(c.Score*faqBoost, 1.0)
+	}
+	if ocrFactor > 0 && ocrFactor < 1 && c.ChunkType == string(types.ChunkTypeImageOCR) {
+		c.Metadata["ocr_discounted"] = "true"
+		c.Metadata["ocr_original_score"] = strconv.FormatFloat(c.Score, 'f', 4, 64)
+		c.Score = math.Max(c.Score*ocrFactor, 0)
 	}
 	return &c
 }

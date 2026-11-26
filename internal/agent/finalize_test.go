@@ -241,6 +241,87 @@ func TestStreamFinalAnswer_ToolCallOnlyFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, stalledAnswerFallback, state.FinalAnswer)
 	require.True(t, fallback)
+	require.Len(t, model.finals, 2, "must retry once with an explicit plain-text turn before falling back")
+}
+
+func TestStreamFinalAnswer_ToolOnlyRetryFailureFallsBack(t *testing.T) {
+	for _, retry := range []string{"transport", "empty", "partial", "budget"} {
+		t.Run(retry, func(t *testing.T) {
+			model := &finalSynthesisChat{}
+			engine := newTestEngine(t, model)
+			recorder := &truncationRecorder{}
+			recorder.attach(engine.eventBus)
+			model.synthesize = func(context.Context, []chat.Message, *chat.ChatOptions) (<-chan types.StreamResponse, error) {
+				if len(model.finals) == 1 {
+					if retry == "budget" {
+						engine.config.MaxContextTokens = 1
+					}
+					return finalSynthesisChunks(types.StreamResponse{ResponseType: types.ResponseTypeToolCall, FinishReason: "tool_calls", Done: true, ToolCalls: []types.LLMToolCall{{ID: "c1", Type: "function", Function: types.FunctionCall{Name: "read_document", Arguments: "{}"}}}}), nil
+				}
+				switch retry {
+				case "transport":
+					return nil, errors.New("transport unavailable")
+				case "partial":
+					return finalSynthesisChunks(types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Content: "discard partial"}, types.StreamResponse{ResponseType: types.ResponseTypeError, Content: "transport unavailable", Done: true}), nil
+				default:
+					return finalSynthesisChunks(types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "stop"}), nil
+				}
+			}
+			state := &types.AgentState{}
+			require.NoError(t, engine.streamFinalAnswerToEventBus(t.Context(), "Summarize", state, "session", emptyMessages()))
+			require.Equal(t, stalledAnswerFallback, state.FinalAnswer)
+			var rendered string
+			done := 0
+			for _, evt := range recorder.snapshot() {
+				if evt.Replace {
+					rendered = ""
+				}
+				rendered += evt.Content
+				if evt.Done {
+					done++
+					require.True(t, evt.IsFallback)
+				}
+			}
+			require.Equal(t, 1, done)
+			require.Equal(t, stalledAnswerFallback, rendered)
+		})
+	}
+}
+
+// Seen with DeepSeek when max_iterations ends on a tool result: the first
+// final-synthesis call still emits a tool call, but appending an explicit user
+// turn breaks tool-calling momentum and recovers the gathered evidence.
+func TestStreamFinalAnswer_ToolCallOnlyRetriesAndRecovers(t *testing.T) {
+	model := &finalSynthesisChat{}
+	engine := newTestEngine(t, model, withMaxIterations(8))
+	var fallback bool
+	engine.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, ev event.Event) error {
+		fallback = fallback || ev.Data.(event.AgentFinalAnswerData).IsFallback
+		return nil
+	})
+	calls := 0
+	model.synthesize = func(_ context.Context, sent []chat.Message, _ *chat.ChatOptions) (<-chan types.StreamResponse, error) {
+		calls++
+		if calls == 1 {
+			return finalSynthesisChunks(types.StreamResponse{
+				ResponseType: types.ResponseTypeToolCall, FinishReason: "tool_calls", Done: true,
+				ToolCalls: []types.LLMToolCall{{ID: "c1", Type: "function",
+					Function: types.FunctionCall{Name: "read_document", Arguments: "{}"}}},
+			}), nil
+		}
+		require.Equal(t, "user", sent[len(sent)-1].Role)
+		require.Contains(t, sent[len(sent)-1].Content, "Do not call any tools")
+		return finalSynthesisChunks(types.StreamResponse{
+			ResponseType: types.ResponseTypeAnswer, Content: "Recovered synthesis from gathered evidence.",
+			FinishReason: "stop", Done: true,
+		}), nil
+	}
+	state := &types.AgentState{CurrentRound: 8}
+	_, err := engine.executeLoop(t.Context(), state, "Summarize", emptyMessages(), nil, "session", "message")
+	require.NoError(t, err)
+	require.Equal(t, "Recovered synthesis from gathered evidence.", state.FinalAnswer)
+	require.False(t, fallback)
+	require.Equal(t, 2, calls)
 }
 
 func finalSynthesisInputTokens(e *AgentEngine, messages []chat.Message, opts *chat.ChatOptions) int {

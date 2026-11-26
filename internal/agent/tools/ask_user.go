@@ -20,6 +20,7 @@ Use it only when you cannot proceed without information or a decision that only 
 Do not ask for information already supplied in the conversation or project context.
 When the relevant branches or required fields must first be discovered in documents, read those documents before asking.
 Ask only what changes the answer or next step; do not guess which branch applies.
+When a setup, integration, or code-calling procedure diverges by platform, channel, or SDK/integration layer and the user did not specify which one applies, call ask_user to clarify instead of expanding multiple branches at once—even if retrieved documents contain all branches.
 Complete any independent parts of the request before calling this tool. Do not place dependent tool calls after it.
 Ask one focused question, grouping necessary materials for the same task.
 
@@ -32,6 +33,9 @@ Shapes of a question:
 Options and field labels are shown to the user as written, and the chosen text comes back as the answer. Write
 them in the user's language as a person would say them ("No authentication", "API key"), never as internal ids
 ("api_key"), and offer only choices the next step accepts. Leave out a field you can fill yourself.
+When choosing an implementation or procedure to perform based on documents, offer only applicable options
+the documents support and exclude those they say are unsupported for that action. If the available evidence
+does not establish a complete set, use free-text input for that choice.
 
 This tool returns the question for publication without waiting, opening an interactive card, or creating a suspended run.
 Do not call another tool or generate a second version of the question after it. Continue when the user sends their next message.`

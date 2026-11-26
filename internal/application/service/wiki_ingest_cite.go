@@ -508,12 +508,14 @@ func mergeCitationsIntoItems(
 	}
 
 	// Append new_slugs discovered by the citation pass, avoiding duplicates.
-	existingSlugs := make(map[string]bool, len(entities)+len(concepts))
-	for _, e := range entities {
-		existingSlugs[e.Slug] = true
+	// If a new_slug repeats an existing Pass-0 candidate slug, union its newly
+	// discovered chunk citations back into that candidate instead of dropping them.
+	existingBySlug := make(map[string]*extractedItem, len(entities)+len(concepts))
+	for i := range entities {
+		existingBySlug[entities[i].Slug] = &entities[i]
 	}
-	for _, c := range concepts {
-		existingSlugs[c.Slug] = true
+	for i := range concepts {
+		existingBySlug[concepts[i].Slug] = &concepts[i]
 	}
 
 	// Aggregate per-slug across batches so the same "newly discovered" slug
@@ -529,8 +531,21 @@ func mergeCitationsIntoItems(
 		if ns.Slug == "" || ns.Name == "" {
 			continue
 		}
-		if existingSlugs[ns.Slug] {
-			// Treat as citation for existing candidate
+		if existing, ok := existingBySlug[ns.Slug]; ok {
+			wasUncited := len(existing.SourceChunks) == 0
+			seen := make(map[string]bool, len(existing.SourceChunks))
+			for _, id := range existing.SourceChunks {
+				seen[id] = true
+			}
+			for _, id := range ns.SourceChunks {
+				if id != "" && !seen[id] {
+					existing.SourceChunks = append(existing.SourceChunks, id)
+					seen[id] = true
+				}
+			}
+			if wasUncited && len(existing.SourceChunks) > 0 && uncited > 0 {
+				uncited--
+			}
 			continue
 		}
 		kind := strings.TrimSpace(strings.ToLower(ns.Type))
@@ -581,4 +596,69 @@ func mergeCitationsIntoItems(
 	}
 
 	return entities, concepts, uncited
+}
+
+// applyMaxPagesPerIngestBudget enforces WikiConfig.MaxPagesPerIngest on
+// brand-new canonical entity/concept pages materialized by a single document.
+// Already-existing KB pages (present in existingSlugs) are always preserved so
+// incremental enrichment is never dropped. Brand-new candidates above the cap
+// are prioritized by supporting chunk count descending, with slug breaking ties.
+func applyMaxPagesPerIngestBudget(
+	entities, concepts []extractedItem,
+	existingSlugs map[string]bool,
+	maxNewPages int,
+) ([]extractedItem, []extractedItem, int) {
+	if maxNewPages <= 0 {
+		return entities, concepts, 0
+	}
+	type newCand struct {
+		isConcept bool
+		idx       int
+		chunks    int
+		slug      string
+	}
+	var cands []newCand
+	for i, item := range entities {
+		if item.Slug == "" || existingSlugs[item.Slug] {
+			continue
+		}
+		cands = append(cands, newCand{isConcept: false, idx: i, chunks: len(item.SourceChunks), slug: item.Slug})
+	}
+	for i, item := range concepts {
+		if item.Slug == "" || existingSlugs[item.Slug] {
+			continue
+		}
+		cands = append(cands, newCand{isConcept: true, idx: i, chunks: len(item.SourceChunks), slug: item.Slug})
+	}
+	if len(cands) <= maxNewPages {
+		return entities, concepts, 0
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].chunks != cands[j].chunks {
+			return cands[i].chunks > cands[j].chunks
+		}
+		return cands[i].slug < cands[j].slug
+	})
+	dropEntity := make(map[int]bool)
+	dropConcept := make(map[int]bool)
+	for _, c := range cands[maxNewPages:] {
+		if c.isConcept {
+			dropConcept[c.idx] = true
+		} else {
+			dropEntity[c.idx] = true
+		}
+	}
+	keptEntities := make([]extractedItem, 0, len(entities)-len(dropEntity))
+	for i, item := range entities {
+		if !dropEntity[i] {
+			keptEntities = append(keptEntities, item)
+		}
+	}
+	keptConcepts := make([]extractedItem, 0, len(concepts)-len(dropConcept))
+	for i, item := range concepts {
+		if !dropConcept[i] {
+			keptConcepts = append(keptConcepts, item)
+		}
+	}
+	return keptEntities, keptConcepts, len(cands) - maxNewPages
 }

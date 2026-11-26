@@ -15,11 +15,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
-// HandleTTL bounds how long a submitted form can still be filled.
 const HandleTTL = 15 * time.Minute
 
-// handleSeqTTL keeps a session's counter long enough that handles in one
-// conversation never repeat while any of them can still be alive.
 const handleSeqTTL = 24 * time.Hour
 
 const (
@@ -27,8 +24,6 @@ const (
 	sourceVault = "vault"
 )
 
-// NewHandle describes the values one handle unlocks. With VaultItemID set the
-// password is read from the vault at fill time and its Value is left empty.
 type NewHandle struct {
 	Owner       Owner
 	SessionID   string
@@ -53,9 +48,6 @@ type handleRecord struct {
 	Fields      []recordField `json:"fields"`
 }
 
-// HandleStore keeps submitted values in Redis, encrypted, under a handle the
-// agent can name but never read. A handle is not a bearer token: it resolves
-// only for the session and user that created it.
 type HandleStore struct {
 	rdb    *redis.Client
 	vault  *Vault
@@ -63,8 +55,6 @@ type HandleStore struct {
 	ttl    time.Duration
 }
 
-// NewHandleStore returns nil without Redis: the feature has no in-process
-// fallback, and the tools are not registered then.
 func NewHandleStore(rdb *redis.Client, vault *Vault) *HandleStore {
 	if rdb == nil || vault == nil {
 		return nil
@@ -80,7 +70,6 @@ func (s *HandleStore) handleKey(sessionID, handle string) string {
 	return s.prefix + "handle:" + sessionID + ":" + handle
 }
 
-// Create stores h and returns its handle.
 func (s *HandleStore) Create(ctx context.Context, h NewHandle) (string, error) {
 	key := utils.GetAESKey()
 	if key == nil {
@@ -152,7 +141,6 @@ func (s *HandleStore) load(
 	return &rec, nil
 }
 
-// Resolve returns the values behind handle for the given caller.
 func (s *HandleStore) Resolve(
 	ctx context.Context, tenantID uint64, userID, sessionID, handle string,
 ) (*types.ResolvedSecret, error) {
@@ -179,8 +167,6 @@ func (s *HandleStore) Resolve(
 	return out, nil
 }
 
-// Complete drops a handle whose every field was filled and marks the saved
-// login as used.
 func (s *HandleStore) Complete(
 	ctx context.Context, tenantID uint64, userID, sessionID, handle, vaultItemID string,
 ) error {
@@ -193,7 +179,6 @@ func (s *HandleStore) Complete(
 	return nil
 }
 
-// Discard drops a handle.
 func (s *HandleStore) Discard(ctx context.Context, sessionID, handle string) error {
 	if !types.ValidSecretHandle(handle) || sessionID == "" {
 		return nil

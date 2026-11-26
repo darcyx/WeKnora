@@ -262,7 +262,7 @@ OCR 的模型调用和输出校验分别记录处理状态。失败、截断或�
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `synthesis_model_id` | - | Wiki 生成 LLM |
-| `max_pages_per_ingest` | 0（不限） | 单次摄入最多创建/更新页面数 |
+| `max_pages_per_ingest` | 0（不限） | 每篇文档最多新建的实体和概念页面数，已有页面的更新和摘要页不计入 |
 | `extraction_granularity` | `standard` | `focused`（仅主要主题）/ `standard` / `exhaustive`（全部实体概念） |
 | `content_instructions` / `extraction_instructions` | - | 生成与提取风格指导 |
 | `ingest_batch_size` / `ingest_map_parallel` / `ingest_reduce_parallel` / `ingest_max_inflight` | 5 / 10 / 10 / 4 | 摄入并发参数 |

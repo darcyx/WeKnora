@@ -79,6 +79,10 @@ type TenantSkillEntity struct {
 	// Builtin marks a row the backend synthesized for this run. It is not a
 	// database column and it has no uploaded bundle.
 	Builtin bool `json:"-" gorm:"-"`
+	// RequiredTools persists optional tool dependencies declared in SKILL.md
+	// frontmatter at install/upgrade time so request-time discovery never downloads
+	// skill archives from object storage.
+	RequiredTools SkillRequiredTools `json:"required_tools,omitempty" gorm:"type:jsonb"`
 
 	// InstalledSnapshotID is the snapshot produced by this skill's install,
 	// kept for audit and chain troubleshooting.
@@ -142,6 +146,7 @@ func (e *TenantSkillEntity) ServedView() *TenantSkillEntity {
 	view.Version = e.Served.Version
 	view.Description = e.Served.Description
 	view.Instructions = e.Served.Instructions
+	view.RequiredTools = append(SkillRequiredTools(nil), e.Served.RequiredTools...)
 	view.BundleSHA256 = e.Served.BundleSHA256
 	view.BundleRef = e.Served.BundleRef
 	view.InstalledSnapshotID = e.Served.SnapshotID
@@ -153,10 +158,11 @@ func (e *TenantSkillEntity) ServedView() *TenantSkillEntity {
 // SkillServedVersion is what a row described when it was last ready, kept
 // while a newer install of the same skill has not replaced it in the image.
 type SkillServedVersion struct {
-	Version      string `json:"version,omitempty"`
-	Description  string `json:"description,omitempty"`
-	Instructions string `json:"instructions,omitempty"`
-	BundleSHA256 string `json:"bundle_sha256,omitempty"`
+	Version       string             `json:"version,omitempty"`
+	Description   string             `json:"description,omitempty"`
+	Instructions  string             `json:"instructions,omitempty"`
+	RequiredTools SkillRequiredTools `json:"required_tools,omitempty"`
+	BundleSHA256  string             `json:"bundle_sha256,omitempty"`
 	// BundleRef names the archive the served files came from. It is resolved
 	// when the version is recorded, including for a row that was following the
 	// catalog, because the catalog may be re-registered while the upgrade
@@ -190,6 +196,43 @@ func (v *SkillServedVersion) Scan(value interface{}) error {
 		return nil
 	}
 	return json.Unmarshal(b, v)
+}
+
+// SkillRequiredTools persists SKILL.md required_tools frontmatter as a JSON
+// array column on Postgres (JSONB) and SQLite (TEXT).
+type SkillRequiredTools []string
+
+func (r SkillRequiredTools) Value() (driver.Value, error) {
+	if len(r) == 0 {
+		return nil, nil
+	}
+	return json.Marshal([]string(r))
+}
+
+func (r *SkillRequiredTools) Scan(value interface{}) error {
+	var b []byte
+	switch raw := value.(type) {
+	case nil:
+		*r = nil
+		return nil
+	case []byte:
+		b = raw
+	case string:
+		b = []byte(raw)
+	default:
+		*r = nil
+		return nil
+	}
+	if len(b) == 0 {
+		*r = nil
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(b, &out); err != nil {
+		return err
+	}
+	*r = SkillRequiredTools(out)
+	return nil
 }
 
 // TenantSkillSnapshotEntity is the image-chain ledger. It exists because
@@ -231,12 +274,13 @@ func (e *TenantSkillSnapshotEntity) TableName() string { return "tenant_skill_sn
 // belong to a sandbox: installations onto a config's image are TenantSkillEntity
 // rows that point back here.
 type TenantSkillCatalogEntity struct {
-	ID           string `gorm:"type:varchar(36);primaryKey"`
-	TenantID     uint64
-	Name         string `gorm:"type:varchar(255);not null"`
-	Version      string `gorm:"type:varchar(64)"`
-	Description  string `gorm:"type:text"`
-	Instructions string `gorm:"type:text"`
+	ID            string `gorm:"type:varchar(36);primaryKey"`
+	TenantID      uint64
+	Name          string             `gorm:"type:varchar(255);not null"`
+	Version       string             `gorm:"type:varchar(64)"`
+	Description   string             `gorm:"type:text"`
+	Instructions  string             `gorm:"type:text"`
+	RequiredTools SkillRequiredTools `json:"required_tools,omitempty" gorm:"type:jsonb"`
 	// BundleRef locates the one stored zip for this definition. Install rows
 	// do not own a copy: sandbox uninstall must not delete this object.
 	BundleRef    string `gorm:"type:varchar(1024)"`

@@ -85,3 +85,20 @@ func TestSubmitMessageFeedbackAlreadySubmittedReturnsError(t *testing.T) {
 		t.Fatal("expected an error for a repeated vote, got nil")
 	}
 }
+
+func TestLoadMessagesIncludesFeedback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"id":"liked","feedback":{"type":"like"}},{"id":"disliked","feedback":{"type":"dislike","reasons":["other"]}},{"id":"unrated"}]}`)
+	}))
+	defer srv.Close()
+
+	messages, err := NewClient(srv.URL, WithAPIKey("sk-test")).LoadMessages(context.Background(), "session", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 3 || messages[0].Feedback == nil || messages[0].Feedback.Type != MessageFeedbackLike ||
+		messages[1].Feedback == nil || messages[1].Feedback.Type != MessageFeedbackDislike || messages[2].Feedback != nil {
+		t.Fatalf("messages = %#v", messages)
+	}
+}

@@ -11,27 +11,20 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// PromptGate is the part of the approval gate a submission needs.
 type PromptGate interface {
 	SecureFormPrompt(ctx context.Context, promptID string) (*types.AgentPrompt, error)
 	ResolveSecureForm(ctx context.Context, req hitl.ResolveRequest) (hitl.Resolution, error)
 }
 
 const (
-	// ActionSubmit records the card's values.
-	ActionSubmit = "submit"
-	// ActionDecline records a refusal.
+	ActionSubmit  = "submit"
 	ActionDecline = "decline"
 
-	// ChoiceUseOnce fills without writing the vault.
 	ChoiceUseOnce = "use_once"
-	// ChoiceSave writes the login then fills.
-	ChoiceSave = "save"
-	// ChoiceSaved fills from a vault row the owner already has.
-	ChoiceSaved = "saved"
+	ChoiceSave    = "save"
+	ChoiceSaved   = "saved"
 )
 
-// SubmitRequest is what the card posts.
 type SubmitRequest struct {
 	PromptID    string
 	Action      string
@@ -40,22 +33,17 @@ type SubmitRequest struct {
 	Values      map[string]string
 }
 
-// SubmitResult reports a recorded submission.
 type SubmitResult struct {
-	Resolution hitl.Resolution
-	// SavedButClosed: the login was saved, but the prompt had already ended,
-	// so no run received it.
+	Resolution     hitl.Resolution
 	SavedButClosed bool
 }
 
-// Submitter turns a card submission into a handle and the prompt's answer.
 type Submitter struct {
 	gate    PromptGate
 	vault   *Vault
 	handles *HandleStore
 }
 
-// NewSubmitter returns nil when any dependency is missing.
 func NewSubmitter(gate PromptGate, vault *Vault, handles *HandleStore) *Submitter {
 	if gate == nil || vault == nil || handles == nil {
 		return nil
@@ -78,7 +66,6 @@ func (d submitDraft) names() []string {
 	return names
 }
 
-// Submit records req for owner. Error messages name fields, never values.
 func (s *Submitter) Submit(ctx context.Context, owner Owner, req SubmitRequest) (SubmitResult, error) {
 	if !Available() {
 		return SubmitResult{}, errUnavailable()

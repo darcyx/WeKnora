@@ -39,7 +39,7 @@
         </div>
         <details><summary>{{ t('feedbackAdmin.advanced') }}</summary><div class="advanced">
           <label>session_id<t-input v-model="filters.session_id" clearable /></label>
-          <label>{{ filters.source === 'faq' || mode === 'summary' ? t('feedbackAdmin.faqID') : t('feedbackAdmin.request') }}<t-input v-model="filters.target_id" clearable /></label>
+          <label>{{ filters.source === 'faq' || mode === 'summary' ? t('feedbackAdmin.faqID') : t('feedbackAdmin.messageID') }}<t-input v-model="filters.target_id" clearable /></label>
           <label>{{ t('feedbackAdmin.user') }}<t-input v-model="filters.user_id" clearable /></label>
           <template v-if="filters.source === 'faq' || mode === 'summary'">
             <label>{{ t('feedbackAdmin.kb') }}<t-input v-model="filters.knowledge_base_id" clearable /></label>
@@ -180,8 +180,8 @@ function closeDetail() { ++detailSequence; drawerVisible.value = false; detail.v
 function stepDetail(delta: number) { const row = records.value[selectedIndex.value + delta]; if (row) void openDetail(row) }
 const identity = computed(() => detail.value ? [
   { label: t('feedbackAdmin.source'), value: sourceLabel(detail.value.source) }, { label: t('feedbackAdmin.user'), value: detail.value.user_id },
-  { label: 'session_id', value: detail.value.session_id }, { label: detail.value.source === 'faq' ? t('feedbackAdmin.faqID') : 'request_id', value: detail.value.target_id },
-  { label: detail.value.source === 'faq' ? t('feedbackAdmin.kb') : t('feedbackAdmin.messageID'), value: detail.value.source === 'faq' ? detail.value.knowledge_base_id : detail.value.message_id },
+  { label: 'session_id', value: detail.value.session_id }, { label: detail.value.source === 'faq' ? t('feedbackAdmin.faqID') : t('feedbackAdmin.messageID'), value: detail.value.target_id },
+  ...(detail.value.source === 'faq' ? [{ label: t('feedbackAdmin.kb'), value: detail.value.knowledge_base_id }] : []),
 ] : [])
 function markdown(text: string) { return sanitizeMarkdownHTML(marked.parse(text || '', { async: false })) }
 async function copy(value: string) { try { if (!await copyToClipboard(value)) throw new Error('copy failed'); MessagePlugin.success(t('feedbackAdmin.copied')) } catch { MessagePlugin.error(t('feedbackAdmin.copyFailed')) } }

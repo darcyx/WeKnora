@@ -366,6 +366,9 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	//   - answerStreamed records that user-facing answer text was sent live to
 	//     the final-answer area, so the natural-stop branch only emits Done.
 	splitter := agenttools.NewThinkStreamSplitter()
+	sentinelGate := newFixedSentinelStreamGate(e.config.FixedResponses)
+	refGate := newReferenceSectionStreamGate()
+	var streamed strings.Builder
 	thinkingOpen := false
 	answerStreamed := false
 	holdAnswer := e.progress.state != nil && e.progress.state.Plan != nil || e.holdRetrievalAnswer()
@@ -414,6 +417,7 @@ func (e *AgentEngine) streamThinkingToEventBus(
 		}
 		closeThinking()
 		answerStreamed = true
+		streamed.WriteString(content)
 		emittedEventTypes["final_answer_chunk"]++
 		e.eventBus.Emit(ctx, event.Event{
 			ID:        answerID,
@@ -513,15 +517,20 @@ func (e *AgentEngine) streamThinkingToEventBus(
 			// to the thought area instead.
 			if chunk.Content != "" {
 				thinkPart, answerPart := splitter.Feed(chunk.Content)
-				if splitter.TakeAnswerReset() && answerStreamed {
-					e.retractAnswer(ctx, sessionID, answerID)
-					answerStreamed = false
+				if splitter.TakeAnswerReset() {
+					sentinelGate.Reset()
+					refGate.Reset()
+					if answerStreamed {
+						e.retractAnswer(ctx, sessionID, answerID)
+						answerStreamed = false
+						streamed.Reset()
+					}
 				}
 				if thinkPart != "" {
 					thinkingOpen = true
 					emitThought(thinkPart, false)
 				}
-				emitAnswer(answerPart)
+				emitAnswer(refGate.Feed(sentinelGate.Feed(answerPart)))
 			}
 			if chunk.Done {
 				thinkPart, answerPart := splitter.Flush()
@@ -529,7 +538,10 @@ func (e *AgentEngine) streamThinkingToEventBus(
 					thinkingOpen = true
 					emitThought(thinkPart, false)
 				}
-				emitAnswer(answerPart)
+				emitAnswer(refGate.Feed(sentinelGate.Feed(answerPart)))
+				if !sentinelGate.Held() {
+					emitAnswer(refGate.Flush())
+				}
 				closeThinking()
 			}
 		},
@@ -605,18 +617,47 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	}
 	if publishAnswer && !e.clarificationLeavesIndependentWork(fullContent) {
 		holdAnswer = activeStep
-		if answerStreamed && fullContent != strings.TrimSpace(cleanContent) {
-			e.eventBus.Emit(ctx, event.Event{
-				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-				Data: event.AgentFinalAnswerData{Content: fullContent, Replace: true, IsFallback: e.isRuntimeFallbackAnswer(fullContent)},
-			})
+		streamedText := streamed.String()
+		if answerStreamed && fullContent != streamedText {
+			if strings.HasPrefix(fullContent, streamedText) && !e.isRuntimeFallbackAnswer(fullContent) {
+				emitAnswer(fullContent[len(streamedText):])
+			} else {
+				e.eventBus.Emit(ctx, event.Event{
+					ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
+					Data: event.AgentFinalAnswerData{Content: fullContent, Replace: true, IsFallback: e.isRuntimeFallbackAnswer(fullContent)},
+				})
+			}
 		} else if !answerStreamed {
 			emitAnswer(fullContent)
 		}
 	}
 
-	if ctx.Err() != nil && pendingWork {
-		answerStreamed = false
+	if !publishAnswer && ctx.Err() == nil && refGate.Held() {
+		if answerStreamed && len(llmResult.ToolCalls) > 0 {
+			// A turn carrying open_page/page-button tool calls may finish in engine.go
+			// without running publishAnswer here; retract the partial streamed body so
+			// engine.go publishes the complete post-processed answer including sources.
+			e.retractAnswer(ctx, sessionID, answerID)
+			answerStreamed = false
+			streamed.Reset()
+		} else if len(llmResult.ToolCalls) == 0 {
+			// Non-standard finish (e.g. content_filter): never save unverified held references.
+			if answerStreamed {
+				fullContent = strings.TrimRight(streamed.String(), " \t\r\n")
+			} else {
+				fullContent = e.sanitizeReferenceSection(fullContent)
+			}
+		}
+	}
+
+	if ctx.Err() != nil {
+		if pendingWork {
+			answerStreamed = false
+		} else if answerStreamed {
+			// Keep the saved partial answer aligned with the verified text
+			// actually streamed; any held unvalidated reference section is excluded.
+			fullContent = strings.TrimRight(streamed.String(), " \t\r\n")
+		}
 	}
 	resp := &types.ChatResponse{
 		Content:            fullContent,

@@ -39,10 +39,11 @@ const (
 
 // SkillBundle is a validated, in-memory skill archive.
 type SkillBundle struct {
-	Name         string
-	Version      string
-	Description  string
-	Instructions string
+	Name          string
+	Version       string
+	Description   string
+	Instructions  string
+	RequiredTools []string
 	// SHA256 is over the uploaded bytes, so re-uploading the same archive is
 	// recognisable in the UI and in the ledger, and a ready skill with this
 	// digest can skip a billed snapshot rebuild.
@@ -320,6 +321,7 @@ func skillBundleFromFiles(archive []byte, files map[string][]byte) (*SkillBundle
 		Version:             version,
 		Description:         skill.Description,
 		Instructions:        skill.Instructions,
+		RequiredTools:       append([]string(nil), skill.RequiredTools...),
 		SHA256:              skillArchiveSHA256(archive),
 		Files:               files,
 		FrontmatterRepaired: skill.FrontmatterRepaired,

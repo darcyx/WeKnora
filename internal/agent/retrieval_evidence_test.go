@@ -107,9 +107,10 @@ func TestRetrievalEvidenceMultipleSourcesKeepProvenance(t *testing.T) {
 }
 
 func TestCandidateOnlyDocumentIsReadLeadNotEvidence(t *testing.T) {
-	const content = "<retrieval>\n  <document id=\"doc\" kb=\"kb\" title=\"secret title\" view=\"candidate_only\" />\n  <document id=\"known\"><chunk><content>verified facts</content></chunk></document>\n</retrieval>"
+	const content = "<retrieval>\n  <document id=\"doc\" kb=\"kb\" title=\"secret title\" view=\"candidate_only\" />\n  <chunk id=\"faq\" kb=\"kb\" title=\"candidate FAQ question\" type=\"faq\" view=\"candidate_only\" />\n  <document id=\"known\"><chunk><content>verified facts</content></chunk></document>\n</retrieval>"
 	attempt := &retrievalAttempt{Completed: true, Outcome: retrievalSuccess, Content: content}
 	require.Error(t, validateEvidenceQuotes(attempt, []string{"secret title"}, true))
+	require.Error(t, validateEvidenceQuotes(attempt, []string{"candidate FAQ question"}, true))
 	require.NoError(t, validateEvidenceQuotes(attempt, []string{"verified facts"}, true))
-	require.True(t, observedDocumentReference(content, "doc"))
+	require.True(t, attemptObservedDocument(retrievalAttempt{ObservedIDs: []string{"doc"}}, "doc"))
 }

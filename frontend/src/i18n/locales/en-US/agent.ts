@@ -1977,6 +1977,14 @@ export default {
       hint: 'Leave empty or 0 to use the default (120 seconds)',
       placeholder: 'Enter seconds, recommended range 60-1800'
     },
+    faqPreflight: {
+      modelLabel: 'FAQ Preflight Fast Model',
+      modelDesc: 'Chat model used for FAQ preflight evaluation. Leave empty to use the system default',
+      modelPlaceholder: 'Select model (leave empty for system default)',
+      policyLabel: 'FAQ Preflight Direct-Output Policy',
+      policyDesc: 'Optional rules governing direct FAQ preflight answers. Leave empty to fall back to the system prompt',
+      policyPlaceholder: 'Leave empty to fall back to the system prompt, e.g. Answer directly only when the question matches the FAQ exactly'
+    },
     imageUpload: {
       navLabel: 'Attachment Upload',
       sectionTitle: 'Attachment Upload',

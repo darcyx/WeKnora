@@ -128,7 +128,7 @@ func TestMaybePlanUsesInstructionsAndRecentHistoryAndCountsUsage(t *testing.T) {
 func TestMaybePlanRoutesFAQFallbackWithoutCatalog(t *testing.T) {
 	model := &mockChat{responses: []mockResponse{plannerResponse(`{"kind":"explain","steps":[]}`)}}
 	engine := newTestEngine(t, model, withPlanningEnabled(true))
-	engine.config.FAQPreflightQuestions = []string{"支付地址可以用内网吗？"}
+	engine.config.FAQPreflightChecked = true
 	messages := []chat.Message{{Role: "system", Content: "Full agent instructions."},
 		{Role: "user", Content: "Previous question."}, {Role: "user", Content: "Full catalog and current question."}}
 	engine.maybePlan(t.Context(), "当前问题", messages, nil)

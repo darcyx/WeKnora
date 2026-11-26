@@ -342,6 +342,7 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 		existing.Version = bundle.Version
 		existing.Description = bundle.Description
 		existing.Instructions = bundle.Instructions
+		existing.RequiredTools = types.SkillRequiredTools(append([]string(nil), bundle.RequiredTools...))
 		existing.BundleSHA256 = bundle.SHA256
 		existing.UpdatedAt = now
 		if err := s.skills.UpdateCatalog(ctx, existing); err != nil {
@@ -361,8 +362,9 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 	row := &types.TenantSkillCatalogEntity{
 		ID: uuid.NewString(), TenantID: tenantID, Name: bundle.Name,
 		Version: bundle.Version, Description: bundle.Description,
-		Instructions: bundle.Instructions,
-		CreatedAt:    now, UpdatedAt: now,
+		Instructions:  bundle.Instructions,
+		RequiredTools: types.SkillRequiredTools(append([]string(nil), bundle.RequiredTools...)),
+		CreatedAt:     now, UpdatedAt: now,
 	}
 	stored, _, err := s.storeCatalogBundle(ctx, tenantID, row, archive, requireStore)
 	if err != nil {

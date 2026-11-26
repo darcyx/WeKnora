@@ -16,40 +16,31 @@ import (
 )
 
 const (
-	// UserMachineGCLockKey makes one replica scan at a time.
-	UserMachineGCLockKey = "weknora:sandbox:user-gc:lock"
-	// UserMachineGCInterval is how often the container runs the scan.
-	UserMachineGCInterval = time.Hour
-	// UserMachineGCCursorKey remembers where a scan stopped, so the next one
-	// continues instead of rereading the same oldest candidates.
+	UserMachineGCLockKey   = "weknora:sandbox:user-gc:lock"
+	UserMachineGCInterval  = time.Hour
 	UserMachineGCCursorKey = "weknora:sandbox:user-gc:cursor"
 	gcLockLease            = 5 * time.Minute
 	gcBatch                = 200
 	gcMaxPerRun            = 2000
 )
 
-// GCReport is one scan's outcome, logged as metrics.
 type GCReport struct {
 	Scanned, Reclaimed, Busy, Failed int
 	CleanupsDone, CleanupsFailed     int
 	Skipped                          bool
 }
 
-// UserMachineGC reclaims user machines that have had no live session for
-// their config's retention window, and retries queued directory deletes.
 type UserMachineGC struct {
 	svc     *Service
 	cleaner *WorkspaceCleaner
 	configs ConfigReader
 	redis   redis.UniversalClient
 	now     func() time.Time
-	batch   int // page size; tests shrink it
+	batch   int
 	maxRun  int
-	cursor  interfaces.EmptyMachineCursor // used when there is no Redis
+	cursor  interfaces.EmptyMachineCursor
 }
 
-// NewUserMachineGC wires the GC. A nil redis client runs unlocked, which is
-// only correct for a single process (user mode is never enabled without Redis).
 func NewUserMachineGC(
 	svc *Service, cleaner *WorkspaceCleaner, configs ConfigReader, client redis.UniversalClient,
 ) *UserMachineGC {
@@ -59,8 +50,6 @@ func NewUserMachineGC(
 	}
 }
 
-// RunOnce performs one scan unless another replica holds the lock. The lock
-// is renewed for the scan's duration; a lost lock ends the scan.
 func (g *UserMachineGC) RunOnce(ctx context.Context) (GCReport, error) {
 	if g.redis == nil {
 		return g.scan(ctx)
@@ -106,9 +95,6 @@ func (g *UserMachineGC) scan(ctx context.Context) (GCReport, error) {
 	var report GCReport
 	report.CleanupsDone, report.CleanupsFailed, _ = g.cleaner.RetryDue(ctx, gcBatch)
 
-	// Candidates only: the shortest window is one day, and every row is
-	// re-evaluated inside its machine's lock. Pages advance past every
-	// candidate, due or not, so none can hide the ones behind it.
 	cursor := g.loadCursor(ctx)
 	emptyBefore := g.now().Add(-24 * time.Hour)
 	for report.Scanned < g.maxRun {
@@ -117,7 +103,7 @@ func (g *UserMachineGC) scan(ctx context.Context) (GCReport, error) {
 			return report, err
 		}
 		if len(rows) == 0 {
-			cursor = interfaces.EmptyMachineCursor{} // reached the end: next run starts over
+			cursor = interfaces.EmptyMachineCursor{}
 			break
 		}
 		for _, row := range rows {
@@ -149,10 +135,6 @@ func (g *UserMachineGC) reclaimCandidate(ctx context.Context, row *types.Sandbox
 			row.ConfigTenantID, row.ConfigID, digestPrefix(digest), err)
 		return
 	}
-	// Retention comes from the config table. Read it before the machine row
-	// lock: SQLite serves the whole process on one connection, so a config
-	// query while that transaction is open never returns. empty_since is
-	// still the value read under the lock, below.
 	days, err := g.retentionDays(ctx, row.ConfigTenantID, row.ConfigID)
 	if err != nil {
 		report.Failed++
@@ -162,8 +144,6 @@ func (g *UserMachineGC) reclaimCandidate(ctx context.Context, row *types.Sandbox
 	var lock interfaces.MachineReclaimLock
 	ok, err := ops.ReclaimUserMachine(ctx, m, func(_ context.Context) (bool, error) {
 		var lockErr error
-		// The manager cancels its provider context before returning. The row
-		// lock must instead live until this scan commits or aborts the delete.
 		lock, lockErr = g.svc.repo.LockEmptyMachine(ctx, digest)
 		if lockErr != nil || lock == nil {
 			return false, lockErr
@@ -186,9 +166,6 @@ func (g *UserMachineGC) reclaimCandidate(ctx context.Context, row *types.Sandbox
 	case !ok:
 		report.Busy++
 	case lock == nil:
-		// The manager reported the machine reclaimable without ever running
-		// the check that takes its row lock; nothing was provably deleted,
-		// so the registry row stays for the next scan.
 		report.Failed++
 		logger.Warnf(ctx, "[sandbox-gc] reclaim machine %s: manager skipped the reclaim check",
 			digestPrefix(digest))
@@ -227,8 +204,6 @@ func (g *UserMachineGC) loadCursor(ctx context.Context) interfaces.EmptyMachineC
 	return interfaces.EmptyMachineCursor{EmptySince: c.EmptySince, Digest: c.Digest}
 }
 
-// saveCursor stores where this run stopped. A lost write only means the
-// next run starts over; the scan stays correct, just slower.
 func (g *UserMachineGC) saveCursor(ctx context.Context, c interfaces.EmptyMachineCursor) {
 	if g.redis == nil {
 		g.cursor = c
@@ -242,8 +217,6 @@ func (g *UserMachineGC) saveCursor(ctx context.Context, c interfaces.EmptyMachin
 	_ = g.redis.Set(context.WithoutCancel(ctx), UserMachineGCCursorKey, raw, 2*UserMachineGCInterval).Err()
 }
 
-// retentionDays is the config's current empty-machine window, read before
-// the row lock is taken.
 func (g *UserMachineGC) retentionDays(ctx context.Context, tenantID uint64, configID string) (int, error) {
 	days := allocation.DefaultEmptyRetentionDays
 	if g.configs == nil {
@@ -253,8 +226,6 @@ func (g *UserMachineGC) retentionDays(ctx context.Context, tenantID uint64, conf
 	if err != nil {
 		return 0, err
 	}
-	// GetByID returns (nil, nil) for a soft-deleted config. That is not
-	// the default window: config deletion reclaims the machine itself.
 	if entity == nil || entity.Config == nil {
 		return 0, fmt.Errorf("sandboxalloc: sandbox config %d/%s not found", tenantID, configID)
 	}

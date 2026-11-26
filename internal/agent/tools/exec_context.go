@@ -42,6 +42,7 @@ type ToolExecContext struct {
 	// never a model argument or a replacement authorization grant.
 	RetrievalTargets  types.SearchTargets
 	RetrievalRecovery func(context.Context) (*types.ToolResult, error)
+	SeenChunkIDs      map[string]bool
 }
 
 // Attended reports whether a client can answer prompts now.

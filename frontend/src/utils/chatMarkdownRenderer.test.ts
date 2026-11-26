@@ -915,3 +915,15 @@ test('caller-provided code renderer receives the exact code and language', () =>
     assert.equal(stripFadeTail(html), '<pre>diagram</pre>')
   }
 })
+
+test('markdown code fences remain literal in complete and streaming output', () => {
+  for (const streaming of [false, true]) {
+    for (const input of ['```markdown\n# 标题\n**加粗**\n```', '```markdown\n# 标题\n**加粗**']) {
+      const html = renderEmphasisSample(input, streaming)
+      assert.match(html, /<pre><code/)
+      assert.match(html, /# 标题/)
+      assert.match(html, /\*\*加粗\*\*/)
+      assert.doesNotMatch(html, /<h1|<strong/)
+    }
+  }
+})

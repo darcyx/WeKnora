@@ -271,6 +271,24 @@ func (r *Registry) RegisterWeb(rawURL, title string) string {
 	return r.sources.RegisterWeb(rawURL, title)
 }
 
+// RegisterReferenceURL records a structured HTTP(S) reference URL surfaced by
+// an in-scope tool result so answer publication can verify ## 参考来源 links.
+func (r *Registry) RegisterReferenceURL(rawURL string) {
+	if r == nil || r.sources == nil {
+		return
+	}
+	r.sources.RegisterReferenceURL(rawURL)
+}
+
+// AllowedReferenceURLs returns a snapshot of normalized HTTP(S) URLs admitted
+// from structured tool results in this request (and surviving in-scope history).
+func (r *Registry) AllowedReferenceURLs() map[string]struct{} {
+	if r == nil || r.sources == nil {
+		return map[string]struct{}{}
+	}
+	return r.sources.AllowedReferenceURLs()
+}
+
 func (r *Registry) RegisterSearchResults(results []*types.SearchResult) {
 	if r == nil || r.sources == nil {
 		return
@@ -335,7 +353,7 @@ func (r *Registry) ModelToolResultForTool(toolName string, result *types.ToolRes
 		modelOutput = r.sources.CompactKnownText(modelOutput)
 	}
 	if result.Success && (toolName == "call_mcp_tool" || strings.HasPrefix(toolName, "mcp_")) {
-		modelOutput += r.mcpSourceCandidates(result.Output)
+		modelOutput += r.mcpSourceCandidates(result)
 	}
 	return r.resources.EncodeText(modelOutput) + outputFilesPrompt(result)
 }

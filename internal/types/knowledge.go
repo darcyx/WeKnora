@@ -269,8 +269,10 @@ func (k *Knowledge) CustomMetadataText() string {
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
-		// Older imports may have copied ingestion settings into custom metadata.
-		if key != metadataKeyProcessOverrides {
+		// Older imports may have copied ingestion settings or raw document body
+		// ("content") into custom metadata; exclude them from document-scoped
+		// model metadata projections so they don't crowd out search budgets.
+		if key != metadataKeyProcessOverrides && key != "content" {
 			keys = append(keys, key)
 		}
 	}

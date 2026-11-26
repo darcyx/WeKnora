@@ -770,3 +770,58 @@ func TestRetrievalReviewQuotesKeepObservationIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestModelOutputAnnotatesImageOCRChunksConditionally(t *testing.T) {
+	t.Run("adds lightweight note when batch contains image_ocr", func(t *testing.T) {
+		registry := newSourceRegistry()
+		output := registry.ModelOutput(&types.ToolResult{
+			Success: true,
+			Data: map[string]interface{}{
+				"display_type": "search_results",
+				"mode":         "hybrid",
+				"results": []map[string]interface{}{
+					{
+						"chunk_id":          "ocr-chunk-1",
+						"chunk_index":       0,
+						"chunk_type":        "image_ocr",
+						"knowledge_id":      "doc-1",
+						"knowledge_base_id": "kb-1",
+						"knowledge_title":   "Push Console Guide",
+						"content":           "Overview Delivery Rate 95.35%",
+					},
+				},
+			},
+		})
+		require.Contains(t, output, `<chunk id="chunk://1" index="0" view="full" type="image_ocr">`)
+		require.Contains(t, output, `<note>Chunks with type="image_ocr" are OCR text extracted from embedded images or screenshots`)
+		require.True(t, strings.HasSuffix(output, "</retrieval>"))
+		require.Equal(t,
+			`<kb doc="Push Console Guide" chunk_id="ocr-chunk-1" kb_id="kb-1" />`,
+			registry.ExpandText(`<ref id="chunk://1"/>`),
+		)
+	})
+
+	t.Run("omits note when batch has only text chunks", func(t *testing.T) {
+		registry := newSourceRegistry()
+		output := registry.ModelOutput(&types.ToolResult{
+			Success: true,
+			Data: map[string]interface{}{
+				"display_type": "search_results",
+				"mode":         "hybrid",
+				"results": []map[string]interface{}{
+					{
+						"chunk_id":          "text-chunk-1",
+						"chunk_index":       1,
+						"chunk_type":        "text",
+						"knowledge_id":      "doc-1",
+						"knowledge_base_id": "kb-1",
+						"knowledge_title":   "Push Console Guide",
+						"content":           "Official configuration instructions.",
+					},
+				},
+			},
+		})
+		require.NotContains(t, output, "<note>")
+		require.True(t, strings.HasSuffix(output, "</retrieval>"))
+	})
+}

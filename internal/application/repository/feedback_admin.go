@@ -58,7 +58,7 @@ func (r *FeedbackRepository) base(full bool) string {
  LEFT JOIN knowledge_bases k ON k.id=f.knowledge_base_id AND k.tenant_id=f.tenant_id AND k.deleted_at IS NULL
  WHERE f.tenant_id=? AND f.feedback IS NOT NULL
  UNION ALL
- SELECT 'message', m.session_id, COALESCE(m.request_id,''), m.id,
+ SELECT 'message', m.session_id, m.id, m.id,
  s.user_id, COALESCE(NULLIF(u.username,''),s.user_id), s.title,
  %s, %s, '', '', '', '[]', '[]', '', %s, CAST(m.feedback AS TEXT), %s
  FROM messages m JOIN sessions s ON s.id=m.session_id

@@ -33,15 +33,9 @@ func TruncateToolOutput(output string, maxChars int) string {
 		return output
 	}
 
-	usable := maxChars - truncationMarkerReserve
-	if usable <= 0 {
-		return string([]rune(output)[:maxChars])
-	}
-
-	headSize := int(float64(usable) * headRatio)
-	tailSize := usable - headSize
-	if tailSize <= 0 {
-		tailSize = 0
+	headSize, tailSize := toolOutputWindows(runeCount, maxChars)
+	if maxChars <= truncationMarkerReserve {
+		return string([]rune(output)[:headSize])
 	}
 
 	runes := []rune(output)
@@ -54,4 +48,16 @@ func TruncateToolOutput(output string, maxChars int) string {
 		return string(runes[:headSize]) + marker
 	}
 	return string(runes[:headSize]) + marker + string(runes[len(runes)-tailSize:])
+}
+
+func toolOutputWindows(runeCount, maxChars int) (int, int) {
+	if maxChars <= 0 || runeCount <= maxChars {
+		return runeCount, 0
+	}
+	usable := maxChars - truncationMarkerReserve
+	if usable <= 0 {
+		return maxChars, 0
+	}
+	head := int(float64(usable) * headRatio)
+	return head, usable - head
 }

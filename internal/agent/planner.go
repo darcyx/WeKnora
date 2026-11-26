@@ -37,7 +37,7 @@ func (e *AgentEngine) maybePlan(ctx context.Context, query string, messages []ch
 		return nil, false
 	}
 	// FAQ preflight already assessed this unpinned request with the business context.
-	compact := len(e.config.FAQPreflightQuestions) > 0 && len(e.selectedDocs) == 0 &&
+	compact := e.config.FAQPreflightChecked && len(e.selectedDocs) == 0 &&
 		e.questionOrigin == nil && e.pageContext.Empty() && len(e.pinnedSkills) == 0 && len(e.pinnedMCPServices) == 0
 	var contextMessages []chat.Message
 	if compact {
@@ -306,7 +306,7 @@ func (e *AgentEngine) waitPlanCollaboration(ctx context.Context, state *types.Ag
 			Query: e.progress.query, ImageURLs: e.progress.imageURLs, UserMessages: e.progress.userMessages,
 			CompletedSteps: append([]types.AgentStep(nil), state.RoundSteps...), KnowledgeRefs: state.KnowledgeRefs,
 			CurrentRound: state.CurrentRound + 1, TurnUsage: state.TurnUsage, Plan: state.Plan,
-			Retrieval: e.retrievalSnapshot(),
+			Retrieval: e.retrievalSnapshot(), FAQPreflight: e.faqPreflightSnapshot(),
 		}
 		data, err := json.Marshal(snap)
 		if err != nil {

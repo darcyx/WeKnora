@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -20,6 +22,15 @@ const (
 	LintIssueMissingCrossRef WikiLintIssueType = "missing_cross_ref"
 	LintIssueEmptyContent    WikiLintIssueType = "empty_content"
 	LintIssueDuplicateSlug   WikiLintIssueType = "duplicate_slug"
+	// Read-only governance signals (never wired into AutoFix):
+	LintIssueThinStub      WikiLintIssueType = "thin_stub"
+	LintIssueOversizedPage WikiLintIssueType = "oversized_page"
+	LintIssueNearDuplicate WikiLintIssueType = "near_duplicate"
+)
+
+const (
+	wikiLintThinStubMaxRunes  = 400
+	wikiLintOversizedMinRunes = 8000
 )
 
 // WikiLintIssueSeverity defines the severity of a lint issue
@@ -133,6 +144,12 @@ func (s *WikiLintService) RunLint(ctx context.Context, kbID string) (*WikiLintRe
 	// candidates. The check itself runs in a second walk because it
 	// needs the full entity-title set to compare against any page.
 	entitySlugs := make(map[string]string) // slug -> title
+	// normalizedTitle -> list of (slug, title) for read-only near-duplicate reporting.
+	type titleEntry struct {
+		slug  string
+		title string
+	}
+	byNormalizedTitle := make(map[string][]titleEntry)
 
 	cursor := ""
 	for {
@@ -144,9 +161,12 @@ func (s *WikiLintService) RunLint(ctx context.Context, kbID string) (*WikiLintRe
 			break
 		}
 		for _, page := range pages {
-			// Track entity/concept titles for the second pass.
+			// Track entity/concept titles for the second pass and near-duplicate check.
 			if page.PageType == types.WikiPageTypeEntity || page.PageType == types.WikiPageTypeConcept {
 				entitySlugs[page.Slug] = page.Title
+				if norm := normalizeWikiIdentityTitle(page.Title); norm != "" {
+					byNormalizedTitle[norm] = append(byNormalizedTitle[norm], titleEntry{slug: page.Slug, title: page.Title})
+				}
 			}
 
 			// Check 1: Orphan pages (no inbound links, excluding system pages).
@@ -179,8 +199,9 @@ func (s *WikiLintService) RunLint(ctx context.Context, kbID string) (*WikiLintRe
 				}
 			}
 
-			// Check 3: Empty content.
+			// Check 3: Empty content & read-only size governance alerts.
 			content := strings.TrimSpace(page.Content)
+			contentRunes := utf8.RuneCountInString(content)
 			if len(content) < 50 {
 				issues = append(issues, WikiLintIssue{
 					Type:        LintIssueEmptyContent,
@@ -188,6 +209,22 @@ func (s *WikiLintService) RunLint(ctx context.Context, kbID string) (*WikiLintRe
 					PageSlug:    page.Slug,
 					Description: fmt.Sprintf("Page '%s' has very little content (%d chars)", page.Title, len(content)),
 					AutoFixable: true,
+				})
+			} else if (page.PageType == types.WikiPageTypeEntity || page.PageType == types.WikiPageTypeConcept) && contentRunes < wikiLintThinStubMaxRunes {
+				issues = append(issues, WikiLintIssue{
+					Type:        LintIssueThinStub,
+					Severity:    SeverityInfo,
+					PageSlug:    page.Slug,
+					Description: fmt.Sprintf("Page '%s' (%s) is a thin stub (%d runes, %d inbound links)", page.Title, page.PageType, contentRunes, len(page.InLinks)),
+					AutoFixable: false,
+				})
+			} else if page.PageType != types.WikiPageTypeIndex && contentRunes > wikiLintOversizedMinRunes {
+				issues = append(issues, WikiLintIssue{
+					Type:        LintIssueOversizedPage,
+					Severity:    SeverityWarning,
+					PageSlug:    page.Slug,
+					Description: fmt.Sprintf("Page '%s' (%s) is oversized (%d runes, %d sources); review for hub/split", page.Title, page.PageType, contentRunes, len(page.SourceRefs)),
+					AutoFixable: false,
 				})
 			}
 
@@ -224,6 +261,30 @@ func (s *WikiLintService) RunLint(ctx context.Context, kbID string) (*WikiLintRe
 			break
 		}
 		cursor = next
+	}
+
+	// Read-only near-duplicate reporting for entity/concept pages sharing the same normalized title.
+	dupKeys := make([]string, 0)
+	for norm, entries := range byNormalizedTitle {
+		if len(entries) > 1 {
+			dupKeys = append(dupKeys, norm)
+		}
+	}
+	sort.Strings(dupKeys)
+	for _, norm := range dupKeys {
+		entries := byNormalizedTitle[norm]
+		sort.Slice(entries, func(i, j int) bool { return entries[i].slug < entries[j].slug })
+		canonical := entries[0]
+		for _, dup := range entries[1:] {
+			issues = append(issues, WikiLintIssue{
+				Type:        LintIssueNearDuplicate,
+				Severity:    SeverityWarning,
+				PageSlug:    dup.slug,
+				TargetSlug:  canonical.slug,
+				Description: fmt.Sprintf("Page '%s' (%s) shares normalized title with '%s' (%s)", dup.title, dup.slug, canonical.title, canonical.slug),
+				AutoFixable: false,
+			})
+		}
 	}
 
 	// Second-pass walk: missing-cross-ref check. This needs the full

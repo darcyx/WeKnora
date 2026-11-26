@@ -14,12 +14,13 @@ import (
 
 type retrievalProbe struct {
 	agenttools.BaseTool
-	mu      sync.Mutex
-	calls   []json.RawMessage
-	err     error
-	output  string
-	result  *types.ToolResult
-	execute func(context.Context, json.RawMessage) (*types.ToolResult, error)
+	mu        sync.Mutex
+	calls     []json.RawMessage
+	err       error
+	output    string
+	published []types.PublishedSourceRef
+	result    *types.ToolResult
+	execute   func(context.Context, json.RawMessage) (*types.ToolResult, error)
 }
 
 func (p *retrievalProbe) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
@@ -36,7 +37,7 @@ func (p *retrievalProbe) Execute(ctx context.Context, args json.RawMessage) (*ty
 		return p.result, nil
 	}
 	if p.output != "" {
-		return &types.ToolResult{Success: true, Output: p.output}, nil
+		return &types.ToolResult{Success: true, Output: p.output, PublishedSources: p.published}, nil
 	}
 	return &types.ToolResult{Success: true, Output: "Only general information; no sandbox configuration."}, nil
 }

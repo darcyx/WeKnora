@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
@@ -20,6 +21,61 @@ func suspendedSnapshot(t *testing.T) []byte {
 	require.NotNil(t, state.Suspended)
 	require.NoError(t, f.blocked.err)
 	return f.blocked.snapshot
+}
+
+func TestResumeRestoresShownSearchChunks(t *testing.T) {
+	snapshot := suspendedSnapshot(t)
+	snap, err := DecodeRunSnapshot(snapshot)
+	require.NoError(t, err)
+	snap.CompletedSteps = append(snap.CompletedSteps, types.AgentStep{ToolCalls: []types.ToolCall{{
+		Name:   agenttools.ToolSearchKnowledge,
+		Result: &types.ToolResult{Success: true, Data: map[string]interface{}{"results": []map[string]interface{}{{"chunk_id": "completed"}}}},
+	}}})
+	snap.PendingRound.Step.ToolCalls[0].Name = agenttools.ToolSearchKnowledge
+	snap.PendingRound.Step.ToolCalls[0].Result = &types.ToolResult{Success: true, Data: map[string]interface{}{"results": []map[string]interface{}{{"faq_id": "pending"}}}}
+	snapshot, err = json.Marshal(snap)
+	require.NoError(t, err)
+	f := newSuspendFixture(t, "first_tool", false)
+	f.engine.chatModel.(*mockChat).responses = []mockResponse{{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "done", Done: true, FinishReason: "stop"}}}}
+	_, err = f.engine.Resume(t.Context(), "sess-1", "msg-1", nil, snapshot, answeredPrompt("call-b"))
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"completed": true, "pending": true}, f.engine.snapshotTurnShownChunks())
+}
+
+// An old snapshot without structured sources loses its ledger, so the model sees
+// the earlier search as omitted. Its chunks must not count as shown either, or a
+// limit=1 re-search would skip the best result the model never saw.
+func TestResumeWithDiscardedLedgerDoesNotMarkOmittedChunksShown(t *testing.T) {
+	snapshot := suspendedSnapshot(t)
+	snap, err := DecodeRunSnapshot(snapshot)
+	require.NoError(t, err)
+	snap.CompletedSteps = append(snap.CompletedSteps, types.AgentStep{ToolCalls: []types.ToolCall{{
+		ID: "search-old", Name: agenttools.ToolSearchKnowledge,
+		Result: &types.ToolResult{Success: true, Data: map[string]interface{}{"results": []map[string]interface{}{{"chunk_id": "best"}}}},
+	}}})
+	snap.Retrieval = &retrievalState{Version: 3, Goal: "test query", Scope: "scope", Scopes: []string{"scope"}, Attempts: []retrievalAttempt{{
+		ID: "search-old", Scope: "scope", Tool: agenttools.ToolSearchKnowledge, Completed: true, Outcome: retrievalSuccess,
+	}}}
+	snapshot, err = json.Marshal(snap)
+	require.NoError(t, err)
+
+	f := newSuspendFixture(t, "first_tool", false)
+	f.engine.config.SearchTargets = types.SearchTargets{{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb", TenantID: 1}}
+	f.engine.toolRegistry.RegisterTool(newCountingTool(agenttools.ToolSearchKnowledge))
+	model := f.engine.chatModel.(*mockChat)
+	model.responses = []mockResponse{{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "done", Done: true, FinishReason: "stop"}}}}
+	_, err = f.engine.Resume(t.Context(), "sess-1", "msg-1", nil, snapshot, answeredPrompt("call-b"))
+	require.NoError(t, err)
+
+	require.Len(t, model.calls, 1)
+	var seen string
+	for _, m := range model.calls[0] {
+		if m.ToolCallID == "search-old" {
+			seen = m.Content
+		}
+	}
+	require.Equal(t, previousRetrievalOmitted, seen)
+	require.NotContains(t, f.engine.snapshotTurnShownChunks(), "best")
 }
 
 func answeredPrompt(callID string) *types.AgentPrompt {

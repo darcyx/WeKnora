@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -265,6 +266,8 @@ func (e *AgentEngine) executeToolCalls(
 		return nil
 	}
 
+	e.useFAQBroadDocumentSearch(response)
+
 	logger.Infof(ctx, "[Agent][Round-%d] Executing %d tool call(s)", round, n)
 	e.turnHasWikiSearch = slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool { return call.Function.Name == agenttools.ToolWikiSearch })
 	defer func() { e.turnHasWikiSearch = false }()
@@ -316,6 +319,71 @@ func (e *AgentEngine) executeToolCalls(
 		}
 	}
 	return nil
+}
+
+// useFAQBroadDocumentSearch replaces one model-selected document search while
+// preserving the caller's resolved retrieval targets and the other tool calls.
+func (e *AgentEngine) useFAQBroadDocumentSearch(response *types.ChatResponse) {
+	if e.faqBroadDocumentQuery == "" || response == nil || isLengthFinishReason(response.FinishReason) {
+		return
+	}
+	if slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool {
+		return call.Function.Name == agenttools.ToolAskUser || call.Function.Name == agenttools.ToolWikiSearch
+	}) {
+		return
+	}
+	for i := range response.ToolCalls {
+		call := &response.ToolCalls[i]
+		if call.Function.Name != agenttools.ToolSearchKnowledge || len(call.UnresolvedHandles) != 0 {
+			continue
+		}
+		var args map[string]any
+		if json.Unmarshal([]byte(call.Function.Arguments), &args) != nil || args == nil || args["retrieval"] != nil {
+			continue
+		}
+		ids, idsOK := args["knowledge_base_ids"].([]any)
+		if args["knowledge_base_ids"] != nil && !idsOK {
+			continue
+		}
+		validIDs := true
+		for _, id := range ids {
+			name, ok := id.(string)
+			if !ok || e.config == nil || !slices.Contains(e.config.SearchTargets.GetAllKnowledgeBaseIDs(), name) {
+				validIDs = false
+				break
+			}
+		}
+		if !validIDs {
+			continue
+		}
+		document := false
+		for _, kb := range e.knowledgeBasesInfo {
+			if kb == nil || kb.Type != "document" || !slices.Contains(kb.Capabilities, "chunks") {
+				continue
+			}
+			if len(ids) == 0 || slices.Contains(ids, any(kb.ID)) {
+				document = true
+				break
+			}
+		}
+		if !document {
+			continue
+		}
+		args["query"] = e.faqBroadDocumentQuery
+		delete(args, "knowledge_base_ids")
+		delete(args, "metadata")
+		delete(args, "mode")
+		encoded, err := json.Marshal(args)
+		if err != nil {
+			return
+		}
+		if call.ModelArguments == "" {
+			call.ModelArguments = call.Function.Arguments
+		}
+		call.Function.Arguments = string(encoded)
+		e.faqBroadDocumentQuery = ""
+		return
+	}
 }
 
 // truncatedArgumentsError is handed to the model instead of a tool result when
@@ -738,6 +806,7 @@ func (e *AgentEngine) runToolCallAnswered(
 		Mode:              e.mode,
 		RetrievalTargets:  e.retrieval.dispatchTargets(e.retrievalCallReference(tc.ID)),
 		RetrievalRecovery: e.retrieval.dispatchRecovery(e.retrievalCallReference(tc.ID)),
+		SeenChunkIDs:      e.snapshotTurnShownChunks(),
 	})
 
 	var result *types.ToolResult
@@ -752,6 +821,27 @@ func (e *AgentEngine) runToolCallAnswered(
 		result, err = e.toolRegistry.ExecuteTool(execCtx, tc.Function.Name, json.RawMessage(executionArguments))
 		toolCancel()
 		if err == nil {
+			if executionName == agenttools.ToolSearchKnowledge {
+				e.recordTurnShownChunks(result)
+			}
+			if executionName == agenttools.ToolReadDocument && result != nil && result.Data != nil && e.config != nil {
+				var notes []string
+				if rows, ok := result.Data["chunks"].([]map[string]interface{}); ok {
+					for _, row := range rows {
+						id, _ := row["faq_id"].(string)
+						if id == "" {
+							id, _ = row["chunk_id"].(string)
+						}
+						question, _ := row["faq_question"].(string)
+						if reason := e.config.FAQPreflightRejections[id].Reason; id != "" && question != "" && reason != "" {
+							notes = append(notes, question+": "+reason)
+						}
+					}
+				}
+				if len(notes) > 0 {
+					result.Data["preflight_rejection_reason"] = strings.Join(notes, "; ")
+				}
+			}
 			e.describeToolImages(toolCtx, result)
 		}
 	}
@@ -785,8 +875,14 @@ func (e *AgentEngine) runToolCallAnswered(
 	}
 
 	if controlledRetrieval {
-		content := e.modelContext.DecodeObservationText(e.modelContext.ModelToolResultForTool(tc.Function.Name, toolCall.Result))
-		if observeErr := e.retrieval.observe(e.retrievalCallReference(tc.ID), content, retrievalCallOutcome(ctx, result, err), retrievalCallFailures(ctx, result)...); observeErr != nil {
+		ref := e.retrievalCallReference(tc.ID)
+		modelResult := e.modelContext.ModelToolResultForTool(tc.Function.Name, toolCall.Result)
+		content := e.modelContext.DecodeObservationText(modelResult)
+		structured, observedIDs, citableIDs := extractToolPublishedSources(toolCall.Result)
+		if result != nil && result.Success && kbToolNames[tc.Function.Name] {
+			structured = true
+		}
+		if observeErr := e.retrieval.observeWithSources(ref, content, retrievalCallOutcome(ctx, result, err), structured, observedIDs, citableIDs, retrievalCallFailures(ctx, result)...); observeErr != nil {
 			logger.Errorf(ctx, "%s Cannot record retrieval outcome: %v", toolTag, observeErr)
 		}
 	}
@@ -822,6 +918,62 @@ func (e *AgentEngine) runToolCallAnswered(
 	}
 
 	return toolCall
+}
+
+func (e *AgentEngine) snapshotTurnShownChunks() map[string]bool {
+	e.progress.mu.Lock()
+	defer e.progress.mu.Unlock()
+	if len(e.turnShownChunks) == 0 {
+		return nil
+	}
+	copied := make(map[string]bool, len(e.turnShownChunks))
+	for id := range e.turnShownChunks {
+		copied[id] = true
+	}
+	return copied
+}
+
+func (e *AgentEngine) recordTurnShownChunks(result *types.ToolResult) {
+	if result == nil || !result.Success || result.Data == nil {
+		return
+	}
+	raw, ok := result.Data["results"]
+	if !ok {
+		return
+	}
+	var ids []string
+	collect := func(row map[string]interface{}) {
+		if id, _ := row["chunk_id"].(string); id != "" {
+			ids = append(ids, id)
+			return
+		}
+		if id, _ := row["faq_id"].(string); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	switch rows := raw.(type) {
+	case []map[string]interface{}:
+		for _, row := range rows {
+			collect(row)
+		}
+	case []interface{}:
+		for _, item := range rows {
+			if row, ok := item.(map[string]interface{}); ok {
+				collect(row)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	e.progress.mu.Lock()
+	defer e.progress.mu.Unlock()
+	if e.turnShownChunks == nil {
+		e.turnShownChunks = make(map[string]bool, len(ids))
+	}
+	for _, id := range ids {
+		e.turnShownChunks[id] = true
+	}
 }
 
 // web_fetch validates each URL before any I/O. Unknown web references are item

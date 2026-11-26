@@ -16,7 +16,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
-// perConfigRetention answers each config's retention from a map.
 type perConfigRetention map[string]int
 
 func (p perConfigRetention) GetByID(
@@ -41,8 +40,6 @@ func (r retentionConfigs) GetByID(
 	}}, nil
 }
 
-// reclaimRecorder runs beforeCheck/afterCheck around the check the GC hands
-// to the manager, standing in for things that happen while the lock is held.
 type reclaimRecorder struct {
 	fakeMachineOps
 	beforeCheck, afterCheck func()
@@ -104,7 +101,6 @@ func TestGCRecomputesInsideTheLock(t *testing.T) {
 	b := uuid.NewString()
 	e.addSession(t, webSession(b))
 	ops := &reclaimRecorder{beforeCheck: func() {
-		// Joined and left between the scan and the lock: empty_since moved.
 		e.svc.now = func() time.Time { return time.Now().UTC().Add(48 * time.Hour) }
 		e.place(t, b, "cfg-a")
 		_, err := e.svc.Release(context.Background(), b)
@@ -125,8 +121,6 @@ func TestGCKeepsTheRowWhenASessionJoinsBeforeTheLockedCheck(t *testing.T) {
 	b := uuid.NewString()
 	e.addSession(t, webSession(b))
 	ops := &reclaimRecorder{beforeCheck: func() {
-		// Joining clears empty_since. The locked check must see that and
-		// not destroy the machine this session now owns.
 		e.place(t, b, "cfg-a")
 	}}
 	gc := NewUserMachineGC(e.svc, NewWorkspaceCleaner(e.svc, fakeResolver{mgr: ops}), retentionConfigs{days: &one}, nil)
@@ -151,14 +145,13 @@ func TestGCReadsRetentionFreshEachRun(t *testing.T) {
 	_, _ = gc.RunOnce(context.Background())
 	require.Zero(t, ops.reclaims)
 
-	days = 1 // admin shortened the window
+	days = 1
 	_, _ = gc.RunOnce(context.Background())
 	require.Equal(t, 1, ops.reclaims)
 }
 
 func TestGCIsNotStarvedByOldCandidatesThatAreNotDue(t *testing.T) {
 	enableUserMode(t)
-	// Two old machines on a 30-day config, one newer machine on a 1-day config.
 	thirty, one := uuid.NewString(), uuid.NewString()
 	old1, old2, due := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	sess := func(id, owner string) *types.Session {
@@ -178,7 +171,7 @@ func TestGCIsNotStarvedByOldCandidatesThatAreNotDue(t *testing.T) {
 	ops := &reclaimRecorder{}
 	days := map[string]int{thirty: 30, one: 1}
 	gc := NewUserMachineGC(e.svc, NewWorkspaceCleaner(e.svc, fakeResolver{mgr: ops}), perConfigRetention(days), nil)
-	gc.batch = 1 // one candidate per page: the two not-due ones come first
+	gc.batch = 1
 	gc.now = func() time.Time { return time.Now().UTC().Add(48 * time.Hour) }
 
 	report, err := gc.RunOnce(context.Background())

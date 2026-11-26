@@ -313,9 +313,97 @@ func TestWebFetchDoesNotCacheFailuresAndBoundsSnapshots(t *testing.T) {
 	assert.Equal(t, 2, fetcher.callCount[rawURL], "must not splice a new page into a continuation")
 }
 
+func TestWebFetchLimitsRepeatedConnectionFailures(t *testing.T) {
+	const rawURL = "https://example.com/unreachable"
+	const otherURL = "https://example.com/other"
+	fetcher := newStubWebContentFetcher(
+		map[string]string{otherURL: "available"},
+		map[string]error{rawURL: fetchFailure(webfetch.ErrorTimeout, true, "timed out")},
+	)
+	tool := NewWebFetchTool(fetcher)
+	for i := 0; i < 2; i++ {
+		result, err := tool.Execute(t.Context(), webFetchArgs(WebFetchItem{URL: rawURL}))
+		require.NoError(t, err)
+		require.False(t, result.Success)
+		require.Contains(t, result.Output, "Retryable: true")
+	}
+	result, err := tool.Execute(t.Context(), webFetchArgs(WebFetchItem{URL: rawURL}, WebFetchItem{URL: otherURL}))
+	require.NoError(t, err)
+	require.Contains(t, result.Output, "retry_limit")
+	require.Contains(t, result.Output, "available")
+	require.Equal(t, 2, fetcher.callCount[rawURL])
+}
+
 type gatingWebContentFetcher struct {
 	*stubWebContentFetcher
 	started, release chan struct{}
+}
+
+func TestWebFetchCountsSharedFlightOnce(t *testing.T) {
+	const rawURL = "https://example.com/shared"
+	fetcher := &gatingWebContentFetcher{
+		stubWebContentFetcher: newStubWebContentFetcher(nil, map[string]error{rawURL: fetchFailure(webfetch.ErrorConnection, true, "EOF")}),
+		started:               make(chan struct{}), release: make(chan struct{}),
+	}
+	tool := NewWebFetchTool(fetcher)
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { _, err := tool.readPage(t.Context(), rawURL, 0); done <- err }()
+	}
+	<-fetcher.started
+	require.Eventually(t, func() bool {
+		tool.mu.Lock()
+		defer tool.mu.Unlock()
+		return tool.inflight[rawURL] != nil && tool.inflight[rawURL].waiters == 2
+	}, time.Second, time.Millisecond)
+	close(fetcher.release)
+	require.Error(t, <-done)
+	require.Error(t, <-done)
+	tool.mu.Lock()
+	count := tool.connectionFailures[rawURL]
+	tool.mu.Unlock()
+	require.Equal(t, 1, count)
+}
+
+func TestWebFetchCancellationDoesNotConsumeRetry(t *testing.T) {
+	const rawURL = "https://example.com/cancel"
+	fetcher := &gatingWebContentFetcher{
+		stubWebContentFetcher: newStubWebContentFetcher(nil, nil),
+		started:               make(chan struct{}), release: make(chan struct{}),
+	}
+	tool := NewWebFetchTool(fetcher)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { _, err := tool.readPage(ctx, rawURL, 0); done <- err }()
+	<-fetcher.started
+	cancel()
+	require.Error(t, <-done)
+	tool.mu.Lock()
+	count := tool.connectionFailures[rawURL]
+	tool.mu.Unlock()
+	require.Zero(t, count)
+}
+
+func TestWebFetchWaiterTimeoutDoesNotCountActiveFlight(t *testing.T) {
+	const rawURL = "https://example.com/shared-timeout"
+	fetcher := &gatingWebContentFetcher{
+		stubWebContentFetcher: newStubWebContentFetcher(map[string]string{rawURL: "available"}, nil),
+		started:               make(chan struct{}), release: make(chan struct{}),
+	}
+	tool := NewWebFetchTool(fetcher)
+	done := make(chan error, 1)
+	go func() { _, err := tool.readPage(t.Context(), rawURL, 0); done <- err }()
+	<-fetcher.started
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	_, err := tool.readPage(ctx, rawURL, 0)
+	require.Error(t, err)
+	tool.mu.Lock()
+	count := tool.connectionFailures[rawURL]
+	tool.mu.Unlock()
+	require.Zero(t, count)
+	close(fetcher.release)
+	require.NoError(t, <-done)
 }
 
 func (f *gatingWebContentFetcher) Fetch(ctx context.Context, rawURL string) (*types.WebPage, error) {
@@ -632,4 +720,7 @@ func TestWebFetchInitiatorCancellationKeepsAnotherWaiterAlive(t *testing.T) {
 	close(fetcher.release)
 	require.NoError(t, <-secondDone)
 	require.Equal(t, 1, fetcher.callCount[u])
+	tool.mu.Lock()
+	require.Zero(t, tool.connectionFailures[u], "caller wait cancellation/timeout must not increment connectionFailures")
+	tool.mu.Unlock()
 }

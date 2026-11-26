@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -63,10 +67,12 @@ type WebSearchFilteredInput struct {
 // WebSearchTool performs web searches and returns results
 type WebSearchTool struct {
 	BaseTool
-	provider   interfaces.WebClient // nil when the run has no usable provider
-	pages      *WebFetchTool
-	maxResults int
-	filtered   bool // Brave, Serply, and SearchApi use WebSearchFilteredInput
+	provider             interfaces.WebClient // nil when the run has no usable provider
+	pages                *WebFetchTool
+	maxResults           int
+	filtered             bool // Brave, Serply, and SearchApi use WebSearchFilteredInput
+	sensitiveTokens      []string
+	shortSensitiveTokens []string
 }
 
 // NewWebSearchTool creates a web_search tool for the provider resolved for this run.
@@ -103,6 +109,149 @@ func (t *WebSearchTool) WithPageReader(reader *WebFetchTool) *WebSearchTool {
 	return t
 }
 
+// WithAppInfo records private project identifiers (app_id, app_name, game_name)
+// from request app_info so public web_search queries leaking them are rejected.
+func (t *WebSearchTool) WithAppInfo(appInfo string) *WebSearchTool {
+	t.sensitiveTokens, t.shortSensitiveTokens = extractSensitiveAppInfoTokens(appInfo)
+	return t
+}
+
+var (
+	webSearchSecretPattern = regexp.MustCompile(`(?i)(?:-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----|(?:\b(?:app_?secret|api_?key|access_?token|secret_?key|private_?key|client_?secret|sign_?key|auth_?token)["'` + "`" + `']?\s*[:=]\s*["'` + "`" + `']?[^\s,"'` + "`" + `'{}\[\]]+)|(?:\bbearer\s+[A-Za-z0-9._-]{12,})|(?:\b(?:sk-[A-Za-z0-9]{16,}|AKID[A-Za-z0-9]{16,}|LTAI[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{20,})\b))`)
+	webSearchPrivateIDExpr = regexp.MustCompile(`(?i)\b(?:app_?id|order_?id|order_?no|trade_?no|user_?id)["'` + "`" + `']?\s*[:=]\s*["'` + "`" + `']?[A-Za-z0-9_-]{1,}["'` + "`" + `']?`)
+)
+
+func extractSensitiveAppInfoTokens(appInfo string) (longTokens []string, shortTokens []string) {
+	if strings.TrimSpace(appInfo) == "" {
+		return nil, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(appInfo), &root); err != nil || root == nil {
+		return nil, nil
+	}
+	add := func(v any, longMinRunes int, numericID bool) {
+		var s string
+		switch val := v.(type) {
+		case string:
+			s = strings.TrimSpace(val)
+		case float64:
+			if val == float64(int64(val)) {
+				s = fmt.Sprintf("%d", int64(val))
+			}
+		}
+		if s == "" {
+			return
+		}
+		if numericID && strings.TrimFunc(s, unicode.IsDigit) == "" {
+			shortTokens = append(shortTokens, s)
+		} else if len([]rune(s)) >= longMinRunes {
+			longTokens = append(longTokens, s)
+		} else {
+			shortTokens = append(shortTokens, s)
+		}
+	}
+	maps := []map[string]any{root}
+	if gi, ok := root["gameInfo"].(map[string]any); ok {
+		maps = append(maps, gi)
+	}
+	if app, ok := root["app"].(map[string]any); ok {
+		maps = append(maps, app)
+	}
+	for _, m := range maps {
+		for _, k := range []string{"app_secret", "appSecret"} {
+			add(m[k], 4, false)
+		}
+		for _, k := range []string{"app_id", "appId", "appid"} {
+			add(m[k], 4, true)
+		}
+		for _, k := range []string{"app_name", "appName", "game_name", "gameName", "project_name", "projectName"} {
+			add(m[k], 3, false)
+		}
+	}
+	return longTokens, shortTokens
+}
+
+func isTokenBoundaryRune(r rune) bool {
+	return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_')
+}
+
+func containsWholeTokenCaseInsensitive(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	hRunes := []rune(strings.ToLower(haystack))
+	nRunes := []rune(strings.ToLower(needle))
+	nLen := len(nRunes)
+	if nLen == 0 || len(hRunes) < nLen {
+		return false
+	}
+	for i := 0; i <= len(hRunes)-nLen; i++ {
+		match := true
+		for j := 0; j < nLen; j++ {
+			if hRunes[i+j] != nRunes[j] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		leftOK := i == 0 || isTokenBoundaryRune(hRunes[i-1])
+		rightOK := i+nLen == len(hRunes) || isTokenBoundaryRune(hRunes[i+nLen])
+		if leftOK && rightOK {
+			return true
+		}
+	}
+	return false
+}
+
+func checkWebSearchPrivacy(query string, sensitiveTokens, shortSensitiveTokens []string) error {
+	if webSearchSecretPattern.MatchString(query) {
+		return fmt.Errorf("web_search query blocked: contains credential or secret material; remove secrets and query public technical concepts only")
+	}
+	if webSearchPrivateIDExpr.MatchString(query) {
+		return fmt.Errorf("web_search query blocked: contains private identifier expression (app_id/order_id/user_id); remove private identifiers and query public concepts only")
+	}
+	lowerQuery := strings.ToLower(query)
+	for _, tok := range sensitiveTokens {
+		if strings.Contains(lowerQuery, strings.ToLower(tok)) {
+			return fmt.Errorf("web_search query blocked: contains private project identifier from app_info; remove project-specific identifiers and query public concepts only")
+		}
+	}
+	for _, tok := range shortSensitiveTokens {
+		if containsWholeTokenCaseInsensitive(query, tok) {
+			return fmt.Errorf("web_search query blocked: contains private project identifier from app_info; remove project-specific identifiers and query public concepts only")
+		}
+	}
+	return nil
+}
+
+// checkWebURLPrivacy inspects a target URL's path and query parameters (both raw
+// and percent-decoded) so direct web_fetch calls cannot leak credentials or
+// private project identifiers in query strings or path segments.
+func checkWebURLPrivacy(rawURL string, sensitiveTokens, shortSensitiveTokens []string) error {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil
+	}
+	candidates := []string{parsed.Path, parsed.RawQuery}
+	if decodedPath, err := url.PathUnescape(parsed.Path); err == nil && decodedPath != parsed.Path {
+		candidates = append(candidates, decodedPath)
+	}
+	if decodedQuery, err := url.QueryUnescape(parsed.RawQuery); err == nil && decodedQuery != parsed.RawQuery {
+		candidates = append(candidates, decodedQuery)
+	}
+	for _, part := range candidates {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		if err := checkWebSearchPrivacy(part, sensitiveTokens, shortSensitiveTokens); err != nil {
+			return fmt.Errorf("web_fetch URL blocked: path or query parameters contain private identifiers or credentials; strip private query parameters before fetching public documentation")
+		}
+	}
+	return nil
+}
+
 // patchWebSearchCountSchema rewrites the count description with the effective
 // maximum. Any parse failure returns the schema unchanged.
 func patchWebSearchCountSchema(raw json.RawMessage, maxResults int) json.RawMessage {
@@ -133,7 +282,20 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*typ
 	logger.Infof(ctx, "[Tool][WebSearch] Execute started")
 
 	var input WebSearchFilteredInput
-	if err := json.Unmarshal(args, &input); err != nil {
+	err := json.Unmarshal(args, &input)
+	if err != nil {
+		var fields map[string]json.RawMessage
+		var count string
+		if json.Unmarshal(args, &fields) == nil && json.Unmarshal(fields["count"], &count) == nil {
+			if n, parseErr := strconv.Atoi(count); parseErr == nil {
+				fields["count"] = json.RawMessage(strconv.Itoa(n))
+				if normalized, marshalErr := json.Marshal(fields); marshalErr == nil {
+					err = json.Unmarshal(normalized, &input)
+				}
+			}
+		}
+	}
+	if err != nil {
 		logger.Errorf(ctx, "[Tool][WebSearch] Failed to parse args: %v", err)
 		return &types.ToolResult{
 			Success: false,
@@ -187,6 +349,13 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*typ
 			Success: false,
 			Error:   "query parameter is required",
 		}, fmt.Errorf("query parameter is required")
+	}
+	if err := checkWebSearchPrivacy(query, t.sensitiveTokens, t.shortSensitiveTokens); err != nil {
+		logger.Warnf(ctx, "[Tool][WebSearch] Privacy pre-filter rejected query: %v", err)
+		return &types.ToolResult{
+			Success: false,
+			Error:   err.Error(),
+		}, nil
 	}
 
 	logger.Infof(ctx, "[Tool][WebSearch] Searching with query: %s, max_results: %d", query, maxResults)

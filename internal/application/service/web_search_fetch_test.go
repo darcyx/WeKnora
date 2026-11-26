@@ -77,6 +77,40 @@ func TestWebSearchResolveFollowsProviderType(t *testing.T) {
 	require.ErrorContains(t, err, "not registered")
 }
 
+func TestTavilyExtractOnlyUsesSearchResultsInSameClient(t *testing.T) {
+	const foundURL = "https://example.com/page?hl=en"
+	searcher := &recordingSearcher{results: []*types.WebSearchResult{{URL: foundURL}, {URL: "https://blocked.example.com/page"}}}
+	page := &recordingFetcher{}
+	registry := infra.NewRegistry()
+	registry.Add(infra.Spec{Type: "tavily", Search: searcherFactory(searcher), Fetch: func(types.WebSearchProviderParameters) (interfaces.WebFetcher, error) { return page, nil }})
+	svc := &WebSearchService{registry: registry, providerRepo: filterProviderRepository{}}
+	ctx := context.WithValue(t.Context(), types.TenantIDContextKey, uint64(7))
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{WebSearchConfig: &types.WebSearchConfig{Blacklist: []string{"*://blocked.example.com/*"}}})
+	client, err := svc.Resolve(ctx, "tavily")
+	require.NoError(t, err)
+	_, err = client.Fetch(ctx, "")
+	require.Error(t, err)
+	require.Empty(t, page.url)
+	_, err = client.Search(ctx, types.WebSearchRequest{Query: "q"})
+	require.NoError(t, err)
+	got, err := client.Fetch(ctx, foundURL)
+	require.NoError(t, err)
+	require.Equal(t, "api:"+foundURL, got.Content)
+	// Fragment and scheme/host case differences still match the same seen search result URL.
+	gotVariant, err := client.Fetch(ctx, "HTTPS://EXAMPLE.COM/page?hl=en#section-2")
+	require.NoError(t, err)
+	require.Equal(t, "api:HTTPS://EXAMPLE.COM/page?hl=en#section-2", gotVariant.Content)
+	require.NotContains(t, client.(*webClient).seenURLs, "https://blocked.example.com/page")
+	require.NotContains(t, client.(*webClient).seenURLs, "https://example.com/page?hl=zh")
+	other, err := svc.Resolve(ctx, "tavily")
+	require.NoError(t, err)
+	require.NotContains(t, other.(*webClient).seenURLs, foundURL)
+	page.url = ""
+	_, err = other.Fetch(ctx, "")
+	require.Error(t, err)
+	require.Empty(t, page.url)
+}
+
 func TestValidateProviderParametersDeepSeek(t *testing.T) {
 	err := validateProviderParameters(types.WebSearchProviderTypeDeepSeek, types.WebSearchProviderParameters{})
 	if err == nil {

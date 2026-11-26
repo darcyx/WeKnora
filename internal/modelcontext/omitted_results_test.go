@@ -42,6 +42,17 @@ func TestAnnotateSearchNotes(t *testing.T) {
 	}
 }
 
+func TestModelSearchOutputRetainsFAQPreflightRejection(t *testing.T) {
+	result := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results", "mode": "exact", "preflight_rejection_reason": "requires live status <query>",
+		"results": []map[string]interface{}{{"faq_id": "faq-1", "faq_question": "状态？", "faq_answers": []string{"示例"}}},
+	}}
+	got := NewRegistry(true).ModelToolResultForTool("search_knowledge", result)
+	if !strings.Contains(got, "requires live status &lt;query&gt;") || !strings.Contains(got, "preflight_review") {
+		t.Fatalf("model result lost FAQ constraint: %s", got)
+	}
+}
+
 // The subset note is conditional: only a counting or exhaustive-list question
 // has to report the scope of the view. It must also carry the counts it was
 // given, so the model reads the real shown / candidate numbers rather than a
@@ -125,5 +136,44 @@ func TestOmittedCandidatesExposeDocumentHandlesWithoutContent(t *testing.T) {
 	out := r.ModelOutput(result)
 	if !strings.Contains(out, `view="candidate_only"`) || !strings.Contains(out, `title="next"`) || !strings.Contains(out, `id="doc://2"`) || strings.Contains(out, `id="33333333-3333-3333-3333-333333333333"`) {
 		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestOmittedFAQCandidatesExposeNavigationChunkHandleWithoutCitationEligibility(t *testing.T) {
+	r := NewRegistry(true)
+	const faqChunkID = "11c49bd9-2885-4363-a082-2ec269f903ca"
+	result := &types.ToolResult{Success: true, Output: "unused", Data: map[string]interface{}{
+		"display_type": "search_results",
+		"mode":         "hybrid",
+		"results": []map[string]interface{}{
+			{"chunk_id": "11111111-1111-1111-1111-111111111111", "knowledge_id": "22222222-2222-2222-2222-222222222222", "knowledge_base_id": "55555555-5555-5555-5555-555555555555", "content": "known"},
+		},
+		"omitted_for_budget": 1,
+		"omitted_candidates": []map[string]interface{}{
+			{
+				"chunk_id":          faqChunkID,
+				"knowledge_id":      "c3a54bac-7396-4345-85cc-c403522bc9c0",
+				"knowledge_base_id": "a3c7aaf1-de37-44a6-a444-bd9591d48a3f",
+				"chunk_type":        "faq",
+				"title":             "充值不到账有哪些常见原因，应该如何排查？",
+			},
+		},
+	}}
+	out := r.ModelToolResultForTool("search_knowledge", result)
+	if !strings.Contains(out, `<chunk id="chunk://2" kb="kb://2" title="充值不到账有哪些常见原因，应该如何排查？" type="faq" view="candidate_only" />`) {
+		t.Fatalf("unexpected output: %s", out)
+	}
+	if strings.Contains(out, faqChunkID) {
+		t.Fatalf("raw FAQ chunk ID leaked into model output: %s", out)
+	}
+	calls := []types.LLMToolCall{{
+		Function: types.FunctionCall{Name: "read_document", Arguments: `{"id":"chunk://2"}`},
+	}}
+	r.DecodeToolCalls(calls)
+	if len(calls[0].UnresolvedHandles) != 0 || !strings.Contains(calls[0].Function.Arguments, faqChunkID) {
+		t.Fatalf("candidate_only chunk handle must resolve for read_document: args=%s unresolved=%v", calls[0].Function.Arguments, calls[0].UnresolvedHandles)
+	}
+	if got := r.DecodeOutputText(`<ref id="chunk://2"/>`); got != "" {
+		t.Fatalf("unread candidate_only FAQ must not be citable, got %q", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -93,10 +94,13 @@ type AgentEngine struct {
 	retrievalProjectReviewed string
 	retrievalHistory         []string
 	retrievalPrevious        json.RawMessage
+	turnShownChunks          map[string]bool
 	retrievalSave            func(context.Context, json.RawMessage) error
 	retrievalTurnID          string
 	turnHasWikiSearch        bool // the tool calls being executed include wiki_search
+	faqBroadDocumentQuery    string
 	retrievalUserMessage     struct{ id, text string }
+	fastChatModel            chat.Chat
 	// steerSink, when set, lets users append messages into the running turn.
 	// Drained at every round boundary; nil disables mid-run injection.
 	steerSink         types.SteerSink
@@ -282,6 +286,27 @@ func (e *AgentEngine) SetRunNote(note string) {
 // input leaves the system prompt untouched.
 func (e *AgentEngine) SetMemoryPrompt(prompt string) {
 	e.memoryPrompt = prompt
+}
+
+// SetFAQPreflightQuestions hands search_knowledge the FAQ titles a preflight
+// that finished after the engine was built has already shown this turn.
+func (e *AgentEngine) SetFAQPreflightQuestions(questions []string) {
+	if e.toolRegistry == nil {
+		return
+	}
+	if tool, err := e.toolRegistry.GetTool(agenttools.ToolSearchKnowledge); err == nil {
+		if search, ok := tool.(*agenttools.SearchKnowledgeTool); ok {
+			search.WithFAQPreflightQuestions(questions)
+		}
+	}
+}
+
+// Cleanup releases tool resources of an engine that will not run.
+// Execute and Resume clean up on their own.
+func (e *AgentEngine) Cleanup(ctx context.Context) {
+	if e.toolRegistry != nil {
+		e.toolRegistry.Cleanup(ctx)
+	}
 }
 
 // NewAgentEngineWithSkills creates a new agent engine with skills support
@@ -1525,6 +1550,7 @@ func (e *AgentEngine) runReActIteration(
 					Plan:                    state.Plan,
 					Retrieval:               e.retrievalSnapshot(),
 					RetrievalTurnID:         e.retrievalTurnID,
+					FAQPreflight:            e.faqPreflightSnapshot(),
 				}
 				intermediate := verdict.step
 				intermediate.IntermediateAnswer = true
@@ -1863,4 +1889,83 @@ func decodeDataURIBytes(dataURI string) ([]byte, error) {
 		decoded, err = base64.RawStdEncoding.DecodeString(raw)
 	}
 	return decoded, err
+}
+
+func (e *AgentEngine) SetFastChatModel(model chat.Chat) {
+	if e == nil {
+		return
+	}
+	e.fastChatModel = model
+}
+
+// HasFAQSourceRestriction conservatively recognizes explicit source language.
+func HasFAQSourceRestriction(query string) bool {
+	lower := strings.ToLower(query)
+	mentionsSource := false
+	for _, term := range []string{"知识库", "文档", "资料", "文件", "指南", "页面", "来源", "材料", "文章", "document", "guide", "source", "library"} {
+		if strings.Contains(lower, term) {
+			mentionsSource = true
+			break
+		}
+	}
+	return mentionsSource && (strings.ContainsAny(query, "只仅") || strings.Contains(query, "限定") ||
+		strings.Contains(query, "指定") || strings.Contains(query, "排除") || strings.Contains(query, "上面") || strings.Contains(query, "上述") ||
+		strings.Contains(query, "前面") || strings.Contains(query, "之前") || strings.Contains(query, "刚才") ||
+		strings.Contains(lower, "only") || strings.Contains(lower, "exclusively") || strings.Contains(lower, "previous") ||
+		strings.Contains(lower, "above"))
+}
+
+func (e *AgentEngine) SetFAQBroadDocumentSearch(query string) {
+	if !HasFAQSourceRestriction(query) {
+		e.faqBroadDocumentQuery = query
+	}
+}
+
+func (e *AgentEngine) clearFAQPreflightFindings() {
+	if e == nil || e.config == nil {
+		return
+	}
+	e.faqBroadDocumentQuery = ""
+	e.config.FAQPreflightChecked = false
+	e.config.FAQPreflightQuestions = nil
+	e.config.FAQPreflightRejections = nil
+	e.SetFAQPreflightQuestions(nil)
+	if e.toolRegistry != nil {
+		if tool, err := e.toolRegistry.GetTool(agenttools.ToolSearchKnowledge); err == nil {
+			if search, ok := tool.(*agenttools.SearchKnowledgeTool); ok {
+				search.WithFAQPreflightRejections(nil)
+			}
+		}
+	}
+}
+
+func (e *AgentEngine) ApplyFAQPreflight(usage *types.TokenUsage, questions []string, rejections map[string]types.FAQPreflightRejection) {
+	if e == nil || e.config == nil {
+		return
+	}
+	if usage != nil {
+		if e.config.FAQPreflightUsage == nil {
+			e.config.FAQPreflightUsage = &types.TokenUsage{}
+		}
+		e.config.FAQPreflightUsage.Accumulate(*usage)
+	}
+	if len(questions) > 0 {
+		e.config.FAQPreflightChecked = true
+		e.config.FAQPreflightQuestions = append(e.config.FAQPreflightQuestions, questions...)
+		e.SetFAQPreflightQuestions(e.config.FAQPreflightQuestions)
+	}
+	if len(rejections) > 0 {
+		e.config.FAQPreflightChecked = true
+		if e.config.FAQPreflightRejections == nil {
+			e.config.FAQPreflightRejections = make(map[string]types.FAQPreflightRejection)
+		}
+		maps.Copy(e.config.FAQPreflightRejections, rejections)
+		if e.toolRegistry != nil {
+			if tool, err := e.toolRegistry.GetTool(agenttools.ToolSearchKnowledge); err == nil {
+				if search, ok := tool.(*agenttools.SearchKnowledgeTool); ok {
+					search.WithFAQPreflightRejections(maps.Clone(e.config.FAQPreflightRejections))
+				}
+			}
+		}
+	}
 }

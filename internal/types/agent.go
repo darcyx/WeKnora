@@ -97,6 +97,13 @@ func AgentRoundMaxCompletionTokensFor(configured int, sandboxConfigID string) in
 // that omit the field keep their current behaviour.
 const UnlimitedMaxIterations = -1
 
+// FAQPreflightRejection is a reviewed FAQ that was not approved as a direct answer.
+// It is keyed by the FAQ chunk ID: different FAQs may share a standard question.
+type FAQPreflightRejection struct {
+	Question string `json:"question"`
+	Reason   string `json:"reason"`
+}
+
 // AgentConfig represents the full agent configuration (used at tenant level and runtime)
 // This includes all configuration parameters for agent execution
 type AgentConfig struct {
@@ -119,18 +126,20 @@ type AgentConfig struct {
 	KnowledgeIDs    []string `json:"knowledge_ids"`           // Accessible knowledge IDs (individual documents)
 	SystemPrompt    string   `json:"system_prompt,omitempty"` // Unified system prompt (uses web_search_status placeholder for dynamic behavior)
 	// Deprecated: Use SystemPrompt instead. Kept for backward compatibility during migration.
-	SystemPromptWebEnabled  string        `json:"system_prompt_web_enabled,omitempty"`  // Deprecated: Custom prompt when web search is enabled
-	SystemPromptWebDisabled string        `json:"system_prompt_web_disabled,omitempty"` // Deprecated: Custom prompt when web search is disabled
-	UseCustomSystemPrompt   bool          `json:"use_custom_system_prompt"`             // Whether to use custom system prompt instead of default
-	LocalBrowserEnabled     bool          `json:"-"`                                    // Per-turn local_browser gate
-	WebSearchEnabled        bool          `json:"web_search_enabled"`                   // Whether web search tool is enabled
-	WebSearchMaxResults     int           `json:"web_search_max_results"`               // Maximum number of web search results (default: 5)
-	WebSearchProviderID     string        `json:"web_search_provider_id,omitempty"`     // WebSearchProviderEntity ID (resolved from agent config)
-	MultiTurnEnabled        bool          `json:"multi_turn_enabled"`                   // Whether multi-turn conversation is enabled
-	MemoryEnabled           *bool         `json:"memory_enabled,omitempty"`             // nil inherits workspace
-	SearchTargets           SearchTargets `json:"-"`                                    // Pre-computed unified search targets (runtime only)
-	FAQPreflightUsage       *TokenUsage   `json:"-"`                                    // Model usage incurred before the agent loop
-	FAQPreflightQuestions   []string      `json:"-"`                                    // Titles already seen in this turn's FAQ search
+	SystemPromptWebEnabled  string                           `json:"system_prompt_web_enabled,omitempty"`  // Deprecated: Custom prompt when web search is enabled
+	SystemPromptWebDisabled string                           `json:"system_prompt_web_disabled,omitempty"` // Deprecated: Custom prompt when web search is disabled
+	UseCustomSystemPrompt   bool                             `json:"use_custom_system_prompt"`             // Whether to use custom system prompt instead of default
+	LocalBrowserEnabled     bool                             `json:"-"`                                    // Per-turn local_browser gate
+	WebSearchEnabled        bool                             `json:"web_search_enabled"`                   // Whether web search tool is enabled
+	WebSearchMaxResults     int                              `json:"web_search_max_results"`               // Maximum number of web search results (default: 5)
+	WebSearchProviderID     string                           `json:"web_search_provider_id,omitempty"`     // WebSearchProviderEntity ID (resolved from agent config)
+	MultiTurnEnabled        bool                             `json:"multi_turn_enabled"`                   // Whether multi-turn conversation is enabled
+	MemoryEnabled           *bool                            `json:"memory_enabled,omitempty"`             // nil inherits workspace
+	SearchTargets           SearchTargets                    `json:"-"`                                    // Pre-computed unified search targets (runtime only)
+	FAQPreflightUsage       *TokenUsage                      `json:"-"`                                    // Model usage incurred before the agent loop
+	FAQPreflightChecked     bool                             `json:"-"`                                    // Whether FAQ preflight evaluated candidates this turn
+	FAQPreflightQuestions   []string                         `json:"-"`                                    // Titles already seen in this turn's FAQ search
+	FAQPreflightRejections  map[string]FAQPreflightRejection `json:"-"`                                    // Rejection reasons/constraints keyed by FAQ chunk ID
 	// MCP service selection
 	MCPSelectionMode string   `json:"mcp_selection_mode"` // MCP selection mode: "all", "selected", "none"
 	MCPServices      []string `json:"mcp_services"`       // Selected MCP service IDs (when mode is "selected")
@@ -158,6 +167,8 @@ type AgentConfig struct {
 	// strategy "fixed", a non-blank response replaces the runtime no-answer text.
 	FallbackStrategy string `json:"fallback_strategy,omitempty"`
 	FallbackResponse string `json:"fallback_response,omitempty"`
+	// FixedResponses maps sentinel keys to verbatim responses expanded from [[FIXED:KEY]].
+	FixedResponses map[string]string `json:"fixed_responses,omitempty"`
 
 	// Whether to retain retrieval history (like wiki_read_page results) across turns (default: false)
 	RetainRetrievalHistory bool `json:"retain_retrieval_history"`
@@ -441,12 +452,15 @@ type ToolResult struct {
 	// uses the final answer's persistent resource references instead.
 	// A non-nil empty slice means output inspection found no eligible changes;
 	// nil means no output inspection result is available.
-	OutputFiles []string               `json:"-"`
-	Success     bool                   `json:"success"`          // Whether the tool executed successfully
-	Output      string                 `json:"output"`           // Human-readable output
-	Data        map[string]interface{} `json:"data,omitempty"`   // Structured data for programmatic use
-	Error       string                 `json:"error,omitempty"`  // Error message if execution failed
-	Images      []string               `json:"images,omitempty"` // Base64 data URIs from tool (e.g. MCP image content)
+	OutputFiles []string `json:"-"`
+	// PublishedSources lists durable document or chunk IDs this tool call
+	// explicitly surfaced as structured references (separate from body text).
+	PublishedSources []PublishedSourceRef   `json:"-"`
+	Success          bool                   `json:"success"`          // Whether the tool executed successfully
+	Output           string                 `json:"output"`           // Human-readable output
+	Data             map[string]interface{} `json:"data,omitempty"`   // Structured data for programmatic use
+	Error            string                 `json:"error,omitempty"`  // Error message if execution failed
+	Images           []string               `json:"images,omitempty"` // Base64 data URIs from tool (e.g. MCP image content)
 	// ImageDescriptions is aligned with Images and holds a vision model's
 	// description of each for a chat model that cannot view them ("" when an
 	// image could not be described). Live only.
@@ -460,6 +474,11 @@ type ToolResult struct {
 	// Suspend, when set, means the call did not run: it is waiting on a user
 	// prompt and the run must end so it can be resumed later. Live only.
 	Suspend *PromptSuspension `json:"-"`
+}
+
+type PublishedSourceRef struct {
+	ID      string
+	Citable bool
 }
 
 type RetrievalFailure struct {

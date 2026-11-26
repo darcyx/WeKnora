@@ -179,6 +179,7 @@ func TestQueryKnowledgeGraph_ReportsConfiguredEntityAndRelationTypes(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, result.Success)
+	assert.Contains(t, result.PublishedSources, types.PublishedSourceRef{ID: "chunk-approval-1", Citable: true})
 	t.Logf("tool output:\n%s", result.Output)
 
 	assert.Contains(t, result.Output, "Entity Types (3)")

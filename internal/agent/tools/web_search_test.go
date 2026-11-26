@@ -206,6 +206,27 @@ func TestAgentWebSearchCountWithinRangeIsHonoured(t *testing.T) {
 	require.NotContains(t, result.Output, "was clamped")
 }
 
+func TestAgentWebSearchAcceptsStringCount(t *testing.T) {
+	svc := &fakeWebSearchProvider{}
+	tool := NewWebSearchTool(svc, 5)
+	ctx := context.WithValue(t.Context(), types.TenantIDContextKey, uint64(1))
+
+	result, err := tool.Execute(ctx, json.RawMessage(`{"query":"q","count":"3"}`))
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Equal(t, 3, svc.request.MaxResults)
+
+	result, err = tool.Execute(ctx, json.RawMessage(`{"query":"q","count":"0"}`))
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Equal(t, 1, svc.calls)
+
+	result, err = tool.Execute(ctx, json.RawMessage(`{"query":"q","count":"invalid"}`))
+	require.Error(t, err)
+	require.False(t, result.Success)
+	require.Equal(t, 1, svc.calls)
+}
+
 // TestWebSearchSchemaFollowsProvider DeepSeek gets the query schema. Brave gets
 // country and freshness, with a description that documents those fields.
 func TestWebSearchSchemaFollowsProvider(t *testing.T) {

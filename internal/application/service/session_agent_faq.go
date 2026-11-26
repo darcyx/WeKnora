@@ -21,7 +21,21 @@ import (
 var errFAQMatchUnavailable = errors.New("FAQ matching unavailable")
 var errFAQTurnChanged = errors.New("FAQ evaluation interrupted by a changed user turn")
 
-const faqPreflightTimeout = 12 * time.Second
+const faqPreflightTimeout = 10 * time.Second
+
+func (s *sessionService) faqPreflightTimeout() time.Duration {
+	if s != nil && s.cfg != nil && s.cfg.Agent != nil && s.cfg.Agent.FAQPreflightTimeoutSeconds > 0 {
+		return time.Duration(s.cfg.Agent.FAQPreflightTimeoutSeconds) * time.Second
+	}
+	return faqPreflightTimeout
+}
+
+// agentFAQOutcome carries an evaluation from the preflight goroutine to the
+// AgentQA goroutine, which alone publishes it.
+type agentFAQOutcome struct {
+	evaluation *agentFAQEvaluation
+	err        error
+}
 
 type faqMatchUnavailableError struct{ cause error }
 
@@ -32,33 +46,70 @@ func (e *faqMatchUnavailableError) Unwrap() error        { return e.cause }
 func (e *faqMatchUnavailableError) Is(target error) bool { return target == errFAQMatchUnavailable }
 
 func (s *sessionService) tryAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (bool, error) {
-	// Requests that can never be answered directly skip the preflight cost.
-	if !faqDirectEligible(req, cfg, bus) || len(cfg.SearchTargets) == 0 || model == nil {
-		return false, nil
-	}
-	if err := ctx.Err(); err != nil {
+	evaluation, err := s.preflightAgentFAQ(ctx, req, cfg, bus, model, reranker, history)
+	if err != nil {
 		return false, err
 	}
-	evaluation := s.evaluateAgentFAQ(ctx, req, cfg, model, reranker, history)
 	return emitAgentFAQEvaluation(ctx, req, bus, evaluation)
 }
 
+// preflightAgentFAQ evaluates without publishing; nil means not eligible.
+func (s *sessionService) preflightAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (*agentFAQEvaluation, error) {
+	// Requests that can never be answered directly skip the preflight cost.
+	if !faqDirectEligible(req, cfg, bus) || !cfg.SearchTargets.MayContainFAQ() || model == nil {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.evaluateAgentFAQ(ctx, req, cfg, model, reranker, history), nil
+}
+
 func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, model chat.Chat, reranker rerank.Reranker, history []chat.Message) *agentFAQEvaluation {
+	started := time.Now()
 	evaluation := &agentFAQEvaluation{}
-	defer evaluation.captureUsage(cfg, model)
+	defer func() {
+		evaluation.captureUsage(cfg, model)
+		elapsed := time.Since(started)
+		outcome := evaluation.Outcome
+		if outcome == "" {
+			outcome = "miss"
+		}
+		modelID := evaluation.ModelID
+		if modelID == "" && model != nil {
+			modelID = model.GetModelID()
+		}
+		recordFAQPreflightMetric(outcome, modelID, elapsed)
+		if req == nil || req.Session == nil {
+			return
+		}
+		tokens := 0
+		if evaluation.Usage != nil {
+			tokens = evaluation.Usage.TotalTokens
+		}
+		logger.Infof(ctx, "FAQ preflight finished: session=%s user_message=%s message=%s outcome=%s duration_ms=%d tokens=%d",
+			req.Session.ID, req.UserMessageID, req.AssistantMessageID, outcome, elapsed.Milliseconds(), tokens)
+	}()
 	if !faqRequestEligible(req, cfg) || len(cfg.SearchTargets) == 0 || model == nil {
+		evaluation.Outcome = "skip_ineligible"
 		return evaluation
 	}
-	ctx, cancel := context.WithTimeout(ctx, faqPreflightTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.faqPreflightTimeout())
 	defer cancel()
 	defer func() {
 		if err := ctx.Err(); err != nil {
 			evaluation.Match, evaluation.Answer = nil, ""
+			if errors.Is(err, context.DeadlineExceeded) {
+				evaluation.Outcome = "err_timeout"
+			} else {
+				evaluation.Outcome = "err_interrupted"
+			}
 			evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		}
 	}()
 	evaluation.Query = req.Query
 	if err := faqEvaluationInterrupted(ctx, req); err != nil {
+		evaluation.Outcome = "err_interrupted"
 		evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		return evaluation
 	}
@@ -90,10 +141,13 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 	}
 	result, err := s.findAgentExactFAQs(ctx, query, cfg)
 	evaluation.observeSearch("faq_exact", query, result, err)
-	if err != nil || len(result.CompletedTargets) == 0 || len(result.Matches) > 0 {
-		cancelRewrite()
-	}
+	rawExact := err == nil && len(result.Candidates) == 1 && len(result.Matches) == 1
 	rewrite := rewriteResult{query: query}
+	if err != nil || len(result.CompletedTargets) == 0 || len(result.Matches) > 0 {
+		// The rewrite cannot change this outcome: drop it without waiting.
+		cancelRewrite()
+		rewritten = nil
+	}
 	if rewritten != nil {
 		select {
 		case rewrite = <-rewritten:
@@ -105,6 +159,11 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 		}
 	}
 	if err != nil || len(result.CompletedTargets) == 0 {
+		if err != nil {
+			evaluation.Outcome = "err_exact_search"
+		} else {
+			evaluation.Outcome = "miss_no_target"
+		}
 		return evaluation
 	}
 	if len(result.Matches) == 0 {
@@ -112,6 +171,7 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 			evaluation.observe("faq_rewrite", req.Query, nil, nil, rewrite.err)
 		}
 		if err := faqEvaluationInterrupted(ctx, req); err != nil {
+			evaluation.Outcome = "err_interrupted"
 			evaluation.observe("faq_interrupted", query, nil, nil, err)
 			return evaluation
 		}
@@ -120,12 +180,13 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 			result, err = s.findAgentExactFAQs(ctx, query, cfg)
 			evaluation.observeSearch("faq_exact", query, result, err)
 			if err != nil {
+				evaluation.Outcome = "err_exact_search"
 				return evaluation
 			}
 		}
 	}
 	evaluation.Query = query
-	s.evaluateAgentFAQCoverage(ctx, req, query, cfg, model, reranker, history, result.Matches, evaluation)
+	s.evaluateAgentFAQCoverage(ctx, req, query, cfg, model, reranker, history, result.Matches, rawExact, evaluation)
 	return evaluation
 }
 
@@ -145,9 +206,9 @@ func faqSearchQuery(ctx context.Context, cfg *types.AgentConfig, model chat.Chat
 	}
 	modelCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	response, err := model.Chat(types.WithLLMCallMetadata(modelCtx, "query_rewrite", ""),
+	response, err := model.Chat(types.WithLLMCallMetadata(modelCtx, "faq_query_rewrite", ""),
 		[]chat.Message{{Role: "system", Content: faqRewritePrompt}, {Role: "user", Content: string(input)}},
-		&chat.ChatOptions{Temperature: 0, MaxTokens: 150})
+		&chat.ChatOptions{Temperature: 0, MaxTokens: 150, Isolated: true})
 	if response != nil {
 		addFAQPreflightUsage(cfg, response.Usage)
 	}
@@ -204,7 +265,7 @@ func faqDirectEligible(req *types.QARequest, cfg *types.AgentConfig, bus *event.
 	return bus != nil && faqRequestEligible(req, cfg) &&
 		len(req.ImageURLs) == 0 && req.ImageDescription == "" && len(req.Attachments) == 0 && req.QuotedContext == "" &&
 		req.QuestionOrigin == nil && req.PageContext == nil &&
-		len(req.MCPServiceIDs) == 0 && !req.LocalBrowserEnabled && !(req.WebSearchEnabled && cfg.WebSearchEnabled) &&
+		len(req.MCPServiceIDs) == 0 && !req.LocalBrowserEnabled &&
 		len(cfg.PinnedSkillNames) == 0 &&
 		cfg.OperationsAgentID == ""
 }
@@ -253,7 +314,7 @@ func (s *sessionService) findAgentExactFAQs(ctx context.Context, query string, c
 func (s *sessionService) steerFAQ(req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) agent.SteerFAQFunc {
 	followup := *req
 	followup.Resume = nil
-	if !faqDirectEligible(&followup, cfg, bus) || len(cfg.SearchTargets) == 0 || model == nil {
+	if !faqDirectEligible(&followup, cfg, bus) || !cfg.SearchTargets.MayContainFAQ() || model == nil {
 		return nil
 	}
 	// The original question stays in the rewrite context on purpose: a steer
@@ -274,7 +335,9 @@ func (s *sessionService) steerFAQ(req *types.QARequest, cfg *types.AgentConfig, 
 		current.UserMessageID, current.Query = id, strings.Join(append(asks, query), "\n")
 		local := *cfg
 		local.FAQPreflightUsage = nil
+		local.FAQPreflightChecked = false
 		local.FAQPreflightQuestions = nil
+		local.FAQPreflightRejections = nil
 		evaluation := s.evaluateAgentFAQ(ctx, &current, &local, model, reranker, append(base[:len(base):len(base)], dialogue...))
 		if err := ctx.Err(); err != nil {
 			return agent.SteerFAQReply{}, err
@@ -282,6 +345,8 @@ func (s *sessionService) steerFAQ(req *types.QARequest, cfg *types.AgentConfig, 
 		if !faqTurnUnsteered(ctx, &current) {
 			return agent.SteerFAQReply{Usage: evaluation.Usage}, nil
 		}
-		return evaluation.reply(), nil
+		reply := evaluation.reply()
+		reply.Questions, reply.Rejections = local.FAQPreflightQuestions, local.FAQPreflightRejections
+		return reply, nil
 	}
 }

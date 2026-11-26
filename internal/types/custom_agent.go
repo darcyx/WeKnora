@@ -306,7 +306,9 @@ type CustomAgentConfig struct {
 	// FAQ direct answer threshold - if similarity > this value, use FAQ answer directly
 	FAQDirectAnswerThreshold float64 `yaml:"faq_direct_answer_threshold" json:"faq_direct_answer_threshold"`
 	// FAQ score boost multiplier - FAQ results score multiplied by this factor
-	FAQScoreBoost float64 `yaml:"faq_score_boost" json:"faq_score_boost"`
+	FAQScoreBoost       float64 `yaml:"faq_score_boost" json:"faq_score_boost"`
+	FAQPreflightModelID string  `yaml:"faq_preflight_model_id" json:"faq_preflight_model_id,omitempty"`
+	FAQPreflightPolicy  string  `yaml:"faq_preflight_policy" json:"faq_preflight_policy,omitempty"`
 
 	// ===== Web Search Settings =====
 	// Whether web search is enabled
@@ -359,6 +361,10 @@ type CustomAgentConfig struct {
 	FallbackStrategy string `yaml:"fallback_strategy" json:"fallback_strategy"`
 	// Fixed fallback response (when FallbackStrategy is "fixed")
 	FallbackResponse string `yaml:"fallback_response" json:"fallback_response"`
+	// FixedResponses maps short sentinel keys (e.g. "OOS", "NO_ANSWER") to exact
+	// verbatim responses. When the model emits [[FIXED:KEY]], the engine expands
+	// it deterministically at answer publication without leaking the sentinel.
+	FixedResponses map[string]string `yaml:"fixed_responses" json:"fixed_responses,omitempty"`
 	// Fallback prompt (when FallbackStrategy is "model")
 	FallbackPrompt string `yaml:"fallback_prompt" json:"fallback_prompt"`
 	// IntentPrompts holds per-intent system prompt overrides for non-retrieval

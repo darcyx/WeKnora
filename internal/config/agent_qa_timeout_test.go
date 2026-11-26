@@ -28,3 +28,26 @@ func TestAgentQATotalTimeoutConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentFAQPreflightModelEnvOverride(t *testing.T) {
+	t.Setenv("WEKNORA_AGENT_FAQ_PREFLIGHT_MODEL_ID", "  fast-faq-model-id  ")
+	t.Setenv("WEKNORA_AGENT_FAQ_PREFLIGHT_TIMEOUT", "4s")
+	cfg := &Config{}
+	if err := applyAgentEnvOverrides(cfg); err != nil {
+		t.Fatalf("applyAgentEnvOverrides: %v", err)
+	}
+	if cfg.Agent.FAQPreflightModelID != "fast-faq-model-id" {
+		t.Fatalf("FAQPreflightModelID=%q", cfg.Agent.FAQPreflightModelID)
+	}
+	if cfg.Agent.FAQPreflightTimeoutSeconds != 4 {
+		t.Fatalf("FAQPreflightTimeoutSeconds=%d", cfg.Agent.FAQPreflightTimeoutSeconds)
+	}
+	t.Setenv("WEKNORA_AGENT_FAQ_PREFLIGHT_TIMEOUT", "500ms")
+	cfgSub := &Config{}
+	if err := applyAgentEnvOverrides(cfgSub); err != nil {
+		t.Fatalf("applyAgentEnvOverrides sub-second: %v", err)
+	}
+	if cfgSub.Agent.FAQPreflightTimeoutSeconds != 0 {
+		t.Fatalf("sub-second FAQPreflightTimeoutSeconds=%d", cfgSub.Agent.FAQPreflightTimeoutSeconds)
+	}
+}

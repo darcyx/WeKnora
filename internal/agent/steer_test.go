@@ -2,13 +2,16 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
+	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -545,6 +548,88 @@ func TestAcceptedSteerChecksFAQOnceBeforeNextModelRound(t *testing.T) {
 			require.Equal(t, want, complete[0].FinalAnswer)
 			require.Equal(t, searches, search.calls)
 			require.Len(t, model.calls, rounds)
+		})
+	}
+}
+
+func TestSteerFAQRejectionReachesRunningTools(t *testing.T) {
+	engine := newTestEngine(t, &mockChat{})
+	engine.recordSteerMessage("u1", "是 iOS")
+	engine.pendingSteerFAQ = "u1"
+	rejection := types.FAQPreflightRejection{Question: "充值失败如何排查？", Reason: "只覆盖安卓"}
+	engine.SetSteerFAQ(func(context.Context, string, string, []chat.Message) (SteerFAQReply, error) {
+		return SteerFAQReply{Questions: []string{rejection.Question}, Rejections: map[string]types.FAQPreflightRejection{"faq-1": rejection}}, nil
+	})
+	state := &types.AgentState{}
+	answered, err := engine.finishSteerFAQ(t.Context(), state, "s")
+	require.NoError(t, err)
+	require.False(t, answered)
+	require.Equal(t, rejection, engine.config.FAQPreflightRejections["faq-1"], "read_document reads rejections from the running config")
+	require.Contains(t, engine.config.FAQPreflightQuestions, rejection.Question)
+}
+
+type steerFAQSearchStub struct {
+	interfaces.KnowledgeBaseService
+}
+
+func (steerFAQSearchStub) GetKnowledgeBasesByIDsOnly(context.Context, []string) ([]*types.KnowledgeBase, error) {
+	kb := &types.KnowledgeBase{ID: "kb", TenantID: 1, Type: types.KnowledgeBaseTypeFAQ}
+	kb.IndexingStrategy.VectorEnabled = true
+	return []*types.KnowledgeBase{kb}, nil
+}
+
+func (steerFAQSearchStub) ResolveEmbeddingModelKeys(context.Context, []*types.KnowledgeBase) map[string]string {
+	return nil
+}
+
+func (steerFAQSearchStub) HybridSearch(context.Context, string, types.SearchParams) ([]*types.SearchResult, error) {
+	return []*types.SearchResult{{ID: "faq-1", KnowledgeID: "doc-1", KnowledgeBaseID: "kb", Score: 0.9, ChunkType: "faq", Content: "排查步骤", ChunkMetadata: types.JSON(`{"standard_question":"充值问题","answers":["排查步骤"]}`)}}, nil
+}
+
+func TestSteerInvalidatesFAQFindingsInRunningSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fail  bool
+		reply SteerFAQReply
+	}{
+		{name: "no new candidate"},
+		{name: "different candidate", reply: SteerFAQReply{Rejections: map[string]types.FAQPreflightRejection{"faq-2": {Question: "其他问题", Reason: "新理由"}}}},
+		{name: "same candidate reviewed again", reply: SteerFAQReply{Rejections: map[string]types.FAQPreflightRejection{"faq-1": {Question: "充值问题", Reason: "新理由"}}}},
+		{name: "persist failed", fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEngine(t, &mockChat{})
+			targets := types.SearchTargets{{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb", TenantID: 1}}
+			search := agenttools.NewSearchKnowledgeTool(steerFAQSearchStub{}, nil, nil, targets, nil, nil)
+			e.toolRegistry = agenttools.NewToolRegistry()
+			e.toolRegistry.RegisterTool(search)
+			e.ApplyFAQPreflight(nil, []string{"充值问题"}, map[string]types.FAQPreflightRejection{"faq-1": {Question: "充值问题", Reason: "旧理由"}})
+			sink := &fakeSteerSink{queued: []map[string]interface{}{steerEntry("s1", "补充条件")}, failPersist: tc.fail}
+			e.SetSteerSink(sink)
+			e.SetSteerFAQ(func(context.Context, string, string, []chat.Message) (SteerFAQReply, error) { return tc.reply, nil })
+			state := &types.AgentState{}
+			var messages []chat.Message
+			e.drainSteerMessages(t.Context(), state, &messages, "s", "m")
+			_, err := e.finishSteerFAQ(t.Context(), state, "s")
+			require.NoError(t, err)
+			result, err := search.Execute(t.Context(), json.RawMessage(`{"query":"其他查询"}`))
+			require.NoError(t, err)
+			require.True(t, result.Success)
+			output := modelcontext.NewRegistry(true).ModelToolResultForTool(agenttools.ToolSearchKnowledge, result)
+			if tc.fail {
+				require.Contains(t, output, "旧理由")
+			} else {
+				require.NotContains(t, output, "旧理由")
+				require.Equal(t, tc.reply.Rejections, e.config.FAQPreflightRejections)
+				if tc.reply.Rejections["faq-1"].Reason != "" {
+					require.Contains(t, output, "新理由")
+				}
+			}
+			snapshot := e.faqPreflightSnapshot()
+			restored := newTestEngine(t, &mockChat{})
+			restored.ApplyFAQPreflight(nil, []string{"过期"}, map[string]types.FAQPreflightRejection{"stale": {Reason: "过期"}})
+			restored.restoreFAQPreflight(snapshot)
+			require.Equal(t, e.config.FAQPreflightRejections, restored.config.FAQPreflightRejections)
 		})
 	}
 }

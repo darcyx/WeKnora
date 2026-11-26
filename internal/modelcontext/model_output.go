@@ -71,7 +71,7 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		output = annotateSearchNotes(r.annotateModeFallbacks(output, result.Data), result.Data)
 		return r.annotateSkippedSearches(output, result.Data)
 	case "knowledge_chunks_list":
-		return r.modelKnowledgeChunksOutput(result.Data, result.Output)
+		return annotateSearchNotes(r.modelKnowledgeChunksOutput(result.Data, result.Output), result.Data)
 	case "document_info":
 		return r.modelDocumentInfoOutput(result.Data, result.Output)
 	case "graph_query_results":
@@ -263,7 +263,7 @@ func (r *sourceRegistry) modelKnowledgeOutput(mode string, rows []map[string]int
 	if len(chunks) == 0 {
 		return r.CompactKnownText(fallback)
 	}
-	return renderKnowledgeChunks(mode, chunks, nil)
+	return r.renderKnowledgeChunks(mode, chunks, nil)
 }
 
 // modelChunksFromRows registers every row's handles and converts it into the
@@ -447,10 +447,32 @@ func (r *sourceRegistry) annotateOmittedCandidates(output string, data map[strin
 	}
 	var b strings.Builder
 	for _, row := range mapsValue(data["omitted_candidates"]) {
+		kbID := stringValue(row, "knowledge_base_id")
+		kb := r.RegisterKnowledgeBase(kbID)
+		title := stringValue(row, "title")
+		if chunkID := stringValue(row, "chunk_id"); chunkID != "" {
+			chunkType := stringValue(row, "chunk_type")
+			chunkHandle := r.registerChunk(ChunkReference{
+				ChunkID:         chunkID,
+				KnowledgeID:     stringValue(row, "knowledge_id"),
+				KnowledgeBaseID: kbID,
+				DocumentTitle:   title,
+				ChunkType:       chunkType,
+			}, false)
+			if chunkHandle != "" {
+				if chunkType != "" {
+					fmt.Fprintf(&b, "  <chunk id=\"%s\" kb=\"%s\" title=\"%s\" type=\"%s\" view=\"candidate_only\" />\n",
+						escapeAttr(chunkHandle), escapeAttr(kb), escapeAttr(title), escapeAttr(chunkType))
+				} else {
+					fmt.Fprintf(&b, "  <chunk id=\"%s\" kb=\"%s\" title=\"%s\" view=\"candidate_only\" />\n",
+						escapeAttr(chunkHandle), escapeAttr(kb), escapeAttr(title))
+				}
+			}
+			continue
+		}
 		doc := r.RegisterDocument(stringValue(row, "knowledge_id"))
-		kb := r.RegisterKnowledgeBase(stringValue(row, "knowledge_base_id"))
 		if doc != "" {
-			fmt.Fprintf(&b, "  <document id=\"%s\" kb=\"%s\" title=\"%s\" view=\"candidate_only\" />\n", escapeAttr(doc), escapeAttr(kb), escapeAttr(stringValue(row, "title")))
+			fmt.Fprintf(&b, "  <document id=\"%s\" kb=\"%s\" title=\"%s\" view=\"candidate_only\" />\n", escapeAttr(doc), escapeAttr(kb), escapeAttr(title))
 		}
 	}
 	return strings.TrimSuffix(output, "</retrieval>") + b.String() + "</retrieval>"
@@ -467,6 +489,7 @@ func annotateSearchNotes(output string, data map[string]interface{}) string {
 	failures := stringSliceValue(data["partial_failures"])
 	stageFailures := stringSliceValue(data["stage_failures"])
 	rerankOutcome := stringValue(data, "rerank_outcome")
+	rejection := stringValue(data, "preflight_rejection_reason")
 	// retrieval_candidates is the candidate pool of the first ranked-filter
 	// stage that dropped anything (rerank, merge or FILTER_TOP_K), not the
 	// number of matches in the knowledge base, which retrieval never computes
@@ -475,10 +498,13 @@ func annotateSearchNotes(output string, data map[string]interface{}) string {
 	shown := intValue(data, "retrieval_shown")
 	candidates := intValue(data, "retrieval_candidates")
 	truncated := shown > 0 && candidates > shown
-	if (omitted <= 0 && len(failures) == 0 && len(stageFailures) == 0 && !truncated && rerankOutcome == "") || !strings.HasSuffix(output, "</retrieval>") {
+	if (omitted <= 0 && len(failures) == 0 && len(stageFailures) == 0 && !truncated && rerankOutcome == "" && rejection == "") || !strings.HasSuffix(output, "</retrieval>") {
 		return output
 	}
 	var b strings.Builder
+	if rejection != "" {
+		fmt.Fprintf(&b, "  <preflight_review>FAQ preflight did not approve verbatim reuse: %s</preflight_review>\n", escapeText(rejection))
+	}
 	if rerankOutcome != "" {
 		fmt.Fprintf(&b, "  <rerank outcome=\"%s\">Ranking or filtering was degraded. Retained passages may still be used, "+
 			"but this does not establish that no answer exists.</rerank>\n", escapeAttr(rerankOutcome))
@@ -568,6 +594,7 @@ func (r *sourceRegistry) modelKnowledgeChunksOutput(data map[string]interface{},
 		b.WriteString("<retrieval type=\"knowledge\" mode=\"deep_read\">\n")
 		fmt.Fprintf(&b, "  <document id=\"%s\" title=\"%s\"", escapeAttr(docHandle), escapeAttr(title))
 		if sourceURL := firstNonEmpty(stringValue(data, "source_url"), stringValue(data, "url")); sourceURL != "" {
+			r.RegisterReferenceURL(sourceURL)
 			fmt.Fprintf(&b, " source_url=\"%s\"", escapeAttr(sourceURL))
 		}
 		b.WriteString(">\n")
@@ -585,7 +612,7 @@ func (r *sourceRegistry) modelKnowledgeChunksOutput(data map[string]interface{},
 	if len(chunks) == 0 {
 		return r.CompactKnownText(fallback)
 	}
-	output := renderKnowledgeChunks("deep_read", chunks, info)
+	output := r.renderKnowledgeChunks("deep_read", chunks, info)
 	if info == nil {
 		// Legacy list_knowledge_chunks payloads carry no document header.
 		remaining := intValue(data, "total_chunks") - intValue(data, "fetched_chunks")
@@ -648,17 +675,22 @@ func writeDocumentInfo(b *strings.Builder, info map[string]interface{}) {
 	if len(metadata) > 0 {
 		keys := make([]string, 0, len(metadata))
 		for key := range metadata {
+			if key == "content" || key == "process_overrides" {
+				continue
+			}
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		var value strings.Builder
-		for i, key := range keys {
-			if i > 0 {
-				value.WriteString("; ")
+		if len(keys) > 0 {
+			var value strings.Builder
+			for i, key := range keys {
+				if i > 0 {
+					value.WriteString("; ")
+				}
+				fmt.Fprintf(&value, "%s: %v", key, metadata[key])
 			}
-			fmt.Fprintf(&value, "%s: %v", key, metadata[key])
+			writeDocumentMetadata(b, "      ", "metadata", value.String())
 		}
-		writeDocumentMetadata(b, "      ", "metadata", value.String())
 	}
 	b.WriteString("    </info>\n")
 }
@@ -672,7 +704,7 @@ func writeDocumentMetadata(b *strings.Builder, indent, tag, value string) {
 	fmt.Fprintf(b, ">%s</%s>\n", escapeText(value), tag)
 }
 
-func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]interface{}) string {
+func (r *sourceRegistry) renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]interface{}) string {
 	type docGroup struct {
 		handle    string
 		realID    string
@@ -706,6 +738,7 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 	sort.SliceStable(groups, func(i, j int) bool { return groups[i].order < groups[j].order })
 
 	var b strings.Builder
+	hasImageOCR := false
 	fmt.Fprintf(&b, "<retrieval type=\"knowledge\" mode=\"%s\">\n", escapeAttr(mode))
 	for _, group := range groups {
 		b.WriteString("  <document")
@@ -719,6 +752,7 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 			fmt.Fprintf(&b, " title=\"%s\"", escapeAttr(group.title))
 		}
 		if group.sourceURL != "" {
+			r.RegisterReferenceURL(group.sourceURL)
 			fmt.Fprintf(&b, " source_url=\"%s\"", escapeAttr(group.sourceURL))
 		}
 		b.WriteString(">\n")
@@ -729,6 +763,9 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 			writeDocumentInfo(&b, info)
 		}
 		for _, chunk := range group.chunks {
+			if chunk.chunkType == string(types.ChunkTypeImageOCR) {
+				hasImageOCR = true
+			}
 			fmt.Fprintf(&b, "    <chunk id=\"%s\" index=\"%d\" view=\"%s\"", chunk.handle, chunk.index, chunk.view)
 			if chunk.chunkType != "" {
 				fmt.Fprintf(&b, " type=\"%s\"", escapeAttr(chunk.chunkType))
@@ -764,6 +801,9 @@ func renderKnowledgeChunks(mode string, chunks []modelChunk, info map[string]int
 		}
 		b.WriteString("  </document>\n")
 	}
+	if hasImageOCR {
+		b.WriteString("  <note>Chunks with type=\"image_ocr\" are OCR text extracted from embedded images or screenshots and may contain UI menus, labels, or sample figures; prefer type=\"text\" prose for authoritative rules, specs, or metrics.</note>\n")
+	}
 	b.WriteString("</retrieval>")
 	return b.String()
 }
@@ -789,6 +829,7 @@ func (r *sourceRegistry) modelWebSearchOutput(rows []map[string]interface{}, fal
 			continue
 		}
 		handle := r.RegisterWeb(rawURL, stringValue(row, "title"))
+		r.RegisterReferenceURL(rawURL)
 		fmt.Fprintf(&b, "  <page id=\"%s\" title=\"%s\">\n", handle, escapeAttr(stringValue(row, "title")))
 		b.WriteString("    <evidence type=\"search_summary\" verified=\"false\" />\n")
 		if u, err := url.Parse(rawURL); err == nil {
@@ -849,11 +890,11 @@ func (r *sourceRegistry) modelWebFetchOutput(rows []map[string]interface{}, fall
 			continue
 		}
 		title := stringValue(row, "title")
-		handle := r.RegisterWeb(rawURL, title)
 		status := stringValue(row, "status")
 		if status == "" {
 			status = "success"
 		}
+		handle := r.registerWeb(rawURL, title, status == "success")
 		if handle == "" {
 			// Unknown references must not become page IDs: a later real page may
 			// legitimately receive that ID in this registry.
@@ -865,6 +906,7 @@ func (r *sourceRegistry) modelWebFetchOutput(rows []map[string]interface{}, fall
 			fmt.Fprintf(&b, " title=\"%s\"", escapeAttr(title))
 		}
 		if status == "success" {
+			r.RegisterReferenceURL(rawURL)
 			b.WriteString(" view=\"excerpt\">\n")
 			writeWebPageFileHint(&b, row)
 			remainingEvidence := perPage

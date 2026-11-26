@@ -748,6 +748,14 @@ export default {
       hint: '비워두거나 0이면 기본값(120초)을 사용합니다',
       placeholder: '초 단위로 입력하세요. 권장 범위 60-1800'
     },
+    faqPreflight: {
+      modelLabel: 'FAQ 프리플라이트 빠른 모델',
+      modelDesc: 'FAQ 프리플라이트 판정에 사용할 대화 모델입니다. 비워두면 시스템 기본값을 사용합니다',
+      modelPlaceholder: '모델 선택 (비워두면 시스템 기본값)',
+      policyLabel: 'FAQ 프리플라이트 직접 응답 규칙',
+      policyDesc: 'FAQ 프리플라이트 일치 시 직접 응답에 적용할 선택 규칙입니다. 비워두면 시스템 프롬프트로 폴백합니다',
+      policyPlaceholder: '비워두면 시스템 프롬프트로 폴백합니다'
+    },
     mcp: {
       label: 'MCP 서비스',
       desc: 'Agent가 호출할 수 있는 MCP 서비스를 선택하세요',

@@ -126,6 +126,7 @@ type AgentConfig struct {
 	QueryUnderstandModelID      string                    `json:"query_understand_model_id,omitempty"`
 	FallbackStrategy            string                    `json:"fallback_strategy"`
 	FallbackResponse            string                    `json:"fallback_response"`
+	FixedResponses              map[string]string         `json:"fixed_responses,omitempty"`
 	FallbackPrompt              string                    `json:"fallback_prompt"`
 	QuestionSuggestions         *QuestionSuggestionConfig `json:"question_suggestions,omitempty"`
 

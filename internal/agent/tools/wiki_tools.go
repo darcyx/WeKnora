@@ -331,6 +331,8 @@ const (
 	// tokens per read; the rest are summarised by a single omission note.
 	wikiMaxLinkSlugs = 15
 
+	wikiMaxBudgetSources = 5
+
 	// wikiMinPageBody is the smallest body slice worth rendering. When the
 	// budget cannot give every resolved page at least this much, trailing pages
 	// are named in <omitted_pages> instead of being cut mid-tag: a half-rendered
@@ -390,12 +392,13 @@ const (
 // pendingWikiPage is a resolved page whose neighbour summaries, sources and
 // body have been gathered but whose rendered size is not yet decided.
 type pendingWikiPage struct {
-	page     *types.WikiPage
-	kbID     string
-	outLinks []string
-	inLinks  []string
-	sources  []string
-	body     string
+	page      *types.WikiPage
+	kbID      string
+	outLinks  []string
+	inLinks   []string
+	sources   []string
+	sourceIDs []string
+	body      string
 }
 
 func (p pendingWikiPage) render(body string) string {
@@ -443,9 +446,9 @@ func (p pendingWikiPage) render(body string) string {
 //
 // It returns the joined output plus the slugs whose body was trimmed and the
 // slugs that were not rendered at all.
-func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (string, []string, []string) {
+func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, []string, []string, []renderedWikiPage) {
 	if len(pages) == 0 {
-		return "", nil, nil
+		return "", nil, nil, nil
 	}
 
 	const separator = "\n\n"
@@ -463,18 +466,9 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (
 		total += size
 	}
 
-	usable := budget - reserve
-	if usable <= 0 {
-		// No room for a page at all: name them all as omitted rather than hand
-		// back an oversized render for the registry to cut mid-tag.
-		omitted := make([]string, 0, len(pages))
-		for _, p := range pages {
-			omitted = append(omitted, p.page.Slug)
-		}
-		return "", nil, omitted
-	}
-	if total <= usable {
-		return strings.Join(rendered, separator), nil, nil
+	usable := budget - wikiBudgetReserve
+	if usable <= 0 || total <= usable {
+		return strings.Join(rendered, separator), nil, nil, renderedWikiPages(pages, rendered)
 	}
 
 	// Relationships can be much larger than the page itself. Reserve space for
@@ -492,8 +486,10 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (
 			p.inLinks = []string{"(relationships omitted for output budget)"}
 		}
 		if overhead() > maxOverhead {
-			if len(p.sources) > 1 {
-				p.sources = []string{p.sources[0], "(additional sources omitted for output budget)"}
+			if len(p.sources) > wikiMaxBudgetSources {
+				omittedCount := len(p.sources) - wikiMaxBudgetSources
+				p.sources = append(append([]string(nil), p.sources[:wikiMaxBudgetSources]...), fmt.Sprintf("(+%d more sources omitted for output budget)", omittedCount))
+				p.sourceIDs = p.sourceIDs[:min(len(p.sourceIDs), wikiMaxBudgetSources)]
 			}
 		}
 		if overhead() > maxOverhead {
@@ -503,6 +499,12 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (
 				page.Aliases = page.Aliases[:3]
 			}
 			p.page = &page
+		}
+		if overhead() > maxOverhead {
+			if len(p.sources) > 1 {
+				p.sources = []string{p.sources[0], "(additional sources omitted for output budget)"}
+				p.sourceIDs = p.sourceIDs[:min(len(p.sourceIDs), 1)]
+			}
 		}
 	}
 
@@ -551,7 +553,23 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (
 		outputs[i] = pages[i].render(body)
 		truncated = append(truncated, pages[i].page.Slug)
 	}
-	return strings.Join(outputs, separator), truncated, omitted
+	return strings.Join(outputs, separator), truncated, omitted, renderedWikiPages(pages[:keep], outputs)
+}
+
+type renderedWikiPage struct {
+	start, end int
+	sourceIDs  []string
+}
+
+func renderedWikiPages(pages []pendingWikiPage, outputs []string) []renderedWikiPage {
+	rendered := make([]renderedWikiPage, 0, len(pages))
+	start := 0
+	for i, page := range pages {
+		end := start + utf8.RuneCountInString(outputs[i])
+		rendered = append(rendered, renderedWikiPage{start: start, end: end, sourceIDs: page.sourceIDs})
+		start = end + 2 // The page separator is two runes.
+	}
+	return rendered
 }
 
 // wikiReadPageTrailers renders the trailers appended after the pages: the slugs
@@ -836,7 +854,8 @@ func NewWikiReadPageTool(
 	return &wikiReadPageTool{
 		BaseTool: NewBaseTool(
 			ToolWikiReadPage,
-			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, and links.
+			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, links, and <sources>.
+Each page's <sources> lists its underlying source documents with doc://N handles and titles; when a wiki page summarizes or references a source document without full parameter, procedure, or condition details, call read_document(id="doc://N", query=...) directly to inspect the source.
 Use the exact slug from the wiki directory or the target of a returned [[slug|title]] link.
 Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned. If the intended knowledge base is known, pass knowledge_base_ids to return only pages from those allowed knowledge bases; duplicates of the slug in other allowed knowledge bases are still reported as a note.`,
 			json.RawMessage(`{
@@ -864,6 +883,39 @@ Knowledge-base routing is automatic. Known link/search provenance is preferred; 
 // slugs from different KBs are not collapsed into a single "already seen" entry.
 func seenLinkKey(kbID, slug string) string {
 	return kbID + "\x00" + slug
+}
+
+func resolveWikiSourceTitles(
+	ctx context.Context,
+	knowledgeService interfaces.KnowledgeService,
+	ids []string,
+) map[string]string {
+	if knowledgeService == nil || len(ids) == 0 {
+		return nil
+	}
+	uniqueIDs := dedupNonEmptyStrings(ids)
+	if len(uniqueIDs) == 0 {
+		return nil
+	}
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	docs, err := knowledgeService.GetKnowledgeBatchWithSharedAccess(ctx, tenantID, uniqueIDs)
+	if err != nil || len(docs) == 0 {
+		return nil
+	}
+	titles := make(map[string]string, len(docs))
+	for _, doc := range docs {
+		if doc == nil || doc.ID == "" {
+			continue
+		}
+		title := strings.TrimSpace(doc.Title)
+		if title == "" {
+			title = strings.TrimSpace(doc.FileName)
+		}
+		if title != "" {
+			titles[doc.ID] = title
+		}
+	}
+	return titles
 }
 
 func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
@@ -967,7 +1019,7 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 	// resolvePage gathers everything needed to render a page except its final
 	// size. Rendering is deferred until every requested slug has been resolved
 	// so the output budget can be shared across the whole batch.
-	resolvePage := func(page *types.WikiPage, kbID string) pendingWikiPage {
+	resolvePage := func(page *types.WikiPage, kbID string, sourceTitles map[string]string) pendingWikiPage {
 		resolved := pendingWikiPage{
 			page:     page,
 			kbID:     kbID,
@@ -985,11 +1037,15 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 			if kid == "" {
 				continue
 			}
-			if title != "" {
-				resolved.sources = append(resolved.sources, fmt.Sprintf(`<source knowledge_id="%s">%s</source>`, kid, title))
-			} else {
-				resolved.sources = append(resolved.sources, fmt.Sprintf(`<source knowledge_id="%s"/>`, kid))
+			if title == "" && sourceTitles != nil {
+				title = sourceTitles[kid]
 			}
+			if title != "" {
+				resolved.sources = append(resolved.sources, fmt.Sprintf(`<source knowledge_id="%s">%s</source>`, xmlEscape(kid), xmlEscape(title)))
+			} else {
+				resolved.sources = append(resolved.sources, fmt.Sprintf(`<source knowledge_id="%s"/>`, xmlEscape(kid)))
+			}
+			resolved.sourceIDs = append(resolved.sourceIDs, kid)
 		}
 
 		// Index page special-case. wiki_pages.content used to hold
@@ -1022,11 +1078,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 	if t.knowledgeService != nil {
 		fetchTags = t.knowledgeService.GetKnowledgeTags
 	}
+	type matchedWikiPage struct {
+		page *types.WikiPage
+		kbID string
+	}
+	var allHits []matchedWikiPage
 	for _, slug := range slugsToFetch {
-		var hits []struct {
-			page *types.WikiPage
-			kbID string
-		}
+		var hits []matchedWikiPage
 		cachedScopes := t.routes.scopesForSlug(slug, scopes)
 		// Provenance is an ordering hint, never an authority boundary. Always
 		// inspect every legal scope so a cached hit cannot hide a duplicate slug
@@ -1079,10 +1137,7 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 					continue
 				}
 
-				hits = append(hits, struct {
-					page *types.WikiPage
-					kbID string
-				}{page, actualKBID})
+				hits = append(hits, matchedWikiPage{page, actualKBID})
 				t.routes.rememberPage(page, actualKBID)
 				foundKBs[slug] = append(foundKBs[slug], actualKBID)
 				// Also register the page's neighbours so that when the model
@@ -1112,16 +1167,27 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 
 		// When routing remains ambiguous, emit every matched page so the model
 		// can use or compare them explicitly.
-		for _, h := range hits {
-			pending = append(pending, resolvePage(h.page, h.kbID))
+		allHits = append(allHits, hits...)
+	}
+
+	var missingSourceIDs []string
+	for _, h := range allHits {
+		for _, ref := range h.page.SourceRefs {
+			if kid, title := types.ParseWikiSourceRef(ref); kid != "" && title == "" {
+				missingSourceIDs = append(missingSourceIDs, kid)
+			}
 		}
+	}
+	sourceTitles := resolveWikiSourceTitles(ctx, t.knowledgeService, missingSourceIDs)
+	for _, h := range allHits {
+		pending = append(pending, resolvePage(h.page, h.kbID, sourceTitles))
 	}
 
 	if len(pending) == 0 {
 		return &types.ToolResult{Success: false, Error: strings.Join(errs, "; ")}, nil
 	}
 
-	finalOutput, truncatedSlugs, omittedSlugs := renderWikiPagesWithinBudget(pending, OutputBudget(ctx))
+	finalOutput, truncatedSlugs, omittedSlugs, renderedPages := renderWikiPagesWithinBudget(pending, OutputBudget(ctx))
 	if len(omittedSlugs) > 0 {
 		hint := "Read the needed page again with knowledge_base_ids limited to its known allowed knowledge base."
 		if len(slugsToFetch) > 1 {
@@ -1176,15 +1242,38 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		}
 	}
 
+	publishedSourceIDs := make([]string, 0)
+	publishedSources := make([]types.PublishedSourceRef, 0)
+	seenSourceID := make(map[string]bool)
+	// Match the registry's head/tail truncation using page offsets recorded at rendering time.
+	n := utf8.RuneCountInString(finalOutput)
+	head, tailSize := toolOutputWindows(n, OutputBudget(ctx))
+	tail := n - tailSize
+	for _, page := range renderedPages {
+		if page.end > head && page.start < tail {
+			continue
+		}
+		for _, kid := range page.sourceIDs {
+			if kid == "" || seenSourceID[kid] {
+				continue
+			}
+			seenSourceID[kid] = true
+			publishedSourceIDs = append(publishedSourceIDs, kid)
+			publishedSources = append(publishedSources, types.PublishedSourceRef{ID: kid, Citable: false})
+		}
+	}
+
 	return &types.ToolResult{
-		Success: true,
-		Output:  finalOutput,
+		Success:          true,
+		Output:           finalOutput,
+		PublishedSources: publishedSources,
 		Data: map[string]interface{}{
-			"found_kbs":       foundKBs,
-			"ambiguous_slugs": ambiguous,
-			"truncated_slugs": truncatedSlugs,
-			"omitted_slugs":   omittedSlugs,
-			"unrequested_kbs": alsoIn,
+			"found_kbs":            foundKBs,
+			"ambiguous_slugs":      ambiguous,
+			"truncated_slugs":      truncatedSlugs,
+			"omitted_slugs":        omittedSlugs,
+			"unrequested_kbs":      alsoIn,
+			"source_knowledge_ids": publishedSourceIDs,
 		},
 	}, nil
 }
@@ -1454,8 +1543,9 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 		output += "\n\n<errors>\n" + strings.Join(searchErrors, "\n") + "\n</errors>"
 	}
 	return &types.ToolResult{
-		Success: true,
-		Output:  output,
+		Success:          true,
+		Output:           output,
+		PublishedSources: []types.PublishedSourceRef{},
 		Data: map[string]interface{}{
 			"found_kbs": foundKBs,
 		},

@@ -216,14 +216,12 @@ func (t *ReadDocumentTool) resolveTarget(ctx context.Context, id string) (*types
 	if authErr != nil {
 		return nil, nil, fmt.Errorf("chunk is not accessible: %w", authErr)
 	}
-	knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, authorizedChunk.KnowledgeID)
-	if err != nil || knowledge == nil {
-		// The chunk is authorized; a missing parent row only costs the header.
-		knowledge = &types.Knowledge{
-			ID:              authorizedChunk.KnowledgeID,
-			TenantID:        authorizedChunk.TenantID,
-			KnowledgeBaseID: authorizedChunk.KnowledgeBaseID,
-		}
+	knowledge, err := authorizeKnowledgeInSearchTargets(ctx, t.searchTargets, authorizedChunk.KnowledgeID, t.knowledgeService)
+	if err != nil {
+		return nil, nil, fmt.Errorf("document is not accessible: %w", err)
+	}
+	if knowledge.KnowledgeBaseID != authorizedChunk.KnowledgeBaseID {
+		return nil, nil, fmt.Errorf("chunk %s has an inconsistent document scope", authorizedChunk.ID)
 	}
 	return knowledge, authorizedChunk, nil
 }
@@ -340,9 +338,10 @@ func (t *ReadDocumentTool) readPage(
 		data["next_offset"] = next
 	}
 	return &types.ToolResult{
-		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, "", ""),
-		Data:    data,
+		Success:          true,
+		Output:           t.buildOutput(knowledge, total, rows, "", ""),
+		Data:             data,
+		PublishedSources: publishedReadSources(knowledge, rows),
 	}, nil
 }
 
@@ -396,9 +395,10 @@ func (t *ReadDocumentTool) readAroundChunk(
 		data["faq_question"] = q
 	}
 	return &types.ToolResult{
-		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, "", ""),
-		Data:    data,
+		Success:          true,
+		Output:           t.buildOutput(knowledge, total, rows, "", ""),
+		Data:             data,
+		PublishedSources: publishedReadSources(knowledge, rows),
 	}, nil
 }
 
@@ -480,7 +480,7 @@ scan:
 			bestTerms = max(bestTerms, terms)
 			if terms >= minTerms {
 				snippet := extractChunkMatchSnippet(c, matchers)
-				cost := readDocumentRowCost(c, content) + escapedRunes(snippet)
+				cost := readDocumentRowCost(c) + escapedRunes(snippet)
 				// Keep the first match even if it is oversized so the cursor advances.
 				if matchCount >= readDocumentMaxMatches || (matchCount > 0 && used+cost > budget) {
 					truncated = true
@@ -489,7 +489,7 @@ scan:
 				}
 				matchCount++
 				if prev != nil && !emitted[prev.ID] {
-					prevCost := readDocumentRowCost(prev, enrichChunkContent(prev))
+					prevCost := readDocumentRowCost(prev)
 					if used+prevCost+cost <= budget {
 						emit(readChunkRow{chunk: prev, role: "context_before"}, prevCost)
 					}
@@ -499,7 +499,7 @@ scan:
 				}
 				forceNext = true
 			} else if forceNext {
-				if cost := readDocumentRowCost(c, content); !emitted[c.ID] && used+cost <= budget {
+				if cost := readDocumentRowCost(c); !emitted[c.ID] && used+cost <= budget {
 					emit(readChunkRow{chunk: c, role: "context_after"}, cost)
 				}
 				forceNext = false
@@ -526,20 +526,43 @@ scan:
 		queryNote = fmt.Sprintf("No chunk contains every query word; matches contain %d of %d.", minTerms, len(matchers))
 	}
 	return &types.ToolResult{
-		Success: true,
-		Output:  t.buildOutput(knowledge, total, rows, query, queryNote),
-		Data:    data,
+		Success:          true,
+		Output:           t.buildOutput(knowledge, total, rows, query, queryNote),
+		Data:             data,
+		PublishedSources: publishedReadSources(knowledge, rows),
 	}, bestTerms, nil
 }
 
-func readDocumentRowCost(chunk *types.Chunk, content string) int {
-	cost := utf8.RuneCountInString(xmlEscape(content)) + readDocumentChunkOverhead
+func publishedReadSources(knowledge *types.Knowledge, rows []readChunkRow) []types.PublishedSourceRef {
+	refs := []types.PublishedSourceRef{{ID: knowledge.ID, Citable: len(rows) > 0}}
+	for _, row := range rows {
+		refs = append(refs, types.PublishedSourceRef{ID: row.chunk.ID, Citable: true})
+	}
+	return refs
+}
+
+func readDocumentRowCost(chunk *types.Chunk) int {
+	cost := utf8.RuneCountInString(xmlEscape(chunk.Content)) + readDocumentChunkOverhead
 	// FAQ answers render from metadata even with question-only indexing.
 	if chunk.ChunkType == types.ChunkTypeFAQ {
 		if meta, err := chunk.FAQMetadata(); err == nil && meta != nil {
 			cost += utf8.RuneCountInString(xmlEscape(meta.StandardQuestion)) + len("      <question></question>\n")
 			for _, answer := range meta.Answers {
 				cost += utf8.RuneCountInString(xmlEscape(answer)) + len("      <answer></answer>\n")
+			}
+		}
+	}
+	// Model rendering (modelcontext.renderKnowledgeChunks) emits only "![caption](url)\n"
+	// per image, not raw image_ocr text. Charging unrendered OCR against the page
+	// budget forces screenshot-heavy docs into unnecessary 1-chunk serial pagination.
+	if chunk.ImageInfo != "" {
+		var imgInfos []types.ImageInfo
+		if err := json.Unmarshal([]byte(chunk.ImageInfo), &imgInfos); err == nil {
+			for _, img := range imgInfos {
+				if strings.TrimSpace(img.URL) == "" {
+					continue
+				}
+				cost += len("      ![]()\n") + utf8.RuneCountInString(img.Caption) + utf8.RuneCountInString(img.URL)
 			}
 		}
 	}
@@ -553,7 +576,7 @@ func readDocumentRowCost(chunk *types.Chunk, content string) int {
 func fitChunksToBudget(chunks []*types.Chunk, budget int) []*types.Chunk {
 	used := 0
 	for i, c := range chunks {
-		used += readDocumentRowCost(c, enrichChunkContent(c))
+		used += readDocumentRowCost(c)
 		if used > budget && i > 0 {
 			return chunks[:i]
 		}

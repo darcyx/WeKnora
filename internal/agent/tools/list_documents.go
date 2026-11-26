@@ -113,6 +113,7 @@ func (t *ListDocumentsTool) Execute(ctx context.Context, args json.RawMessage) (
 	}
 
 	documents := make([]map[string]interface{}, 0, len(filtered))
+	publishedSources := make([]types.PublishedSourceRef, 0, len(filtered))
 	var b strings.Builder
 	fmt.Fprintf(&b, "<documents knowledge_base_id=\"%s\" total=\"%d\" page=\"%d\" page_size=\"%d\"",
 		xmlEscape(kbID), total, page, pageSize)
@@ -121,6 +122,7 @@ func (t *ListDocumentsTool) Execute(ctx context.Context, args json.RawMessage) (
 	}
 	b.WriteString(">\n")
 	for _, k := range filtered {
+		publishedSources = append(publishedSources, types.PublishedSourceRef{ID: k.ID})
 		fmt.Fprintf(&b, "<document knowledge_id=\"%s\" title=\"%s\"", xmlEscape(k.ID), xmlEscape(k.Title))
 		if k.FileType != "" {
 			fmt.Fprintf(&b, " file_type=\"%s\"", xmlEscape(k.FileType))
@@ -177,7 +179,7 @@ func (t *ListDocumentsTool) Execute(ctx context.Context, args json.RawMessage) (
 			output = fmt.Sprintf("Knowledge base %s has no documents.", kbID)
 		}
 	}
-	return &types.ToolResult{Success: true, Output: output, Data: data}, nil
+	return &types.ToolResult{Success: true, Output: output, Data: data, PublishedSources: publishedSources}, nil
 }
 
 // listDocumentsScopeCap bounds how many tagged documents are loaded when a

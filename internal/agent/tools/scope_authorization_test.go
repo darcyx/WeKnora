@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -11,6 +12,7 @@ import (
 type scopeKnowledgeService struct {
 	interfaces.KnowledgeService
 	knowledge *types.Knowledge
+	err       error
 	tags      map[string][]*types.KnowledgeTag
 }
 
@@ -24,7 +26,7 @@ func (s *scopeChunkService) GetChunkByIDOnly(context.Context, string) (*types.Ch
 }
 
 func (s *scopeKnowledgeService) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
-	return s.knowledge, nil
+	return s.knowledge, s.err
 }
 
 func (s *scopeKnowledgeService) GetKnowledgeTags(
@@ -106,6 +108,50 @@ func TestAuthorizeChunkInSearchTargetsRejectsDisabledFAQ(t *testing.T) {
 		context.Background(), targets, "faq-1", chunkService, knowledgeService,
 	); err == nil {
 		t.Fatal("disabled FAQ chunk must not be authorized for Agent tools")
+	}
+}
+
+func TestAuthorizeKnowledgeInSearchTargetsRejectsDisabledDocument(t *testing.T) {
+	service := &scopeKnowledgeService{knowledge: &types.Knowledge{
+		ID: "doc-old", KnowledgeBaseID: "kb-1", EnableStatus: "disabled",
+	}}
+	targets := types.SearchTargets{{
+		Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1",
+	}}
+	if _, err := authorizeKnowledgeInSearchTargets(context.Background(), targets, "doc-old", service); err == nil {
+		t.Fatal("disabled document must not be authorized for direct read by Agent tools")
+	}
+}
+
+func TestAuthorizeChunkInSearchTargetsRejectsDisabledParentDocument(t *testing.T) {
+	chunkService := &scopeChunkService{chunk: &types.Chunk{
+		ID: "chunk-1", KnowledgeID: "doc-old", KnowledgeBaseID: "kb-1",
+		ChunkType: types.ChunkTypeText, IsEnabled: true,
+	}}
+	knowledgeService := &scopeKnowledgeService{knowledge: &types.Knowledge{
+		ID: "doc-old", KnowledgeBaseID: "kb-1", EnableStatus: "disabled",
+	}}
+	targets := types.SearchTargets{{
+		Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1",
+	}}
+	if _, err := authorizeChunkInSearchTargets(context.Background(), targets, "chunk-1", chunkService, knowledgeService); err == nil {
+		t.Fatal("chunk whose parent document is disabled must not be authorized")
+	}
+}
+
+func TestAuthorizeChunkInSearchTargetsRequiresParentDocument(t *testing.T) {
+	chunkService := &scopeChunkService{chunk: &types.Chunk{
+		ID: "chunk-1", KnowledgeID: "doc-1", KnowledgeBaseID: "kb-1", IsEnabled: true,
+	}}
+	targets := types.SearchTargets{{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1"}}
+	for _, service := range []*scopeKnowledgeService{
+		{},
+		{err: errors.New("database unavailable")},
+		{knowledge: &types.Knowledge{ID: "doc-1", KnowledgeBaseID: "kb-2"}},
+	} {
+		if _, err := authorizeChunkInSearchTargets(context.Background(), targets, "chunk-1", chunkService, service); err == nil {
+			t.Fatal("chunk must not be authorized without a matching accessible parent")
+		}
 	}
 }
 

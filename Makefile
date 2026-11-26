@@ -1,4 +1,4 @@
-.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs docs-check install-swagger build-lite run-lite package-lite anydoc-lib build-anydoc
+.PHONY: help build run test test-local clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs docs-check install-swagger build-lite run-lite package-lite anydoc-lib build-anydoc
 
 # Show help
 help:
@@ -8,6 +8,7 @@ help:
 	@echo "  build             构建应用"
 	@echo "  run               运行应用"
 	@echo "  test              运行测试"
+	@echo "  test-local        无代理运行核心包及 FAQ 预检回归单测 (-race)"
 	@echo "  anydoc-lib        构建 anydoc 静态库（需要 Rust 工具链）"
 	@echo "  build-anydoc      构建带 anydoc 解析引擎的应用"
 	@echo "  clean             清理构建文件"
@@ -113,6 +114,13 @@ run: build
 test:
 	bash scripts/docker-entrypoint_test.sh
 	go test -v ./...
+
+# Run core local tests with proxy environment variables cleared to avoid SSRF false positives
+test-local:
+	HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= NO_PROXY=* \
+		go test -race ./internal/config/... ./internal/types/... ./internal/agent/...
+	HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= NO_PROXY=* \
+		go test -race ./internal/application/service -run 'Test(FAQ|AgentQA|ResolveFAQ)'
 
 # Generate reviewed metadata + protocol overrides, then verify every model.
 .PHONY: model-catalog-generate model-catalog-check
@@ -282,6 +290,20 @@ fmt:
 # Lint code
 lint:
 	golangci-lint run
+
+# Ratchet comment lines in internal/application/service against .comment-baseline.json
+.PHONY: lint-comments pre-commit test-model-contract
+lint-comments:
+	go run ./cmd/nocomment
+
+test-model-contract:
+	go test ./internal/models/parity/...
+
+# Local pre-commit gate: Swagger sync, optional comment ratchet, and agent contracts
+pre-commit: docs-check
+	@if ls cmd/nocomment/*.go >/dev/null 2>&1; then $(MAKE) lint-comments; else echo "Skipping lint-comments: cmd/nocomment source is absent"; fi
+	go test ./internal/agent/... ./internal/modelcontext/...
+	go test ./internal/application/service -run 'Test(FAQ|AgentQAJoinsParallelFAQPreflight|AgentQACleansEngineWhenRetrievalBindFails)' -count=1
 
 # Install dependencies
 deps:

@@ -135,6 +135,15 @@ func usableSkillRow(row *types.TenantSkillEntity) bool {
 		sandbox.IsValidSkillName(row.Name)
 }
 
+// requiredToolsFor reads persisted RequiredTools metadata directly from the row
+// so request-time skill discovery never downloads ZIP archives from storage.
+func (s *TenantSkillSource) requiredToolsFor(row *types.TenantSkillEntity) []string {
+	if row == nil || len(row.RequiredTools) == 0 {
+		return nil
+	}
+	return append([]string(nil), row.RequiredTools...)
+}
+
 // DiscoverSkills returns Level 1 metadata for every usable skill.
 func (s *TenantSkillSource) DiscoverSkills() ([]*SkillMetadata, error) {
 	metadata := make([]*SkillMetadata, 0, len(s.order))
@@ -145,9 +154,10 @@ func (s *TenantSkillSource) DiscoverSkills() ([]*SkillMetadata, error) {
 			return nil, err
 		}
 		metadata = append(metadata, &SkillMetadata{
-			Name:        row.Name,
-			Description: row.Description,
-			BasePath:    basePath,
+			Name:          row.Name,
+			Description:   row.Description,
+			BasePath:      basePath,
+			RequiredTools: s.requiredToolsFor(row),
 		})
 	}
 	return metadata, nil
@@ -164,12 +174,13 @@ func (s *TenantSkillSource) LoadSkillInstructions(name string) (*Skill, error) {
 		return nil, err
 	}
 	return &Skill{
-		Name:         row.Name,
-		Description:  row.Description,
-		BasePath:     basePath,
-		FilePath:     path.Join(basePath, SkillFileName),
-		Instructions: row.Instructions,
-		Loaded:       true,
+		Name:          row.Name,
+		Description:   row.Description,
+		RequiredTools: s.requiredToolsFor(row),
+		BasePath:      basePath,
+		FilePath:      path.Join(basePath, SkillFileName),
+		Instructions:  row.Instructions,
+		Loaded:        true,
 	}, nil
 }
 

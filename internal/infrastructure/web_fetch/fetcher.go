@@ -79,7 +79,8 @@ const (
 	ErrorUnsupportedContent ErrorCode = "unsupported_content"
 	ErrorSnapshotExpired    ErrorCode = "snapshot_expired"
 	// ErrorProviderAuth means the fetch provider rejected WeKnora's credentials, not the page.
-	ErrorProviderAuth ErrorCode = "provider_auth_failed"
+	ErrorProviderAuth  ErrorCode = "provider_auth_failed"
+	ErrorProviderFetch ErrorCode = "provider_fetch_failed"
 )
 
 // FetchError carries stable, machine-readable failure details.

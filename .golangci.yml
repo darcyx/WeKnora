@@ -15,6 +15,11 @@ linters:
       # stay on one line.
       - linters: [lll]
         source: '^\s*// @(Param|Success|Failure|x-)|(swaggertype|extensions):"'
+      # comments are banned in the service layer (see cmd/nocomment), so
+      # revive must not demand doc comments there.
+      - linters: [revive]
+        path: ^internal/application/service/
+        text: 'exported|package-comments'
 formatters:
   enable:
     - gofmt

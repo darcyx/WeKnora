@@ -234,10 +234,12 @@ func (s *wikiIngestService) newWikiBatchContext(
 	}
 
 	granularity := types.WikiExtractionStandard
+	maxPagesPerIngest := 0
 	contentInstructions := ""
 	extractionInstructions := ""
 	if wikiConfig != nil {
 		granularity = wikiConfig.ExtractionGranularity.Normalize()
+		maxPagesPerIngest = wikiConfig.MaxPagesPerIngest
 		contentInstructions = wikiConfig.ContentInstructions
 		extractionInstructions = wikiConfig.ExtractionInstructions
 	}
@@ -252,6 +254,7 @@ func (s *wikiIngestService) newWikiBatchContext(
 			return m[kid]
 		},
 		ExtractionGranularity:  granularity,
+		MaxPagesPerIngest:      maxPagesPerIngest,
 		ContentInstructions:    contentInstructions,
 		ExtractionInstructions: extractionInstructions,
 	}
@@ -718,6 +721,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// concurrent romanizations of the same title collapse before taxonomy
 	// planning and Reduce lock by slug.
 	slugUpdates = s.remapSlugUpdatesByIdentity(ctx, payload.KnowledgeBaseID, slugUpdates, batchCtx)
+	stripBudgetDroppedSummaryLinks(slugUpdates, docResults)
 
 	// Plan the directory once for the whole batch BEFORE reduce. Reduce writes
 	// pages in parallel, so it can't converge on shared folders on its own; this
@@ -1621,6 +1625,48 @@ func (s *wikiIngestService) mapOneDocument(
 		ctx, payload.KnowledgeBaseID, extractedEntities, extractedConcepts, batchCtx,
 	)
 
+	var budgetDropped int
+	var budgetCandidates []string
+	var existingKnown map[string]bool
+	if batchCtx != nil && batchCtx.MaxPagesPerIngest > 0 {
+		existingKnown = make(map[string]bool, len(oldPageSlugs))
+		for slug := range oldPageSlugs {
+			existingKnown[slug] = true
+		}
+		candidateSlugs := make([]string, 0, len(extractedEntities)+len(extractedConcepts))
+		for _, item := range extractedEntities {
+			if item.Slug != "" && !existingKnown[item.Slug] {
+				candidateSlugs = append(candidateSlugs, item.Slug)
+			}
+		}
+		for _, item := range extractedConcepts {
+			if item.Slug != "" && !existingKnown[item.Slug] {
+				candidateSlugs = append(candidateSlugs, item.Slug)
+			}
+		}
+		budgetCandidates = candidateSlugs
+		for _, slug := range summaryExtractedPages {
+			if !existingKnown[slug] {
+				candidateSlugs = append(candidateSlugs, slug)
+			}
+		}
+		if len(candidateSlugs) > 0 {
+			pages, err := s.wikiService.ExistsSlugs(ctx, payload.KnowledgeBaseID, candidateSlugs)
+			if err != nil {
+				s.tracker().FailSpan(ctx, wikiSpan, "BUDGET_LOOKUP_FAILED", err.Error(), err)
+				return nil, nil, fmt.Errorf("resolve existing wiki pages for ingest budget: %w", err)
+			}
+			for slug, exists := range pages {
+				if exists {
+					existingKnown[slug] = true
+				}
+			}
+		}
+		extractedEntities, extractedConcepts, budgetDropped = applyMaxPagesPerIngestBudget(
+			extractedEntities, extractedConcepts, existingKnown, batchCtx.MaxPagesPerIngest,
+		)
+	}
+
 	// Rebuild slugItems so stale entries (for slugs that did not survive the
 	// merge) and brand-new slugs discovered by the citation pass are both
 	// reflected in summaryExtractedPages tracking.
@@ -1633,6 +1679,19 @@ func (s *wikiIngestService) mapOneDocument(
 	for _, item := range extractedConcepts {
 		if item.Slug != "" && item.Name != "" {
 			slugItems[item.Slug] = item
+		}
+	}
+	var budgetDroppedSlugs []string
+	for _, slug := range budgetCandidates {
+		if _, kept := slugItems[slug]; !kept {
+			budgetDroppedSlugs = append(budgetDroppedSlugs, slug)
+		}
+	}
+	if budgetDropped > 0 {
+		for _, slug := range summaryExtractedPages {
+			if _, kept := slugItems[slug]; !kept && !existingKnown[slug] {
+				budgetDroppedSlugs = append(budgetDroppedSlugs, slug)
+			}
 		}
 	}
 
@@ -1815,30 +1874,84 @@ func (s *wikiIngestService) mapOneDocument(
 	// "wiki processing for this knowledge" time the user sees in the
 	// trace viewer, not just the LLM extraction slice.
 	mapStats := types.JSONMap{
-		"doc_title":        previewText(docTitle, 120),
-		"chunks":           len(chunks),
-		"candidate_slugs":  len(slugItems),
-		"cited_chunks":     len(citedChunkSet),
-		"uncited_slugs":    uncited,
-		"new_slugs":        len(newSlugs),
-		"updates":          len(updates),
-		"reparse_slugs":    reparseOverlap,
-		"preserved_slugs":  preservedCount,
-		"extracted_pages":  len(extractedPages),
-		"summary_chars":    utf8.RuneCountInString(docSummary),
-		"pass0_fallback":   pass0Failed,
-		"classify_batches": batchCount,
-		"summary_preview":  previewText(docSummaryLine, 160),
+		"doc_title":            previewText(docTitle, 120),
+		"chunks":               len(chunks),
+		"candidate_slugs":      len(slugItems),
+		"cited_chunks":         len(citedChunkSet),
+		"uncited_slugs":        uncited,
+		"new_slugs":            len(newSlugs),
+		"updates":              len(updates),
+		"reparse_slugs":        reparseOverlap,
+		"preserved_slugs":      preservedCount,
+		"extracted_pages":      len(extractedPages),
+		"budget_dropped_slugs": budgetDropped,
+		"summary_chars":        utf8.RuneCountInString(docSummary),
+		"pass0_fallback":       pass0Failed,
+		"classify_batches":     batchCount,
+		"summary_preview":      previewText(docSummaryLine, 160),
 	}
 
 	return &docIngestResult{
-		KnowledgeID: knowledgeID,
-		DocTitle:    docTitle,
-		Summary:     docSummaryLine,
-		Pages:       extractedPages,
-		MapStats:    mapStats,
-		WikiSpan:    wikiSpan,
+		KnowledgeID:        knowledgeID,
+		DocTitle:           docTitle,
+		Summary:            docSummaryLine,
+		Pages:              extractedPages,
+		BudgetDroppedSlugs: budgetDroppedSlugs,
+		MapStats:           mapStats,
+		WikiSpan:           wikiSpan,
 	}, updates, nil
+}
+
+func stripBudgetDroppedSummaryLinks(updates map[string][]SlugUpdate, docs []*docIngestResult) {
+	droppedByDocument := make(map[string]map[string]struct{})
+	for _, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		for _, slug := range doc.BudgetDroppedSlugs {
+			kept := false
+			for _, update := range updates[slug] {
+				if update.Type == types.WikiPageTypeEntity || update.Type == types.WikiPageTypeConcept {
+					kept = true
+					break
+				}
+			}
+			if !kept {
+				if droppedByDocument[doc.KnowledgeID] == nil {
+					droppedByDocument[doc.KnowledgeID] = make(map[string]struct{})
+				}
+				droppedByDocument[doc.KnowledgeID][slug] = struct{}{}
+			}
+		}
+	}
+	if len(droppedByDocument) == 0 {
+		return
+	}
+	for _, doc := range docs {
+		if doc != nil {
+			doc.Summary, _ = stripDeadWikiLinks(doc.Summary, droppedByDocument[doc.KnowledgeID], nil, nil)
+		}
+	}
+	type summaryKey struct{ knowledgeID, text string }
+	cleanedSummaries := make(map[summaryKey]string)
+	for slug, items := range updates {
+		for i := range items {
+			dead := droppedByDocument[items[i].KnowledgeID]
+			if len(dead) == 0 {
+				continue
+			}
+			items[i].SummaryLine, _ = stripDeadWikiLinks(items[i].SummaryLine, dead, nil, nil)
+			items[i].SummaryBody, _ = stripDeadWikiLinks(items[i].SummaryBody, dead, nil, nil)
+			key := summaryKey{items[i].KnowledgeID, items[i].DocSummary}
+			cleaned, ok := cleanedSummaries[key]
+			if !ok {
+				cleaned, _ = stripDeadWikiLinks(key.text, dead, nil, nil)
+				cleanedSummaries[key] = cleaned
+			}
+			items[i].DocSummary = cleaned
+		}
+		updates[slug] = items
+	}
 }
 
 func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(

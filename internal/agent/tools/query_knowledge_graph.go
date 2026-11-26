@@ -525,7 +525,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			"display_type":       "graph_query_results",
 		}
 		truncation.addToData(data)
-		result := &types.ToolResult{Success: failedKBs < len(kbIDs), Output: output, Data: data, RetrievalFailures: failures}
+		result := &types.ToolResult{Success: failedKBs < len(kbIDs), Output: output, Data: data, RetrievalFailures: failures, PublishedSources: []types.PublishedSourceRef{}}
 		if !result.Success {
 			result.Error = output
 		}
@@ -603,9 +603,11 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	output += "=== 🔍 Query Results ===\n\n"
 
 	formattedResults := make([]map[string]interface{}, 0, len(allResults))
+	publishedSources := make([]types.PublishedSourceRef, 0, len(allResults)*2)
 	currentKB := ""
 
 	for i, result := range allResults {
+		publishedSources = append(publishedSources, types.PublishedSourceRef{ID: result.ID, Citable: true}, types.PublishedSourceRef{ID: result.KnowledgeID, Citable: true})
 		// Group by knowledge base
 		if result.KnowledgeID != currentKB {
 			currentKB = result.KnowledgeID
@@ -662,6 +664,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		Success:           true,
 		Output:            output,
 		Data:              data,
+		PublishedSources:  publishedSources,
 		RetrievalFailures: failures,
 	}, nil
 }

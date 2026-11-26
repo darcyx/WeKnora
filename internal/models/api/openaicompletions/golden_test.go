@@ -209,6 +209,17 @@ func TestGolden(t *testing.T) {
 			want:   map[string]any{"enable_thinking": true, "thinking_budget": float64(4096)},
 		},
 		{
+			name: "dashscope graded effort maps to thinking_budget when effort unsupported",
+			mutate: func(c *Config) {
+				c.Settings.ThinkingFormat = api.ThinkingFormatEnableThinking
+				c.Settings.ThinkingBudgetField = "thinking_budget"
+				c.Settings.SupportsReasoningEffort = false
+			},
+			opts:   &api.Options{ReasoningEffort: api.ReasoningMinimal},
+			stream: true,
+			want:   map[string]any{"enable_thinking": true, "reasoning_effort": nil, "thinking_budget": float64(1024)},
+		},
+		{
 			name: "dashscope: no preference still pins enable_thinking false",
 			mutate: func(c *Config) {
 				c.Settings.ThinkingFormat = api.ThinkingFormatEnableThinking

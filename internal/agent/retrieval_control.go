@@ -66,22 +66,25 @@ type retrievalGap struct {
 }
 
 type retrievalAttempt struct {
-	QuestionID      string              `json:"question_id,omitempty"`
-	FAQOnly         bool                `json:"faq_only,omitempty"`
-	RuntimeManaged  bool                `json:"runtime_managed,omitempty"`
-	ID              string              `json:"id"`
-	Scope           string              `json:"scope"`
-	GapID           string              `json:"gap_id"`
-	Action          retrievalAction     `json:"action"`
-	Tool            string              `json:"tool"`
-	Arguments       string              `json:"arguments"`
-	Completed       bool                `json:"completed"`
-	Outcome         retrievalOutcome    `json:"outcome,omitempty"`
-	Failures        []retrievalFailure  `json:"failures,omitempty"`
-	RecoveryCallID  string              `json:"recovery_call_id,omitempty"`
-	RecoveryTargets types.SearchTargets `json:"recovery_targets,omitempty"`
-	RecoveryStages  []string            `json:"recovery_stages,omitempty"`
-	FAQ             *retrievalFAQState  `json:"faq,omitempty"`
+	QuestionID        string              `json:"question_id,omitempty"`
+	FAQOnly           bool                `json:"faq_only,omitempty"`
+	RuntimeManaged    bool                `json:"runtime_managed,omitempty"`
+	ID                string              `json:"id"`
+	Scope             string              `json:"scope"`
+	GapID             string              `json:"gap_id"`
+	Action            retrievalAction     `json:"action"`
+	Tool              string              `json:"tool"`
+	Arguments         string              `json:"arguments"`
+	Completed         bool                `json:"completed"`
+	Outcome           retrievalOutcome    `json:"outcome,omitempty"`
+	Failures          []retrievalFailure  `json:"failures,omitempty"`
+	RecoveryCallID    string              `json:"recovery_call_id,omitempty"`
+	RecoveryTargets   types.SearchTargets `json:"recovery_targets,omitempty"`
+	RecoveryStages    []string            `json:"recovery_stages,omitempty"`
+	FAQ               *retrievalFAQState  `json:"faq,omitempty"`
+	StructuredSources bool                `json:"structured_sources,omitempty"`
+	ObservedIDs       []string            `json:"observed_ids,omitempty"`
+	CitableIDs        []string            `json:"citable_ids,omitempty"`
 	// Raw results must be restored through the authorized history path.
 	Content string `json:"-"`
 }
@@ -305,6 +308,10 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 }
 
 func (c *retrievalControl) observe(callID, content string, outcome retrievalOutcome, failures ...retrievalFailure) error {
+	return c.observeWithSources(callID, content, outcome, false, nil, nil, failures...)
+}
+
+func (c *retrievalControl) observeWithSources(callID, content string, outcome retrievalOutcome, structured bool, observedIDs, citableIDs []string, failures ...retrievalFailure) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	a := c.attempt(callID)
@@ -315,6 +322,9 @@ func (c *retrievalControl) observe(callID, content string, outcome retrievalOutc
 		return fmt.Errorf("unknown retrieval outcome %q", outcome)
 	}
 	a.Completed, a.Content, a.Outcome = true, content, outcome
+	a.StructuredSources = structured
+	a.ObservedIDs = slices.Clone(observedIDs)
+	a.CitableIDs = slices.Clone(citableIDs)
 	a.Failures = cloneRetrievalFailures(failures)
 	for i := range a.Failures {
 		a.Failures[i].CallID = callID
@@ -342,21 +352,25 @@ func (c *retrievalControl) review(gapID, callID string, verdict retrievalStatus,
 		return fmt.Errorf("review must refer to the gap's unreviewed successful observation")
 	}
 	newEvidence := false
-	if len(quotes) > 0 {
+	// Quotes are only evidentiary for progress and satisfied verdicts.
+	// Ignoring optional quotes on no_progress/exhausted_no_progress prevents
+	// retry loops when the model summarizes an earlier call while reporting
+	// no progress on the latest observation.
+	if len(quotes) > 0 && (verdict == retrievalProgress || verdict == retrievalSatisfied) {
 		if err := validateEvidenceQuotes(a, quotes, false); err != nil {
 			return err
 		}
-	}
-	for _, quote := range quotes {
-		seen := slices.ContainsFunc(g.Evidence, func(prior string) bool { return evidenceContains(prior, quote) })
-		for _, previous := range c.state.Attempts {
-			if previous.ID != callID && previous.GapID == gapID && previous.Outcome == retrievalSuccess &&
-				observedEvidenceContains(previous.Content, quote) {
-				seen = true
+		for _, quote := range quotes {
+			seen := slices.ContainsFunc(g.Evidence, func(prior string) bool { return evidenceContains(prior, quote) })
+			for _, previous := range c.state.Attempts {
+				if previous.ID != callID && previous.GapID == gapID && previous.Outcome == retrievalSuccess &&
+					observedEvidenceContains(previous.Content, quote) {
+					seen = true
+				}
 			}
-		}
-		if !seen {
-			newEvidence = true
+			if !seen {
+				newEvidence = true
+			}
 		}
 	}
 	switch verdict {
@@ -387,9 +401,11 @@ func (c *retrievalControl) review(gapID, callID string, verdict retrievalStatus,
 		g.EvidenceCallID = callID
 		return nil
 	}
-	for _, quote := range quotes {
-		if !slices.Contains(g.Evidence, quote) {
-			g.Evidence = append(g.Evidence, quote)
+	if verdict == retrievalProgress {
+		for _, quote := range quotes {
+			if !slices.Contains(g.Evidence, quote) {
+				g.Evidence = append(g.Evidence, quote)
+			}
 		}
 	}
 	return nil
@@ -419,6 +435,8 @@ func (c *retrievalControl) snapshotLocked() retrievalState {
 		s.Attempts[i].Failures = cloneRetrievalFailures(s.Attempts[i].Failures)
 		s.Attempts[i].RecoveryTargets = s.Attempts[i].RecoveryTargets.Clone()
 		s.Attempts[i].RecoveryStages = slices.Clone(s.Attempts[i].RecoveryStages)
+		s.Attempts[i].ObservedIDs = slices.Clone(s.Attempts[i].ObservedIDs)
+		s.Attempts[i].CitableIDs = slices.Clone(s.Attempts[i].CitableIDs)
 		if faq := s.Attempts[i].FAQ; faq != nil {
 			copyFAQ := *faq
 			copyFAQ.Observations = slices.Clone(faq.Observations)
@@ -445,6 +463,19 @@ func (c *retrievalControl) restoreObservation(callID, content string, tool ...st
 	if a := c.attempt(callID); a != nil && a.Completed && a.Content == "" &&
 		retrievalScopeCovers(c.state.Scope, a.Scope) && (len(tool) == 0 || a.Tool == tool[0]) {
 		a.Content = content
+	}
+}
+
+func (c *retrievalControl) recordPublishedSources(callID string, structured bool, observedIDs, citableIDs []string) {
+	if !structured && len(observedIDs) == 0 && len(citableIDs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a := c.attempt(callID); a != nil && a.Completed && retrievalScopeCovers(c.state.Scope, a.Scope) {
+		a.StructuredSources = a.StructuredSources || structured
+		a.ObservedIDs = slices.Clone(observedIDs)
+		a.CitableIDs = slices.Clone(citableIDs)
 	}
 }
 

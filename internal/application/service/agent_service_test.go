@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1176,4 +1177,83 @@ func TestRegisterOperationToolsKeepsSystemAdminIndependentOfWorkspaceRole(t *tes
 			}
 		}
 	}
+}
+
+func TestCreateAgentEngineDoesNotMutateCallerConfig(t *testing.T) {
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	thinking := true
+	memoryEnabled := true
+	citationEnabled := false
+	cfg := &types.AgentConfig{
+		MaxIterations:           0,
+		AllowedTools:            []string{tools.ToolThinking},
+		KnowledgeBases:          []string{"kb-1"},
+		KnowledgeIDs:            []string{"doc-1"},
+		MCPSelectionMode:        "all",
+		MCPServices:             []string{"mcp-1", "mcp-2"},
+		SkillDirs:               []string{"/tmp/skills"},
+		AllowedSkills:           []string{"skill-a"},
+		PinnedMCPServiceIDs:     []string{"mcp-1"},
+		PinnedSkillNames:        []string{"skill-a"},
+		WritableKBIDs:           []string{"kb-1"},
+		FAQPreflightQuestions:   []string{"q1"},
+		FAQPreflightUsage:       &types.TokenUsage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5},
+		AttachmentSandboxCopies: map[string]string{"/workspace/input/a.txt": "attachment:doc-1"},
+		MemoryEnabled:           &memoryEnabled,
+		Thinking:                &thinking,
+		CitationEnabled:         &citationEnabled,
+		QuestionOrigin:          &types.QuestionOrigin{KnowledgeBaseID: "kb-1", KnowledgeID: "doc-1"},
+		PageContext: &types.PageContext{
+			Page:         types.PageWiki,
+			WikiIssueIDs: []string{"issue-1"},
+			Selection:    &types.PageSelection{Text: "selected"},
+		},
+		TenantSkills: []*types.TenantSkillEntity{
+			{ID: "sk-1", Name: "pdf-tools", Status: types.SkillStatusReady, Enabled: true},
+		},
+	}
+
+	svc := &agentService{}
+	const workers = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.CreateAgentEngine(ctx, cfg, &fakeAgentChatModel{}, nil, nil, "sess-1", "msg-1")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 0, cfg.MaxIterations)
+	assert.Equal(t, "all", cfg.MCPSelectionMode)
+	assert.Equal(t, []string{"mcp-1", "mcp-2"}, cfg.MCPServices)
+	assert.Equal(t, []string{tools.ToolThinking}, cfg.AllowedTools)
+	assert.Equal(t, []string{"kb-1"}, cfg.KnowledgeBases)
+	assert.Equal(t, []string{"doc-1"}, cfg.KnowledgeIDs)
+	assert.Equal(t, []string{"/tmp/skills"}, cfg.SkillDirs)
+	assert.Equal(t, []string{"skill-a"}, cfg.AllowedSkills)
+	assert.Equal(t, []string{"mcp-1"}, cfg.PinnedMCPServiceIDs)
+	assert.Equal(t, []string{"skill-a"}, cfg.PinnedSkillNames)
+	assert.Equal(t, []string{"kb-1"}, cfg.WritableKBIDs)
+	assert.Equal(t, []string{"q1"}, cfg.FAQPreflightQuestions)
+	assert.Equal(t, map[string]string{"/workspace/input/a.txt": "attachment:doc-1"}, cfg.AttachmentSandboxCopies)
+	require.NotNil(t, cfg.MemoryEnabled)
+	assert.True(t, *cfg.MemoryEnabled)
+	require.NotNil(t, cfg.Thinking)
+	assert.True(t, *cfg.Thinking)
+	require.NotNil(t, cfg.CitationEnabled)
+	assert.False(t, *cfg.CitationEnabled)
+	require.NotNil(t, cfg.QuestionOrigin)
+	assert.Equal(t, "doc-1", cfg.QuestionOrigin.KnowledgeID)
+	require.NotNil(t, cfg.PageContext)
+	assert.Equal(t, []string{"issue-1"}, cfg.PageContext.WikiIssueIDs)
+	require.NotNil(t, cfg.PageContext.Selection)
+	assert.Equal(t, "selected", cfg.PageContext.Selection.Text)
 }

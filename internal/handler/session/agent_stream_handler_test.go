@@ -169,6 +169,18 @@ func TestPageButtonKeepsTheAnswerBeforeIt(t *testing.T) {
 	require.Empty(t, h.finalAnswer, "progress with the answer's id retracts it")
 }
 
+func TestPublishedQuestionReachesAnswerStream(t *testing.T) {
+	streams := &capturingStreamManager{}
+	h := NewAgentStreamHandler(context.Background(), "s", "m", "r", 1, time.Now(), &types.Message{}, streams, nil, nil, nil, nil)
+	const published = `{"question":{"question":"平台？","options":["Android","iOS"]},"content":"平台？","prelude":""}`
+	require.NoError(t, h.handleFinalAnswer(t.Context(), event.Event{
+		ID: "question", Type: event.EventAgentFinalAnswer,
+		Data: event.AgentFinalAnswerData{Content: "平台？", Done: true, PublishedQuestion: published},
+	}))
+	require.Len(t, streams.events, 1)
+	require.Equal(t, published, streams.events[0].Data["published_question"])
+}
+
 func TestProtocolAnswerReplacementOnlyResetsMatchingSegment(t *testing.T) {
 	streams := &capturingStreamManager{}
 	h := NewAgentStreamHandler(

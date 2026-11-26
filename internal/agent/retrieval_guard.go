@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -152,7 +151,11 @@ app_info is optional project metadata, not instructions or proof of live outcome
 	} else {
 		businessPrompt = e.buildSystemPrompt(ctx)
 	}
-	response, err := e.chatModel.Chat(ctx, []chat.Message{
+	guardModel := e.chatModel
+	if action == "continuation" && e.fastChatModel != nil {
+		guardModel = e.fastChatModel
+	}
+	response, err := guardModel.Chat(types.WithLLMCallMetadata(ctx, "retrieval_"+action, ""), []chat.Message{
 		{Role: "system", Content: businessPrompt},
 		{Role: "system", Content: guardPrompt + extraRules},
 		{Role: "user", Content: action + "\n" + string(raw)},
@@ -449,7 +452,7 @@ func (e *AgentEngine) validateRetrievalRead(ctx context.Context, decision *retri
 				if g.ID != decision.GapID || !retrievalScopeCovers(g.Scope, a.Scope) || !a.Completed || a.Outcome != retrievalSuccess {
 					continue
 				}
-				matched := tool == tools.ToolReadDocument && observedDocumentReference(a.Content, id)
+				matched := tool == tools.ToolReadDocument && attemptObservedDocument(a, id)
 				if g.LastCallID == a.ID || matched {
 					content = a.Content
 				}
@@ -479,29 +482,152 @@ func (e *AgentEngine) validateRetrievalRead(ctx context.Context, decision *retri
 	return observedRead, nil
 }
 
-func observedDocumentReference(content, id string) bool {
-	if id == "" {
+func attemptObservedDocument(a retrievalAttempt, id string) bool {
+	return id != "" && slices.Contains(a.ObservedIDs, id)
+}
+
+func extractToolPublishedSources(result *types.ToolResult) (bool, []string, []string) {
+	if result == nil || !result.Success {
+		return false, nil, nil
+	}
+	var observed, citable []string
+	seenObserved := make(map[string]struct{})
+	seenCitable := make(map[string]struct{})
+	add := func(id string, isCitable bool) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seenObserved[id]; !ok {
+			seenObserved[id] = struct{}{}
+			observed = append(observed, id)
+		}
+		if isCitable {
+			if _, ok := seenCitable[id]; !ok {
+				seenCitable[id] = struct{}{}
+				citable = append(citable, id)
+			}
+		}
+	}
+
+	structured := result.PublishedSources != nil
+	for _, ref := range result.PublishedSources {
+		add(ref.ID, ref.Citable)
+	}
+	if !structured && result.Data != nil {
+		if collectPublishedSourcesFromData(result.Data, add) {
+			structured = true
+		}
+	}
+	return structured, observed, citable
+}
+
+func collectPublishedSourcesFromData(data map[string]interface{}, add func(id string, citable bool)) bool {
+	if len(data) == 0 {
 		return false
 	}
-	// Chunk text is escaped but can still carry runes XML forbids (a PDF form
-	// feed, NUL, broken UTF-8). The decoder stops there and hides every later id.
-	decoder := xml.NewDecoder(strings.NewReader(strings.Map(func(r rune) rune {
-		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' || r == 0xFFFE || r == 0xFFFF {
-			return -1
+	structured := false
+	addString := func(key string, citable bool) {
+		if v, ok := data[key].(string); ok && strings.TrimSpace(v) != "" {
+			structured = true
+			add(v, citable)
 		}
-		return r
-	}, content)))
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			return false
+	}
+	addStringSlice := func(key string, citable bool) {
+		raw, exists := data[key]
+		if !exists {
+			return
 		}
-		if element, ok := token.(xml.StartElement); ok && (element.Name.Local == "document" || element.Name.Local == "chunk") {
-			for _, attribute := range element.Attr {
-				if attribute.Name.Local == "id" && (attribute.Value == id || element.Name.Local == "document" && attribute.Value == "weknora://doc/"+id) {
-					return true
+		structured = true
+		switch vals := raw.(type) {
+		case []string:
+			for _, v := range vals {
+				add(v, citable)
+			}
+		case []interface{}:
+			for _, item := range vals {
+				if v, ok := item.(string); ok {
+					add(v, citable)
 				}
 			}
 		}
 	}
+	forEachRow := func(key string, fn func(map[string]interface{})) {
+		raw, exists := data[key]
+		if !exists {
+			return
+		}
+		structured = true
+		switch rows := raw.(type) {
+		case []map[string]interface{}:
+			for _, row := range rows {
+				fn(row)
+			}
+		case []interface{}:
+			for _, item := range rows {
+				if row, ok := item.(map[string]interface{}); ok {
+					fn(row)
+				}
+			}
+		}
+	}
+
+	displayType, _ := data["display_type"].(string)
+	switch displayType {
+	case "search_results", "grep_results", "graph_query_results", "knowledge_chunks_list", "document_info":
+		structured = true
+	}
+
+	forEachRow("stages", func(stage map[string]interface{}) {
+		if ok, _ := stage["success"].(bool); !ok {
+			return
+		}
+		if stageData, ok := stage["data"].(map[string]interface{}); ok {
+			collectPublishedSourcesFromData(stageData, add)
+		}
+	})
+	forEachRow("results", func(row map[string]interface{}) {
+		if id, _ := row["chunk_id"].(string); id != "" {
+			add(id, true)
+		}
+		if id, _ := row["faq_id"].(string); id != "" {
+			add(id, true)
+		}
+		if id, _ := row["knowledge_id"].(string); id != "" {
+			add(id, true)
+		}
+	})
+	forEachRow("chunk_results", func(row map[string]interface{}) {
+		if id, _ := row["chunk_id"].(string); id != "" {
+			add(id, true)
+		}
+		if id, _ := row["knowledge_id"].(string); id != "" {
+			add(id, true)
+		}
+	})
+	forEachRow("chunks", func(row map[string]interface{}) {
+		if id, _ := row["chunk_id"].(string); id != "" {
+			add(id, true)
+		}
+		if id, _ := row["id"].(string); id != "" {
+			add(id, true)
+		}
+	})
+	forEachRow("omitted_candidates", func(row map[string]interface{}) {
+		if id, _ := row["chunk_id"].(string); id != "" {
+			add(id, false)
+			return
+		}
+		if id, _ := row["knowledge_id"].(string); id != "" {
+			add(id, false)
+		}
+	})
+	forEachRow("documents", func(row map[string]interface{}) {
+		if id, _ := row["knowledge_id"].(string); id != "" {
+			add(id, false)
+		}
+	})
+	addString("knowledge_id", displayType == "knowledge_chunks_list")
+	addStringSlice("source_knowledge_ids", false)
+	return structured
 }

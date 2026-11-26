@@ -19,7 +19,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-type fakeConfigs map[string]string // config id -> allocation_mode
+type fakeConfigs map[string]string
 
 func (f fakeConfigs) GetByID(_ context.Context, tenantID uint64, id string) (*types.TenantSandboxConfigEntity, error) {
 	return &types.TenantSandboxConfigEntity{
@@ -35,9 +35,6 @@ type testEnv struct {
 
 func newEnv(t *testing.T, configs fakeConfigs, sessions ...*types.Session) *testEnv {
 	t.Helper()
-	// Same SQLite pool as the allocation repository tests: one connection and
-	// a busy timeout, so concurrent first-writers queue instead of failing
-	// with "database table is locked".
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_busy_timeout=5000", uuid.NewString())
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
@@ -143,14 +140,10 @@ func TestPlacePutsAVerifiedWebUserOnASharedMachineAndPinsIt(t *testing.T) {
 	require.Equal(t, "cfg-a", cfg)
 	require.EqualValues(t, 7, tenant)
 
-	// The stored row wins over a later request for another config, and reads
-	// back the same machine.
 	again := e.place(t, id, "cfg-b")
 	require.Equal(t, a, again)
 }
 
-// The owner's kind is derived from the stored source and the id's shape; a
-// source that disagrees with the id never makes a verified person.
 func TestPlaceDerivesTheOwnerKindFromItsSource(t *testing.T) {
 	enableUserMode(t)
 	ext, webWithColon, unknown := uuid.NewString(), uuid.NewString(), uuid.NewString()
@@ -291,8 +284,6 @@ func TestPlaceOnARetiredSessionIsRefused(t *testing.T) {
 	require.False(t, ok)
 }
 
-// Lookup keeps a released row for cleanup; Place must refuse it, or a turn
-// already in flight would rebuild the workspace of a deleted session.
 func TestPlaceOnAReleasedAssignmentIsRefused(t *testing.T) {
 	enableUserMode(t)
 	id := uuid.NewString()

@@ -40,6 +40,9 @@ type sourceRegistry struct {
 	// Addressable IDs from history, directory entries, and tool arguments are
 	// not evidence until a current tool result supplies the source.
 	citable sync.Map // handle -> true; registrations may run concurrently
+	// allowedRefURLs records normalized HTTP(S) reference URLs published by
+	// structured tool results (and surviving in-scope historical tool data).
+	allowedRefURLs sync.Map // normalized URL -> true; registrations may run concurrently
 
 	chunks *handleTable[ChunkReference]
 	docs   *handleTable[struct{}]
@@ -173,6 +176,153 @@ func canonicalWebURL(raw string) string {
 	}
 	parsed.Fragment = ""
 	return parsed.String()
+}
+
+// NormalizeReferenceURL canonicalizes an HTTP(S) URL for deterministic
+// reference-section whitelist comparison and deduplication: trims whitespace,
+// lowercases scheme and host, removes default ports, and drops an empty
+// trailing '#' fragment while preserving non-empty anchors.
+func NormalizeReferenceURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimSuffix(trimmed, "#")
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	if parsed.Host == "" {
+		return ""
+	}
+	parsed.Scheme = scheme
+	parsed.Host = strings.ToLower(parsed.Host)
+	if (scheme == "http" && parsed.Port() == "80") || (scheme == "https" && parsed.Port() == "443") {
+		host := parsed.Hostname()
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		parsed.Host = host
+	}
+	return parsed.String()
+}
+
+func (r *sourceRegistry) RegisterReferenceURL(rawURL string) {
+	if r == nil {
+		return
+	}
+	if norm := NormalizeReferenceURL(rawURL); norm != "" {
+		r.allowedRefURLs.Store(norm, true)
+	}
+}
+
+func (r *sourceRegistry) AllowedReferenceURLs() map[string]struct{} {
+	allowed := make(map[string]struct{})
+	if r == nil {
+		return allowed
+	}
+	r.allowedRefURLs.Range(func(key, _ any) bool {
+		if u, ok := key.(string); ok && u != "" {
+			allowed[u] = struct{}{}
+		}
+		return true
+	})
+	return allowed
+}
+
+// ExtractReferenceURLsFromToolData extracts normalized HTTP(S) reference URLs
+// from published tool data so multi-turn history can restore in-scope URLs.
+// MCP results use their opaque output and structured content, as in the live path.
+func ExtractReferenceURLsFromToolData(toolName string, result *types.ToolResult) []string {
+	if result == nil || !result.Success {
+		return nil
+	}
+	if toolName == "call_mcp_tool" || strings.HasPrefix(toolName, "mcp_") {
+		urls := mcpResultURLs(result)
+		for i := range urls {
+			urls[i] = NormalizeReferenceURL(urls[i])
+		}
+		return urls
+	}
+	if result.Data == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var urls []string
+	add := func(raw string) {
+		norm := NormalizeReferenceURL(raw)
+		if norm == "" {
+			return
+		}
+		if _, exists := seen[norm]; exists {
+			return
+		}
+		seen[norm] = struct{}{}
+		urls = append(urls, norm)
+	}
+
+	displayType := stringValue(result.Data, "display_type")
+	switch displayType {
+	case "search_results", "grep_results", "graph_query_results":
+		addGroupedDocRows := func(rows []map[string]any) {
+			seenDoc := make(map[string]bool)
+			for _, row := range rows {
+				docKey := firstNonEmpty(stringValue(row, "knowledge_id"), stringValue(row, "chunk_id"), stringValue(row, "id"))
+				if docKey != "" {
+					if seenDoc[docKey] {
+						continue
+					}
+					seenDoc[docKey] = true
+				}
+				add(firstNonEmpty(stringValue(row, "source_url"), stringValue(row, "url")))
+			}
+		}
+		addGroupedDocRows(mapsValue(result.Data["results"]))
+		addGroupedDocRows(mapsValue(result.Data["chunk_results"]))
+	case "knowledge_chunks_list":
+		if topURL := firstNonEmpty(stringValue(result.Data, "source_url"), stringValue(result.Data, "url")); topURL != "" {
+			add(topURL)
+		} else {
+			seenDoc := make(map[string]bool)
+			for _, row := range mapsValue(result.Data["chunks"]) {
+				docKey := firstNonEmpty(stringValue(row, "knowledge_id"), stringValue(row, "chunk_id"), stringValue(row, "id"))
+				if docKey != "" {
+					if seenDoc[docKey] {
+						continue
+					}
+					seenDoc[docKey] = true
+				}
+				add(firstNonEmpty(stringValue(row, "source_url"), stringValue(row, "url")))
+			}
+		}
+	case "web_search_results":
+		for _, row := range mapsValue(result.Data["results"]) {
+			add(stringValue(row, "url"))
+		}
+	case "web_fetch_results":
+		for _, row := range mapsValue(result.Data["results"]) {
+			status := stringValue(row, "status")
+			if status == "" || status == "success" {
+				add(stringValue(row, "url"))
+			}
+		}
+	default:
+		if sourceOutputAllowed(toolName) {
+			add(firstNonEmpty(stringValue(result.Data, "source_url"), stringValue(result.Data, "url")))
+			for _, row := range mapsValue(result.Data["results"]) {
+				status := stringValue(row, "status")
+				if toolName == "web_fetch" && status != "" && status != "success" {
+					continue
+				}
+				add(firstNonEmpty(stringValue(row, "source_url"), stringValue(row, "url")))
+			}
+		}
+	}
+	return urls
 }
 
 func (r *sourceRegistry) RegisterSearchResults(results []*types.SearchResult) {

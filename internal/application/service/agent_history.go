@@ -14,6 +14,7 @@ import (
 	agenttoken "github.com/Tencent/WeKnora/internal/agent/token"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -577,10 +578,11 @@ func buildAgentStepMessages(step types.AgentStep) []chat.Message {
 	msgs = append(msgs, assistantMsg)
 	for _, tc := range nonTerminalCalls {
 		msgs = append(msgs, chat.Message{
-			Role:       "tool",
-			Content:    toolCallOutput(tc),
-			ToolCallID: tc.ID,
-			Name:       tc.Name,
+			Role:          "tool",
+			Content:       toolCallOutput(tc),
+			ToolCallID:    tc.ID,
+			Name:          tc.Name,
+			ReferenceURLs: modelcontext.ExtractReferenceURLsFromToolData(tc.Name, tc.Result),
 		})
 	}
 	return msgs

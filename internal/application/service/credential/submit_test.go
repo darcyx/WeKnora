@@ -154,7 +154,6 @@ func TestSubmitSavedChecksSiteAndDomains(t *testing.T) {
 }
 
 func TestSubmitDomainsAreTheIntersectionForSaved(t *testing.T) {
-	// The agent asks for an extra host the saved login does not allow.
 	form := types.SecureFormPromptRequest{Title: "登录", Kind: "login", Site: "a.com", Domains: []string{"sso.a.com"}}
 	require.NoError(t, form.Validate())
 	raw, _ := json.Marshal(form)

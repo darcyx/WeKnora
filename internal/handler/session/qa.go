@@ -197,8 +197,8 @@ func uploadOnlyQuery(ctx context.Context, req *CreateKnowledgeQARequest) string 
 }
 
 // marshalAppInfo copies the extension object as compact JSON for the current
-// agent turn, omitting credential fields from model and tracing context. An empty
-// ext object means there is no <app_info> block to inject.
+// agent turn, retaining the top-level token while omitting other credential fields.
+// An empty ext object means there is no <app_info> block to inject.
 func marshalAppInfo(ext map[string]interface{}) (string, error) {
 	if len(ext) == 0 {
 		return "", nil
@@ -235,10 +235,7 @@ func redactAppInfo(v interface{}) interface{} {
 
 func isCredentialKey(key string) bool {
 	key = strings.ToLower(key)
-	normalized := strings.NewReplacer("_", "", "-", "").Replace(key)
-	if strings.HasSuffix(normalized, "token") || normalized == "tokenvalue" {
-		return true
-	}
+
 	for _, marker := range []string{"password", "secret", "authorization", "apikey", "api_key", "cookie"} {
 		if strings.Contains(key, marker) {
 			return true

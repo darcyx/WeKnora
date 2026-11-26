@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -122,6 +123,7 @@ func (e *AgentEngine) Resume(
 	for id, content := range snap.UserMessages {
 		e.recordSteerMessage(id, content)
 	}
+	e.restoreFAQPreflight(snap.FAQPreflight)
 	messages := e.buildMessagesWithLLMContext(e.buildSystemPrompt(ctx), snap.Query, sessionID, llmContext, snap.ImageURLs)
 	appendUsers := func(step types.AgentStep) error {
 		for _, id := range step.UserMessagesBefore {
@@ -145,8 +147,19 @@ func (e *AgentEngine) Resume(
 		}
 		e.replayCollaborationDeliveries(&messages, i, false)
 		appendBackground(step)
+		for _, tc := range step.ToolCalls {
+			// Only chunks the model can still see count as shown; see appendToolResults.
+			if tc.Name == agenttools.ToolSearchKnowledge && e.retrievalResultInScope(tc) {
+				e.recordTurnShownChunks(tc.Result)
+			}
+		}
 		messages = e.appendToolResults(messages, step)
 		messages = e.appendToolImages(ctx, messages, step)
+	}
+	for _, tc := range p.Step.ToolCalls {
+		if tc.Name == agenttools.ToolSearchKnowledge && e.retrievalResultInScope(tc) {
+			e.recordTurnShownChunks(tc.Result)
+		}
 	}
 	e.replayCollaborationDeliveries(&messages, len(state.RoundSteps), true)
 	if err := appendUsers(p.Step); err != nil {

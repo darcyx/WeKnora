@@ -113,3 +113,7 @@ jobs:
           # filtering is done below, from git.
           only-new-issues: false
           args: --new-from-merge-base=${{ github.event.pull_request.base.sha }}
+
+      - name: Comment ratchet
+        if: matrix.module == '.'
+        run: go run ./cmd/nocomment

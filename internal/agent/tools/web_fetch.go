@@ -71,16 +71,26 @@ type webFetchItemResult struct {
 // WebFetchTool reads page snapshots for the current Agent run.
 type WebFetchTool struct {
 	BaseTool
-	fetcher         interfaces.WebFetcher
-	mu              sync.Mutex
-	pages           map[string]webPageSnapshot
-	inflight        map[string]*pageFlight
-	source          WebPageSource
-	order           []string
-	saved           map[string]string
-	failures        map[string]error
-	failureOrder    []string
-	stragglerBudget time.Duration
+	fetcher              interfaces.WebFetcher
+	mu                   sync.Mutex
+	pages                map[string]webPageSnapshot
+	inflight             map[string]*pageFlight
+	source               WebPageSource
+	order                []string
+	saved                map[string]string
+	failures             map[string]error
+	failureOrder         []string
+	connectionFailures   map[string]int
+	stragglerBudget      time.Duration
+	sensitiveTokens      []string
+	shortSensitiveTokens []string
+}
+
+// WithAppInfo records private project identifiers so web_fetch rejects target
+// URLs carrying private project identifiers or credentials in path/query params.
+func (t *WebFetchTool) WithAppInfo(appInfo string) *WebFetchTool {
+	t.sensitiveTokens, t.shortSensitiveTokens = extractSensitiveAppInfoTokens(appInfo)
+	return t
 }
 
 // NewWebFetchTool creates a web_fetch tool that reads through pageFetcher, the
@@ -92,7 +102,7 @@ func NewWebFetchTool(pageFetcher interfaces.WebFetcher) *WebFetchTool {
 	return &WebFetchTool{
 		BaseTool: webFetchTool, fetcher: pageFetcher,
 		pages: make(map[string]webPageSnapshot), inflight: make(map[string]*pageFlight),
-		saved: make(map[string]string), failures: make(map[string]error),
+		saved: make(map[string]string), failures: make(map[string]error), connectionFailures: make(map[string]int),
 		stragglerBudget: defaultWebFetchStragglerBudget,
 	}
 }
@@ -113,6 +123,7 @@ type pageFlight struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
 	waiters int
+	counted bool
 	page    webPageSnapshot
 	err     error
 }
@@ -136,6 +147,10 @@ func (t *WebFetchTool) readPage(ctx context.Context, rawURL string, offset int) 
 	}
 	wait := t.inflight[rawURL]
 	if wait == nil {
+		if t.connectionFailures[rawURL] >= 2 {
+			t.mu.Unlock()
+			return webPageSnapshot{}, &webfetch.FetchError{Code: "retry_limit", Err: fmt.Errorf("page connection failed twice in this run; use another source")}
+		}
 		path := t.saved[rawURL]
 		if offset > 0 && path == "" {
 			t.mu.Unlock()
@@ -163,6 +178,9 @@ func (t *WebFetchTool) readPage(ctx context.Context, rawURL string, offset int) 
 	case <-wait.done:
 		return wait.page, wait.err
 	case <-ctx.Done():
+		// Caller wait budget expiration (e.g. web_search content=true 15s preview)
+		// is not an underlying page connection failure and must not poison
+		// connectionFailures for a subsequent full-budget web_fetch.
 		return webPageSnapshot{}, snapshotWaitTimeoutError(context.Cause(ctx))
 	}
 }
@@ -184,8 +202,16 @@ func (t *WebFetchTool) completeStore(ctx context.Context, rawURL, path string, f
 	// A cancelled flight may have been replaced. It must not publish stale data.
 	if t.inflight[rawURL] == flight {
 		delete(t.inflight, rawURL)
+		if flight.err != nil && !flight.counted && !errors.Is(ctx.Err(), context.Canceled) {
+			code, retryable, _ := webfetch.ErrorDetails(flight.err)
+			if retryable && (code == webfetch.ErrorTimeout || code == webfetch.ErrorConnection) {
+				t.connectionFailures[rawURL]++
+				flight.counted = true
+			}
+		}
 		if ctx.Err() == nil {
 			if flight.err == nil {
+				delete(t.connectionFailures, rawURL)
 				if len(t.order) >= webPageCacheLimit {
 					delete(t.pages, t.order[0])
 					t.order = t.order[1:]
@@ -292,6 +318,20 @@ func (t *WebFetchTool) Execute(ctx context.Context, args json.RawMessage) (*type
 	pageBudget := min(8000, available/len(input.Items))
 	var first, later []int
 	for index, item := range input.Items {
+		if err := checkWebURLPrivacy(item.URL, t.sensitiveTokens, t.shortSensitiveTokens); err != nil {
+			results[index] = &webFetchItemResult{
+				status: "failed",
+				output: fmt.Sprintf("Failed to fetch %s: %s", item.URL, err.Error()),
+				data: map[string]interface{}{
+					"url":           item.URL,
+					"status":        "failed",
+					"error_code":    "privacy_blocked",
+					"error_message": err.Error(),
+					"retryable":     false,
+				},
+			}
+			continue
+		}
 		canonicalURL := fmt.Sprintf("%s:%d:%d", canonicalFetchURL(item.URL), item.Offset, item.Limit)
 		if _, duplicate := seenURLs[canonicalURL]; duplicate {
 			results[index] = duplicateWebFetchResult(item)

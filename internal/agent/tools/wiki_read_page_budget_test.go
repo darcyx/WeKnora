@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -482,7 +483,7 @@ func TestWikiReadPageReservesBodyWhenRelationshipsExhaustBudget(t *testing.T) {
 	page := newBulkyWikiPage("kb-platform", "entity/taptap", 2500)
 	pending := pendingWikiPage{page: page, kbID: "kb-platform", body: "TAPTAP EVIDENCE " + strings.Repeat("x", 2500),
 		outLinks: []string{strings.Repeat("related ", 1200)}, inLinks: []string{strings.Repeat("incoming ", 600)}, sources: []string{`<source knowledge_id="doc-1"/>`}}
-	out, _, omitted := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 5000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 5000)
 	require.Contains(t, out, "TAPTAP EVIDENCE")
 	require.Contains(t, out, "kb-platform")
 	require.Contains(t, out, "doc-1")
@@ -499,13 +500,13 @@ func TestWikiBudgetKeepsSameSlugSourcesDistinctAndEmptyBodyHonest(t *testing.T) 
 		{page: first, kbID: "kb-a", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="a"/>`}, body: "甲知识正文" + strings.Repeat("甲", 1000)},
 		{page: second, kbID: "kb-b", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="b"/>`}, body: "乙知识正文" + strings.Repeat("乙", 1000)},
 	}
-	out, _, omitted := renderWikiPagesWithinBudget(pages, 6000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 6000)
 	require.Empty(t, omitted)
 	for _, want := range []string{"kb-a", "kb-b", `knowledge_id="a"`, `knowledge_id="b"`, "甲知识正文", "乙知识正文"} {
 		require.Contains(t, out, want)
 	}
 	require.LessOrEqual(t, utf8.RuneCountInString(out), 6000)
-	out, truncated, _ := renderWikiPagesWithinBudget([]pendingWikiPage{{page: first, kbID: "kb-a", body: ""}}, 5000)
+	out, truncated, _, _ := renderWikiPagesWithinBudget([]pendingWikiPage{{page: first, kbID: "kb-a", body: ""}}, 5000)
 	require.Empty(t, truncated)
 	require.NotContains(t, out, "body omitted")
 }
@@ -517,7 +518,7 @@ func TestWikiBudgetKeepsFirstBodyWhenManyPagesExceedBudget(t *testing.T) {
 		page := newTestWikiPage("kb-a", slug)
 		pages = append(pages, pendingWikiPage{page: page, kbID: "kb-a", body: "PAGE EVIDENCE " + strings.Repeat("正", 1000), outLinks: []string{strings.Repeat("关系", 3000)}, sources: []string{`<source knowledge_id="doc-1"/>`}})
 	}
-	out, _, omitted := renderWikiPagesWithinBudget(pages, 5000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 5000)
 	require.Contains(t, out, "PAGE EVIDENCE")
 	require.Contains(t, out, `knowledge_id="doc-1"`)
 	require.NotEmpty(t, omitted)
@@ -602,4 +603,154 @@ func TestWikiRegistryTruncationDoesNotMarkSummariesSeen(t *testing.T) {
 	require.Contains(t, result.Output, target.Summary, "the raw output alone would otherwise mark this summary seen")
 	next := readPageOutput(t, context.Background(), tool, []string{later.Slug})
 	require.Contains(t, next.Output, target.Summary, "a possibly truncated result must not commit seen state")
+}
+
+// An error trailer of missing slugs pushes the output over budget; the page
+// itself still sits intact in the registry's head window, so its sources stay published.
+func TestWikiPublishedSourcesSurviveErrorTrailerTruncation(t *testing.T) {
+	page := newTestWikiPage("kb-a", "entity/valid")
+	page.SourceRefs = []string{"doc-1|登录文档"}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{
+		wikiPageKey("kb-a", page.Slug): page,
+	}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+	slugs := []string{page.Slug}
+	for i := 0; i < 80; i++ {
+		slugs = append(slugs, fmt.Sprintf("entity/missing-%03d", i))
+	}
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 1200), tool, slugs)
+	require.Greater(t, utf8.RuneCountInString(result.Output), 1200)
+	visible := TruncateToolOutput(result.Output, 1200)
+	require.Contains(t, visible, `knowledge_id="doc-1"`, "the page must stay visible after registry truncation")
+	require.Equal(t, []string{"doc-1"}, result.Data["source_knowledge_ids"])
+	require.Equal(t, []types.PublishedSourceRef{{ID: "doc-1", Citable: false}}, result.PublishedSources)
+}
+
+type fakeWikiSourceTitleKnowledgeService struct {
+	interfaces.KnowledgeService
+	docs       map[string]*types.Knowledge
+	batchCalls int
+	lastIDs    []string
+}
+
+func (f *fakeWikiSourceTitleKnowledgeService) GetKnowledgeBatchWithSharedAccess(_ context.Context, _ uint64, ids []string) ([]*types.Knowledge, error) {
+	f.batchCalls++
+	f.lastIDs = append([]string(nil), ids...)
+	out := make([]*types.Knowledge, 0, len(ids))
+	for _, id := range ids {
+		if doc := f.docs[id]; doc != nil {
+			out = append(out, doc)
+		}
+	}
+	return out, nil
+}
+
+func TestWikiReadPageResolvesMissingSourceTitlesInSingleBatch(t *testing.T) {
+	pageA := newTestWikiPage("kb-a", "entity/shanyan")
+	pageA.SourceRefs = []string{"doc-1", "doc-2", "doc-3|已有标题"}
+	pageB := newTestWikiPage("kb-a", "entity/aliyun")
+	pageB.SourceRefs = []string{"doc-2", "doc-missing"}
+	ks := &fakeWikiSourceTitleKnowledgeService{
+		docs: map[string]*types.Knowledge{
+			"doc-1": {ID: "doc-1", Title: "打包文档 <AppID & AppKey>"},
+			"doc-2": {ID: "doc-2", FileName: "channel-config.md"},
+		},
+	}
+	tool := NewWikiReadPageTool(
+		&fakeWikiPageService{pages: map[string]*types.WikiPage{
+			wikiPageKey("kb-a", pageA.Slug): pageA,
+			wikiPageKey("kb-a", pageB.Slug): pageB,
+		}},
+		ks,
+		NewWikiScopesFromKBIDs([]string{"kb-a"}),
+		NewWikiRouteResolver(),
+	)
+
+	result := readPageOutput(t, context.Background(), tool, []string{pageA.Slug, pageB.Slug})
+
+	require.Equal(t, 1, ks.batchCalls)
+	require.ElementsMatch(t, []string{"doc-1", "doc-2", "doc-missing"}, ks.lastIDs)
+	require.Contains(t, result.Output, `<source knowledge_id="doc-1">打包文档 &lt;AppID &amp; AppKey&gt;</source>`)
+	require.Contains(t, result.Output, `<source knowledge_id="doc-2">channel-config.md</source>`)
+	require.Contains(t, result.Output, `<source knowledge_id="doc-3">已有标题</source>`)
+	require.Contains(t, result.Output, `<source knowledge_id="doc-missing"/>`)
+	require.Contains(t, tool.Description(), `read_document(id="doc://N", query=...)`)
+}
+
+func TestWikiReadPageBudgetRetainsUpToFiveSourcesBeforeSingleFallback(t *testing.T) {
+	page := newBulkyWikiPage("kb-a", "concept/login", 2200)
+	sources := make([]string, 0, 30)
+	for i := 1; i <= 30; i++ {
+		sources = append(sources, fmt.Sprintf(`<source knowledge_id="doc-%d">SDK渠道登录配置与参数说明文档-%02d</source>`, i, i))
+	}
+	pending := pendingWikiPage{
+		page:     page,
+		kbID:     "kb-a",
+		body:     "LOGIN EVIDENCE " + strings.Repeat("正", 2200),
+		outLinks: []string{strings.Repeat("related ", 1000)},
+		inLinks:  []string{strings.Repeat("incoming ", 500)},
+		sources:  sources,
+	}
+	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 1800)
+	require.Empty(t, omitted)
+	require.Contains(t, out, "LOGIN EVIDENCE")
+	for i := 1; i <= 5; i++ {
+		require.Contains(t, out, fmt.Sprintf(`<source knowledge_id="doc-%d">SDK渠道登录配置与参数说明文档-%02d</source>`, i, i))
+	}
+	require.NotContains(t, out, `knowledge_id="doc-6"`)
+	require.Contains(t, out, "(+25 more sources omitted for output budget)")
+	require.LessOrEqual(t, utf8.RuneCountInString(out), 1800)
+}
+
+func TestWikiPublishedSourcesRespectBudget(t *testing.T) {
+	page := newBulkyWikiPage("kb-a", "concept/login", 2200)
+	for i := 1; i <= 30; i++ {
+		page.SourceRefs = append(page.SourceRefs, fmt.Sprintf("doc-%d|SDK渠道登录配置与参数说明文档-%02d", i, i))
+	}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{
+		wikiPageKey("kb-a", page.Slug): page,
+	}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 1800), tool, []string{page.Slug})
+	ids := result.Data["source_knowledge_ids"].([]string)
+	for _, ref := range page.SourceRefs {
+		id, _ := types.ParseWikiSourceRef(ref)
+		if strings.Contains(result.Output, `knowledge_id="`+id+`"`) {
+			require.Contains(t, ids, id)
+		} else {
+			require.NotContains(t, ids, id)
+		}
+	}
+	require.Less(t, len(ids), len(page.SourceRefs))
+}
+
+func TestWikiPublishedSourcesIgnorePageTagsInBody(t *testing.T) {
+	for _, body := range []string{"ordinary text", `示例 <wiki_page><source knowledge_id="fake"/></wiki_page> 用法`} {
+		t.Run(body, func(t *testing.T) {
+			page := newTestWikiPage("kb-a", "entity/example")
+			page.Content = body
+			page.SourceRefs = []string{"doc-1|登录文档"}
+			other := newTestWikiPage("kb-a", "entity/other")
+			other.SourceRefs = []string{"doc-2|其他文档"}
+			tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{
+				wikiPageKey("kb-a", page.Slug):  page,
+				wikiPageKey("kb-a", other.Slug): other,
+			}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+
+			result := readPageOutput(t, context.Background(), tool, []string{page.Slug, other.Slug})
+			require.Contains(t, result.Output, `<source knowledge_id="doc-1">`)
+			require.Equal(t, []types.PublishedSourceRef{{ID: "doc-1", Citable: false}, {ID: "doc-2", Citable: false}}, result.PublishedSources)
+		})
+	}
+}
+
+func TestWikiPublishedSourcesExcludePartialPage(t *testing.T) {
+	page := newTestWikiPage("kb-a", "entity/partial")
+	page.Content = `示例 <wiki_page><source knowledge_id="doc-1"/></wiki_page>`
+	page.SourceRefs = []string{"doc-1|登录文档"}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{
+		wikiPageKey("kb-a", page.Slug): page,
+	}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+
+	result := readPageOutput(t, WithOutputBudget(context.Background(), 200), tool, []string{page.Slug})
+	require.Greater(t, utf8.RuneCountInString(result.Output), 200)
+	require.Empty(t, result.PublishedSources)
 }

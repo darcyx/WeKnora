@@ -616,6 +616,15 @@ func (s *sessionService) buildSearchTargets(
 		targets = append(targets, target)
 	}
 
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		if kb := kbByID[target.KnowledgeBaseID]; kb != nil {
+			target.KnowledgeBaseType = kb.Type
+		}
+	}
+
 	logger.Infof(ctx, "Built %d search targets: %d full KB, %d partial/tag KB, kbTenantMap=%v",
 		len(targets), len(knowledgeBaseIDs), len(targets)-len(knowledgeBaseIDs), kbTenantMap)
 

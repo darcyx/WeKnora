@@ -49,7 +49,6 @@ func splitSentences(text string) []string {
 	return sentences
 }
 
-// 正则匹配中英文段落（中文块、英文块、其他字符）
 var wordTokenPattern = regexp.MustCompile(`([\p{Han}]+)|([a-zA-Z0-9_.,!?]+)|(\p{P})`)
 
 func splitIntoWords(sentences []string) []string {
@@ -63,13 +62,13 @@ func splitIntoWords(sentences []string) []string {
 			punctuation := groups[3]
 
 			switch {
-			case chineseBlock != "": // 处理中文部分
+			case chineseBlock != "":
 				words := types.Jieba.Cut(chineseBlock, true)
 				tokens = append(tokens, words...)
-			case englishBlock != "": // 处理英文部分
+			case englishBlock != "":
 				engTokens := strings.Fields(englishBlock)
 				tokens = append(tokens, engTokens...)
-			case punctuation != "": // 保留标点符号
+			case punctuation != "":
 				tokens = append(tokens, punctuation)
 			}
 		}
@@ -93,9 +92,6 @@ func SliceMap[T any, Y any](li []T, fn func(T) Y) []Y {
 	return res
 }
 
-// Hit counts how many elements of li appear in set. Each distinct element
-// is counted only at its first occurrence, so duplicated retrieved IDs do
-// not inflate precision/recall beyond full credit.
 func Hit[T comparable](li []T, set map[T]struct{}) int {
 	count := 0
 	counted := make(map[T]struct{}, len(set))

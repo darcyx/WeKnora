@@ -67,6 +67,25 @@ func TestMergedRecoveryKeepsNonSearchDiagnostics(t *testing.T) {
 	}
 }
 
+func TestMergedFAQResultsRetainPublishedSourcesAndReview(t *testing.T) {
+	faq := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results", "mode": "exact", "preflight_rejection_reason": "needs live status",
+		"results":            []map[string]interface{}{{"faq_id": "faq-1", "faq_question": "支付状态", "faq_answers": []string{"查订单"}}},
+		"omitted_candidates": []map[string]interface{}{{"chunk_id": "omitted-faq"}},
+	}}
+	docs := &types.ToolResult{Success: true, Data: map[string]interface{}{
+		"display_type": "search_results", "results": []map[string]interface{}{{"chunk_id": "chunk-1", "knowledge_id": "doc-1", "content": "detail"}},
+	}}
+	merged := mergeFAQSearchResult(faq, docs)
+	structured, observed, citable := extractToolPublishedSources(merged)
+	require.True(t, structured)
+	require.ElementsMatch(t, []string{"faq-1", "omitted-faq", "chunk-1", "doc-1"}, observed)
+	require.ElementsMatch(t, []string{"faq-1", "chunk-1", "doc-1"}, citable)
+	engine := newTestEngine(t, &mockChat{})
+	modelOutput := engine.modelContext.ModelToolResultForTool(agenttools.ToolSearchKnowledge, merged)
+	require.Contains(t, modelOutput, "needs live status")
+}
+
 // A skill read and a knowledge search issued in the same reply both run, in
 // model order, with the provider metadata that authorizes the skill preserved.
 func TestKnowledgeSearchAndSkillReadBothRunInOneRound(t *testing.T) {

@@ -442,6 +442,24 @@ func TestRenderUserTurnContent_IncludesScopeBlocks(t *testing.T) {
 	assert.Contains(t, out, "hello")
 }
 
+func TestRenderUserTurnContent_FAQPreflightHints(t *testing.T) {
+	engine := &AgentEngine{modelContext: modelcontext.NewRegistry(true), config: &types.AgentConfig{}}
+	base := engine.RenderUserTurnContent("sess-1", "question")
+	assert.NotContains(t, base, "<faq_preflight_candidates>")
+
+	engine.config.FAQPreflightQuestions = []string{"未复核"}
+	unreviewedOnly := engine.RenderUserTurnContent("sess-1", "question")
+	assert.NotContains(t, unreviewedOnly, "<faq_preflight_candidates>")
+
+	engine.config.FAQPreflightQuestions = []string{" 账号 <唯一>？ ", "账号 <唯一>？", "未复核"}
+	engine.config.FAQPreflightRejections = map[string]types.FAQPreflightRejection{"faq-1": {Question: "账号 <唯一>？", Reason: "仅部分覆盖 & 需核实"}}
+	out := engine.RenderUserTurnContent("sess-1", "question")
+	assert.Contains(t, out, "optional search leads, not evidence")
+	assert.Contains(t, out, "<title>账号 &lt;唯一&gt;？</title><review>仅部分覆盖 &amp; 需核实</review>")
+	assert.Equal(t, 1, strings.Count(out, "<candidate>"))
+	assert.NotContains(t, out, "未复核")
+}
+
 func TestBuildMessagesWithLLMContextRegistersBoundScopeBeforeFirstModelCall(t *testing.T) {
 	engine := &AgentEngine{
 		modelContext: modelcontext.NewRegistry(true),

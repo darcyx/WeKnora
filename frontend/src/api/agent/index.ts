@@ -45,6 +45,8 @@ export interface CustomAgentConfig {
   // ===== 模型设置 =====
   model_id?: string;
   rerank_model_id?: string;         // ReRank 模型 ID
+  faq_preflight_model_id?: string;  // FAQ 预检快模型 ID（为空表示使用系统默认）
+  faq_preflight_policy?: string;    // FAQ 预检直出规则（为空表示回退系统提示词）
   temperature?: number;
   max_completion_tokens?: number;   // 0 = 跟随系统默认（快速问答 2048；智能推理 4096，绑沙箱可写文件时 24576）。大于 0 为自定义上限
   max_tool_output_chars?: number;   // 0 = 跟随工具输出预算默认值

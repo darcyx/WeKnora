@@ -359,6 +359,9 @@ func (e *AgentEngine) includeProjectIntegrationLibraries(args map[string]any) {
 			return
 		}
 	}
+	if e.allFAQKnowledgeBases(ids) {
+		return
+	}
 	for _, kb := range e.knowledgeBasesInfo {
 		if kb == nil || !names[kb.Name] || !slices.ContainsFunc(e.config.SearchTargets, func(target *types.SearchTarget) bool {
 			return target != nil && target.KnowledgeBaseID == kb.ID
@@ -368,6 +371,21 @@ func (e *AgentEngine) includeProjectIntegrationLibraries(args map[string]any) {
 		ids = append(ids, kb.ID)
 	}
 	args["knowledge_base_ids"] = ids
+}
+
+func (e *AgentEngine) allFAQKnowledgeBases(ids []any) bool {
+	if len(ids) == 0 {
+		return false
+	}
+	for _, id := range ids {
+		value, ok := id.(string)
+		if !ok || !slices.ContainsFunc(e.knowledgeBasesInfo, func(kb *KnowledgeBaseInfo) bool {
+			return kb != nil && kb.ID == value && kb.Type == types.KnowledgeBaseTypeFAQ
+		}) {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *AgentEngine) prepareStructuredRetrievalCall(ctx context.Context, tc types.LLMToolCall, args map[string]any) (string, error) {
@@ -597,7 +615,7 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 		}
 	}
 	if e.runtimeRetrievalFor(s) {
-		statePrompt += "The ordinary search allowance is spent. Read an available document using its original arguments without retrieval metadata. "
+		statePrompt += "The ordinary search allowance is spent. Only read an available document that directly addresses the requested fact (do not read unrelated or placeholder docs); pass its original arguments without retrieval metadata. "
 		for _, gap := range s.Gaps {
 			if e.retrievalSearchGapID != "" && gap.ID != e.retrievalSearchGapID {
 				continue
@@ -606,7 +624,8 @@ func (e *AgentEngine) retrievalStatePrompt() string {
 				statePrompt += fmt.Sprintf("For %s, a supplementary search needs a grounded lead and a no_progress review (review.call_id = last_call_id). ", gap.ID)
 			}
 		}
-		return statePrompt + "Recover a needed transient failure only within its remaining allowance and recorded scope, using its original arguments. You can finish from available evidence without a review."
+		return statePrompt + "Recover a needed transient failure only within its remaining allowance and recorded scope, using its original arguments. You can finish from applicable evidence or directly use the configured no-answer response without a review when no relevant evidence exists." +
+			e.configuredNoAnswerPrompt()
 	}
 	return statePrompt +
 		"Use these harness-issued identities and allowances. Closed gaps cannot be searched again. " +

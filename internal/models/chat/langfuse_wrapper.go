@@ -240,7 +240,9 @@ func buildLangfuseModelParams(opts *ChatOptions) map[string]interface{} {
 		return nil
 	}
 	params := map[string]interface{}{}
-	if opts.Temperature != 0 {
+	if opts.Isolated {
+		params["requested_temperature"] = 0.0
+	} else if opts.Temperature != 0 {
 		params["temperature"] = opts.Temperature
 	}
 	if opts.TopP != 0 {

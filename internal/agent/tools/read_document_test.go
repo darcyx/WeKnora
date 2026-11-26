@@ -273,6 +273,9 @@ func TestReadDocumentPagesFromExactOffset(t *testing.T) {
 	if got := chunkIDsFromData(t, res.Data); strings.Join(got, ",") != "chunk-5,chunk-6,chunk-7,chunk-8" {
 		t.Fatalf("window = %v", got)
 	}
+	if len(res.PublishedSources) != 5 || res.PublishedSources[1].ID != "chunk-5" || !res.PublishedSources[1].Citable {
+		t.Fatalf("published sources = %+v", res.PublishedSources)
+	}
 	if res.Data["next_offset"] != 9 || res.Data["total_chunks"] != int64(12) || res.Data["fetched_chunks"] != 4 {
 		t.Fatalf("pagination data = %+v", res.Data)
 	}

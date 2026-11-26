@@ -158,7 +158,8 @@ func (s *TenantSkillService) installParsedSkill(
 			ID: skillID, TenantID: tenantID, SandboxConfigID: configID,
 			Name: bundle.Name, Version: bundle.Version,
 			Description: bundle.Description, Instructions: bundle.Instructions,
-			BundleSHA256: bundle.SHA256, Enabled: true,
+			RequiredTools: types.SkillRequiredTools(append([]string(nil), bundle.RequiredTools...)),
+			BundleSHA256:  bundle.SHA256, Enabled: true,
 			Status: types.SkillStatusInstalling, InstallingSince: &now,
 		}); err != nil {
 			if !isSkillNameConflict(err) {
@@ -301,12 +302,13 @@ func (s *TenantSkillService) servedVersionOf(
 	switch row.Status {
 	case types.SkillStatusReady:
 		return &types.SkillServedVersion{
-			Version:      row.Version,
-			Description:  row.Description,
-			Instructions: row.Instructions,
-			BundleSHA256: row.BundleSHA256,
-			BundleRef:    s.servedBundleRef(ctx, row),
-			SnapshotID:   row.InstalledSnapshotID,
+			Version:       row.Version,
+			Description:   row.Description,
+			Instructions:  row.Instructions,
+			RequiredTools: append(types.SkillRequiredTools(nil), row.RequiredTools...),
+			BundleSHA256:  row.BundleSHA256,
+			BundleRef:     s.servedBundleRef(ctx, row),
+			SnapshotID:    row.InstalledSnapshotID,
 		}
 	case types.SkillStatusInstalling, types.SkillStatusFailed:
 		return row.Served
@@ -371,6 +373,7 @@ func takeSkillRowForInstall(row *types.TenantSkillEntity, bundle *SkillBundle, n
 	row.Version = bundle.Version
 	row.Description = bundle.Description
 	row.Instructions = bundle.Instructions
+	row.RequiredTools = types.SkillRequiredTools(append([]string(nil), bundle.RequiredTools...))
 	row.BundleSHA256 = bundle.SHA256
 	row.Status = types.SkillStatusInstalling
 	row.Error = ""

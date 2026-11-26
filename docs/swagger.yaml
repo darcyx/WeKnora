@@ -457,6 +457,9 @@ definitions:
     - missing_cross_ref
     - empty_content
     - duplicate_slug
+    - thin_stub
+    - oversized_page
+    - near_duplicate
     type: string
     x-enum-varnames:
     - LintIssueOrphanPage
@@ -465,6 +468,9 @@ definitions:
     - LintIssueMissingCrossRef
     - LintIssueEmptyContent
     - LintIssueDuplicateSlug
+    - LintIssueThinStub
+    - LintIssueOversizedPage
+    - LintIssueNearDuplicate
   github_com_Tencent_WeKnora_internal_application_service.WikiLintReport:
     properties:
       health_score:
@@ -3111,6 +3117,10 @@ definitions:
         description: FAQ direct answer threshold - if similarity > this value, use
           FAQ answer directly
         type: number
+      faq_preflight_model_id:
+        type: string
+      faq_preflight_policy:
+        type: string
       faq_priority_enabled:
         description: |-
           ===== FAQ Strategy Settings =====
@@ -3120,6 +3130,14 @@ definitions:
         description: FAQ score boost multiplier - FAQ results score multiplied by
           this factor
         type: number
+      fixed_responses:
+        additionalProperties:
+          type: string
+        description: |-
+          FixedResponses maps short sentinel keys (e.g. "OOS", "NO_ANSWER") to exact
+          verbatim responses. When the model emits [[FIXED:KEY]], the engine expands
+          it deterministically at answer publication without leaking the sentinel.
+        type: object
       history_turns:
         description: Number of history turns to keep in context. Quick-answer only;
           smart-reasoning sizes history by context window
@@ -10266,8 +10284,8 @@ definitions:
           DB connection pool size. Same multiplier caveat as IngestMapParallel.
         type: integer
       max_pages_per_ingest:
-        description: MaxPagesPerIngest limits pages created or updated per ingest.
-          0 means no limit.
+        description: MaxPagesPerIngest limits new entity and concept pages per document.
+          Existing pages and summaries are not counted. 0 means no limit.
         maximum: 1000
         minimum: 0
         type: integer
@@ -24853,7 +24871,7 @@ paths:
     post:
       consumes:
       - application/json
-      description: id 为纯数字时记录会话级 FAQ 反馈，否则将 id 作为 request_id，按 session_id + request_id
+      description: id 为纯数字时记录会话级 FAQ 反馈，否则将 id 作为 message_id，按 session_id + message_id
         记录助手消息反馈；同一会话同一对象仅可提交一次，点踩需提供原因（多选），选择"其他"时需附文字说明
       parameters:
       - description: 会话ID
@@ -24861,7 +24879,7 @@ paths:
         name: session_id
         required: true
         type: string
-      - description: 请求ID（request_id）或FAQ条目数字ID（seq_id）
+      - description: 消息ID（message_id）或FAQ条目数字ID（seq_id）
         in: path
         name: id
         required: true

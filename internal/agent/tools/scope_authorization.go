@@ -90,6 +90,9 @@ func authorizeLoadedKnowledge(
 	if knowledge == nil {
 		return nil, fmt.Errorf("knowledge_id is required")
 	}
+	if strings.EqualFold(strings.TrimSpace(knowledge.EnableStatus), "disabled") {
+		return nil, fmt.Errorf("document %s is disabled", knowledge.ID)
+	}
 	if !searchTargets.ContainsKB(knowledge.KnowledgeBaseID) {
 		return nil, fmt.Errorf("knowledge base %s is not within the current Agent scope", knowledge.KnowledgeBaseID)
 	}
@@ -144,6 +147,13 @@ func authorizeChunkInSearchTargets(
 	}
 	if !allowed {
 		return nil, fmt.Errorf("chunk %s is not within the current @mention scope", chunk.ID)
+	}
+	parent, err := authorizeKnowledgeInSearchTargets(ctx, searchTargets, chunk.KnowledgeID, knowledgeService)
+	if err != nil {
+		return nil, err
+	}
+	if parent.KnowledgeBaseID != chunk.KnowledgeBaseID {
+		return nil, fmt.Errorf("chunk %s has an inconsistent document scope", chunk.ID)
 	}
 	return chunk, nil
 }

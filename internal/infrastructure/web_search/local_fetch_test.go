@@ -39,12 +39,13 @@ func TestFallbackFetcherRetriesOnlyProviderSideFailures(t *testing.T) {
 		fallback bool
 	}{
 		{&webfetch.FetchError{Code: webfetch.ErrorProviderAuth}, true},
+		{&webfetch.FetchError{Code: webfetch.ErrorProviderFetch, Retryable: true}, true},
 		{&webfetch.FetchError{Code: webfetch.ErrorHTTP429, Retryable: true}, true},
 		{&webfetch.FetchError{Code: webfetch.ErrorHTTP5xx, Retryable: true}, true},
 		{errors.New("connection reset"), true},
 		{&webfetch.FetchError{Code: webfetch.ErrorInvalidURL}, false},
 		{&webfetch.FetchError{Code: webfetch.ErrorSSRFRejected}, false},
-		{context.DeadlineExceeded, false},
+		{context.DeadlineExceeded, true},
 	} {
 		secondary := &stubFetcher{}
 		page, err := fallbackFetcher{primary: &stubFetcher{err: tc.err}, secondary: secondary}.
@@ -58,6 +59,16 @@ func TestFallbackFetcherRetriesOnlyProviderSideFailures(t *testing.T) {
 		if !errors.Is(err, tc.err) || secondary.calls != 0 {
 			t.Fatalf("%v: err=%v calls=%d, want primary error without fallback", tc.err, err, secondary.calls)
 		}
+	}
+}
+
+func TestFallbackFetcherDoesNotRetryCanceledCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	secondary := &stubFetcher{}
+	_, err := (fallbackFetcher{primary: &stubFetcher{err: context.Canceled}, secondary: secondary}).Fetch(ctx, "https://example.com")
+	if !errors.Is(err, context.Canceled) || secondary.calls != 0 {
+		t.Fatalf("err=%v calls=%d, want canceled caller without fallback", err, secondary.calls)
 	}
 }
 

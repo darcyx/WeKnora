@@ -2,24 +2,24 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent"
-	"github.com/Tencent/WeKnora/internal/agent/collaboration"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	appconfig "github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
-	"github.com/Tencent/WeKnora/internal/models/rerank"
 	modelruntime "github.com/Tencent/WeKnora/internal/models/runtime"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
@@ -42,6 +42,30 @@ func modelMaxOutputTokens(m *types.Model) int {
 	return resolved.Capabilities().MaxOutputTokens
 }
 
+func (s *sessionService) resolveFAQPreflightModel(
+	ctx context.Context,
+	modelCtx context.Context,
+	req *types.QARequest,
+	fallback chat.Chat,
+) chat.Chat {
+	var modelID string
+	if req != nil && req.CustomAgent != nil {
+		modelID = strings.TrimSpace(req.CustomAgent.Config.FAQPreflightModelID)
+	}
+	if modelID == "" && s.cfg != nil && s.cfg.Agent != nil {
+		modelID = strings.TrimSpace(s.cfg.Agent.FAQPreflightModelID)
+	}
+	if modelID == "" || s.modelService == nil {
+		return fallback
+	}
+	model, err := s.modelService.GetChatModel(modelCtx, modelID)
+	if err != nil || model == nil {
+		logger.Warnf(ctx, "Failed to get FAQ preflight model %s, falling back to agent chat model: %v", modelID, err)
+		return fallback
+	}
+	return model
+}
+
 // AgentQA performs agent-based question answering with conversation history and streaming support
 // customAgent is optional - if provided, uses custom agent configuration instead of tenant defaults
 // summaryModelID is optional - if provided, overrides the model from customAgent config
@@ -55,217 +79,14 @@ func (s *sessionService) AgentQA(
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.Agent.QATotalTimeoutSeconds)*time.Second)
 		defer cancel()
 	}
-	sessionID := req.Session.ID
-	if req.Session.Kind == types.SessionKindAgentDelegated {
-		b := collaboration.FromContext(ctx)
-		if b == nil || b.Child == nil || b.Child.Member.SessionID != sessionID {
-			return errors.New("delegated conversations require a scheduler-owned execution")
-		}
-		if err := b.Runtime.CheckOwner(ctx, *b.Child); err != nil {
-			return err
-		}
-	}
-	// Propagate the session ID so stateful sandbox backends (CubeSandbox) can
-	// bind script execution to a per-session MicroVM instance.
-	ctx = types.WithSessionID(ctx, sessionID)
-	ctx = types.WithRunMode(ctx, req.Mode)
-	// customAgent is required for AgentQA (handler has already done permission check for shared agent)
-	if req.CustomAgent == nil {
-		logger.Warnf(ctx, "Custom agent not provided for session: %s", sessionID)
-		return errors.New("custom agent configuration is required for agent QA")
-	}
 
-	// Resolve retrieval tenant using shared helper
-	agentTenantID := s.resolveRetrievalTenantID(ctx, req)
-	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query length: %d",
-		sessionID, agentTenantID, len([]rune(req.Query)))
-
-	var tenantInfo *types.Tenant
-	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
-		tenantInfo, _ = v.(*types.Tenant)
-	}
-	// When agent belongs to another tenant (shared agent), use agent's tenant for KB/model scope; load tenantInfo if needed
-	if tenantInfo == nil || tenantInfo.ID != agentTenantID {
-		if s.tenantService != nil {
-			if agentTenant, err := s.tenantService.GetTenantByID(ctx, agentTenantID); err == nil && agentTenant != nil {
-				tenantInfo = agentTenant
-				logger.Infof(ctx, "Using agent tenant info for retrieval scope, tenant ID: %d", agentTenantID)
-			}
-		}
-	}
-	if tenantInfo == nil {
-		logger.Warnf(ctx, "Tenant info not available for agent tenant %d, proceeding with defaults", agentTenantID)
-		tenantInfo = &types.Tenant{ID: agentTenantID}
-	}
-
-	// Ensure defaults are set
-	req.CustomAgent.EnsureDefaults()
-
-	// Build AgentConfig from custom agent and tenant info
-	agentConfig, err := s.buildAgentConfig(ctx, req, tenantInfo, agentTenantID)
+	ctx, setup, err := s.prepareAgentTurnSetup(ctx, req)
 	if err != nil {
 		return err
 	}
-	if delegated, err := delegatedConfigFromBinding(ctx); err != nil {
-		return err
-	} else if delegated != nil {
-		agentConfig.AssistantAccess = delegated.level(tenantInfo)
-		if agentConfig.AssistantAccess == types.AssistantAccessReadOnly {
-			agentConfig.WritableKBIDs = nil
-		}
-	}
-	ctx = types.WithAccessLevel(ctx, agentConfig.AssistantAccess)
-	if _, scoped := types.GrantScopeFromContext(ctx); !scoped {
-		// Grants given anywhere in a conversation, including by its delegated
-		// children, belong to the root conversation.
-		grantSessionID := req.GrantSessionID
-		if grantSessionID == "" {
-			grantSessionID = sessionID
-		}
-		ctx = types.WithGrantScope(ctx, types.GrantScope{Scope: types.AgentGrantScopeSession, ScopeID: grantSessionID})
-	}
 
-	// Set VLM model ID for tool result image analysis (runtime-only field)
-	if req.CustomAgent != nil && req.CustomAgent.Config.VLMModelID != "" {
-		agentConfig.VLMModelID = req.CustomAgent.Config.VLMModelID
-	}
-
-	// Resolve model ID using shared helper (AgentQA requires a model, so error if not found)
-	effectiveModelID, modelTenantID, err := s.resolveChatModelID(
-		ctx, req, agentConfig.KnowledgeBases, agentConfig.KnowledgeIDs,
-	)
-	if err != nil {
-		return err
-	}
-	if effectiveModelID == "" {
-		logger.Warnf(ctx, "No summary model configured for custom agent %s", req.CustomAgent.ID)
-		return errors.New("summary model (model_id) is not configured in custom agent settings")
-	}
-
-	modelCtx := types.WithExecutionTenant(ctx, modelTenantID)
-	summaryModel, err := s.modelService.GetChatModel(modelCtx, effectiveModelID)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to get chat model: %v", err)
-		return fmt.Errorf("failed to get chat model: %w", err)
-	}
-
-	// The model's own metadata decides two things the agent cannot guess: how
-	// much history fits before compaction, and whether images can be passed
-	// through. Resolve it once, before the engine is built — the engine sizes
-	// its memory consolidator from MaxContextTokens at construction.
-	var agentModelSupportsVision bool
-	modelContextWindow := 0
-	if effectiveModelID != "" {
-		if modelInfo, err := s.modelService.GetModelByID(modelCtx, effectiveModelID); err == nil && modelInfo != nil {
-			agentModelSupportsVision = modelInfo.Parameters.SupportsVision
-			modelContextWindow = modelInfo.Parameters.ContextWindow
-			agentConfig.ModelMaxOutputTokens = modelMaxOutputTokens(modelInfo)
-		}
-	}
-	agentConfig.ChatModelSupportsVision = agentModelSupportsVision
-	agentConfig.MaxContextTokens = types.AgentMaxContextTokens(
-		agentConfig.MaxContextTokens, modelContextWindow,
-	)
-	logger.Infof(ctx, "Agent context window: %d tokens (model %s declares %d)",
-		agentConfig.MaxContextTokens, effectiveModelID, modelContextWindow)
-
-	// Get rerank model from custom agent config only when knowledge_search can
-	// actually run. A disabled KB scope makes all KB tools ineffective, so it
-	// must not force users to configure an otherwise-unused rerank model.
-	var rerankModel rerank.Reranker
-	if agentRequiresRerankModel(req.CustomAgent) {
-		// Rerank model is resolved purely from the agent config now.
-		// We used to fall back to ConversationConfig.RerankModelID at
-		// the tenant level, but that path encouraged "leave rerank
-		// blank on the agent and inherit silently" which made debugging
-		// retrieval quality a guessing game across tenant settings vs
-		// agent settings. Forcing the agent to declare its own rerank
-		// model puts the configuration where the user actually edits
-		// the agent. If a Wiki-only agent doesn't need reranking,
-		// agentRequiresRerankModel() below already lets it pass.
-		rerankModelID := req.CustomAgent.Config.RerankModelID
-		if rerankModelID == "" && types.UsesWorkspaceModelFallback(req.CustomAgent) {
-			// Nobody can set a rerank model on an internal agent, so it takes
-			// the workspace's; search_knowledge keeps retrieval order without one.
-			models, listErr := s.modelService.ListModels(ctx)
-			if listErr != nil {
-				logger.Warnf(ctx, "Failed to list models for internal agent %s rerank fallback: %v",
-					req.CustomAgent.ID, listErr)
-			}
-			rerankModelID = pickWorkspaceRerankModelID(models)
-			if rerankModelID == "" {
-				logger.Infof(ctx, "No rerank model in the workspace, internal agent %s searches without reranking",
-					req.CustomAgent.ID)
-			}
-		} else if rerankModelID == "" {
-			// A missing rerank model degrades ranking quality, it does not make
-			// the knowledge base unreadable: search_knowledge keeps the
-			// retrieval order without one. Failing the whole turn here turned an
-			// optional component into a hard start-up gate for every question.
-			logger.Warnf(ctx, "No rerank model configured for custom agent %s; knowledge_search will keep retrieval order",
-				req.CustomAgent.ID)
-		}
-
-		if rerankModelID != "" {
-			// A local error keeps the turn's own error value untouched: a
-			// degraded rerank must not leak into a later `if err != nil`.
-			model, getErr := s.modelService.GetRerankModel(ctx, rerankModelID)
-			if getErr != nil {
-				logger.Warnf(ctx, "Failed to get rerank model %s, searching without reranking: %v", rerankModelID, getErr)
-			} else {
-				rerankModel = model
-			}
-		}
-	} else {
-		logger.Infof(ctx, "knowledge_search is unavailable for the effective agent scope, skipping rerank model initialization")
-	}
-
-	// Load multi-turn history directly from DB (the single source of truth).
-	// AgentSteps on each historical assistant message are expanded into proper
-	// assistant_with_tool_calls + tool messages so the model can see what was
-	// tried last turn — except final_answer, which is replayed as the trailing
-	// canonical assistant message. History is sized by the window, not by a
-	// turn count: compaction and its persisted checkpoints keep it in bounds.
-	var llmContext []chat.Message
-	if agentConfig.MultiTurnEnabled {
-		budget := agent.HistoryTokenBudget(agentConfig)
-		for attempt := 0; attempt < 2; attempt++ {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
-				ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory,
-			)
-			if err == nil {
-				break
-			}
-			logger.Warnf(ctx, "Failed to load agent history (attempt %d/2): %v", attempt+1, err)
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err != nil {
-			return fmt.Errorf("failed to load conversation history; please retry: %w", err)
-		}
-		logger.Infof(ctx, "Loaded %d history messages from DB (budget=%d tokens, token scale=%.2f)",
-			len(llmContext), budget, agentConfig.ContextTokenScale)
-	} else {
-		logger.Infof(ctx, "Multi-turn disabled for this agent, running without history")
-		llmContext = []chat.Message{}
-	}
-
-	// FAQ matching belongs to the incoming question, before restoring the Agent's retrieval state.
-	if answered, err := s.tryAgentFAQ(ctx, req, agentConfig, eventBus, summaryModel, rerankModel, llmContext); answered || err != nil {
-		return err
-	}
-
-	// Hold the sandbox across this turn so an install that finishes while we
-	// are running cannot rebuild the VM between tool calls. Staging below is
-	// the first resolve: if the previous turn left a stale mark, that is
-	// where the new image is picked up. HTTP send already holds the lease it
-	// took before persisting the turn, so only direct callers take one here.
 	if !req.TurnLeaseHeld {
-		turnCtx, releaseTurn, err := s.holdSandboxTurn(ctx, sessionID, agentConfig.SandboxConfigID)
+		turnCtx, releaseTurn, err := s.holdSandboxTurn(ctx, setup.sessionID, setup.agentConfig.SandboxConfigID)
 		if err != nil {
 			return err
 		}
@@ -273,197 +94,150 @@ func (s *sessionService) AgentQA(
 		ctx = turnCtx
 	}
 
-	// Reconcile all durable session attachments into the session's remote
-	// sandbox before the model can request shell or skill execution. The
-	// durable storage URL — not the ephemeral sandbox path — remains the
-	// source of truth. Gated on the sandbox manager advertising a session
-	// filesystem capability so provider-neutral remote wiring stays here.
-	var stagedAttachments []stagedSessionAttachment
+	qaCtx := tools.WithFAQPreflightCache(ctx)
+	prepCtx, cancelPrep := context.WithCancel(qaCtx)
+	defer cancelPrep()
+
 	stager, ok := s.agentService.(sessionAttachmentStager)
 	if !ok {
 		return errors.New("agent service does not support session attachment staging")
 	}
-	// Probe the backend this session's sandbox actually runs on. Gating on the
-	// process-wide manager instead could inspect a different backend than the
-	// named workspace config selected by this agent.
-	inputStore, storeErr := stager.sessionSandboxInputStore(ctx, sessionID, agentConfig.SandboxConfigID)
-	if storeErr != nil {
-		return fmt.Errorf("resolve sandbox file store for session %s: %w", sessionID, storeErr)
-	}
-	mgr, _, layoutErr := resolveSandboxForExecution(
-		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
-		req.Session.TenantID, sessionID, agentConfig.SandboxConfigID, s.sandboxPolicy,
-		withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop),
-	)
-	layout := sessionWorkspaceLayout(
-		ctx, sessionID, mgr, layoutErr, s.hostSandbox, agentConfig.SandboxConfigID,
-	)
-	if inputStore != nil && strings.TrimSpace(layout.InputDir) != "" {
-		sessionAttachments, loadErr := s.messageRepo.GetSessionAttachments(ctx, sessionID)
-		if loadErr != nil {
-			return fmt.Errorf("load session attachments for sandbox staging: %w", loadErr)
-		}
-		stagedAttachments, err = stager.stageSessionAttachments(
-			ctx, sessionID, agentConfig.SandboxConfigID, req.Session.TenantID, sessionAttachments, layout,
-		)
-		if err != nil {
-			return fmt.Errorf("restore session attachments into sandbox: %w", err)
-		}
-		for _, staged := range stagedAttachments {
-			if staged.AttachmentPath == "" {
-				continue
-			}
-			if agentConfig.AttachmentSandboxCopies == nil {
-				agentConfig.AttachmentSandboxCopies = make(map[string]string, len(stagedAttachments))
-			}
-			agentConfig.AttachmentSandboxCopies[staged.Path] = staged.AttachmentPath
-		}
-	}
 
-	pin, err := sandboxConfigForExistingSandbox(ctx, s.sandboxPinner, sessionID)
-	if err != nil {
-		return fmt.Errorf("read sandbox scope for child tasks: %w", err)
+	baseAgentConfig := cloneAgentConfigForRun(setup.agentConfig)
+	faqModel, faqPreflight := s.startAgentFAQPreflight(qaCtx, cancelPrep, req, setup, baseAgentConfig, eventBus)
+	defer faqPreflight.stop()
+
+	baseQACtx := qaCtx
+	var (
+		prep          *agentTurnPrep
+		engineStarted bool
+	)
+	releaseEngine := func() {
+		if prep == nil || prep.engine == nil || engineStarted {
+			return
+		}
+		if cleaner, ok := prep.engine.(interface{ Cleanup(context.Context) }); ok {
+			cleaner.Cleanup(context.WithoutCancel(qaCtx))
+		}
+		prep.engine = nil
 	}
-	ctx = context.WithValue(ctx, childSourceKey{}, childSource{
-		Agent: req.CustomAgent, ModelID: effectiveModelID, SandboxConfigID: pin.ConfigID,
+	defer releaseEngine()
+
+	var prepErr error
+	prep, prepErr = s.prepareAgentTurnEngine(
+		prepCtx, baseQACtx, req, setup, baseAgentConfig, stager, eventBus, faqModel, faqPreflight.pending,
+	)
+
+	if faqPreflight.pending {
+		faqPreflight.pending = false
+		if prepErr != nil {
+			faqPreflight.stop()
+		}
+		answered, withdrawn, faqErr := faqPreflight.finish(qaCtx, prepCtx, req, eventBus)
+		switch {
+		case answered:
+			return nil
+		case faqErr != nil && (prepErr == nil || (prepCtx.Err() != nil && qaCtx.Err() == nil)):
+			return faqErr
+		case faqErr != nil && !errors.Is(faqErr, context.Canceled):
+			logger.Warnf(qaCtx, "FAQ preflight not published: %v", faqErr)
+		case withdrawn:
+			logger.Infof(qaCtx, "FAQ answer withdrawn by a steer, preparing the agent again (session=%s, message=%s)", setup.sessionID, req.AssistantMessageID)
+			releaseEngine()
+			prep, prepErr = s.prepareAgentTurnEngine(
+				baseQACtx, baseQACtx, req, setup, baseAgentConfig, stager, eventBus, faqModel, false,
+			)
+		}
+		if faqErr == nil && !withdrawn && faqPreflight.evaluation != nil && faqPreflight.evaluation.Outcome == "miss_insufficient" &&
+			faqPreflight.evaluation.BroadDocumentSearch && !faqHistoryRestrictsSources(setup.llmContext) && prep != nil && prep.engine != nil && faqTurnUnsteered(qaCtx, req) {
+			if receiver, ok := prep.engine.(interface{ SetFAQBroadDocumentSearch(string) }); ok {
+				receiver.SetFAQBroadDocumentSearch(req.Query)
+			}
+		}
+		if faqPreflight.cfg.FAQPreflightUsage != nil && prep != nil {
+			addFAQPreflightUsage(prep.config, *faqPreflight.cfg.FAQPreflightUsage)
+		}
+		if faqPreflight.cfg.FAQPreflightChecked && prep != nil {
+			prep.config.FAQPreflightChecked = true
+		}
+		if len(faqPreflight.cfg.FAQPreflightQuestions) > 0 && prep != nil {
+			prep.config.FAQPreflightQuestions = append(prep.config.FAQPreflightQuestions, faqPreflight.cfg.FAQPreflightQuestions...)
+		}
+		if prep != nil && len(faqPreflight.cfg.FAQPreflightRejections) > 0 {
+			if prep.config.FAQPreflightRejections == nil {
+				prep.config.FAQPreflightRejections = make(map[string]types.FAQPreflightRejection)
+			}
+			maps.Copy(prep.config.FAQPreflightRejections, faqPreflight.cfg.FAQPreflightRejections)
+		}
+		if prep != nil && prep.engine != nil && (faqPreflight.cfg.FAQPreflightUsage != nil || len(faqPreflight.cfg.FAQPreflightQuestions) > 0 || len(faqPreflight.cfg.FAQPreflightRejections) > 0) {
+			if applier, ok := prep.engine.(interface {
+				ApplyFAQPreflight(*types.TokenUsage, []string, map[string]types.FAQPreflightRejection)
+			}); ok {
+				applier.ApplyFAQPreflight(faqPreflight.cfg.FAQPreflightUsage, faqPreflight.cfg.FAQPreflightQuestions, faqPreflight.cfg.FAQPreflightRejections)
+			}
+		}
+	}
+	if prepErr != nil {
+		return prepErr
+	}
+	return s.executePreparedAgentTurn(qaCtx, req, setup, prep, stager, eventBus, func() {
+		engineStarted = true
 	})
+}
 
-	// Create agent engine with EventBus
-	logger.Info(ctx, "Creating agent engine")
-	engine, err := s.agentService.CreateAgentEngine(
-		ctx,
-		agentConfig,
-		summaryModel,
-		rerankModel,
-		eventBus,
-		sessionID,
-		req.AssistantMessageID,
-	)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to create agent engine: %v", err)
-		return err
+func faqSourceHistory(history []chat.Message) ([]string, bool) {
+	var messages []string
+	length := 0
+	for _, message := range history {
+		if message.Role != "user" {
+			continue
+		}
+		content := message.Content
+		if message.OriginalUserText != nil {
+			content = *message.OriginalUserText
+		}
+		length += len([]rune(content))
+		if length > 16000 {
+			return nil, false
+		}
+		messages = append(messages, content)
 	}
+	return messages, true
+}
 
-	if receiver, ok := engine.(interface{ SetRetrievalUserMessage(string, string) }); ok {
-		receiver.SetRetrievalUserMessage(req.UserMessageID, req.Query)
-	}
-	if err := s.bindAgentRetrievalState(ctx, req, agentConfig, engine); err != nil {
-		return err
-	}
-
-	// Recall long-term memory for this turn. Like the RAG path this is a
-	// no-model read, and an agent may opt out of it entirely.
-	memoryCtx := types.ApplyAgentMemoryPreference(ctx, agentConfig.MemoryEnabled)
-	if s.memoryService != nil {
-		recall := s.memoryService.Recall(memoryCtx, req.Query)
-		if recall.Prompt != "" {
-			engine.SetMemoryPrompt(recall.Prompt)
-			used := types.UsedMemoriesFromItems(recall.Items)
-			if err := eventBus.Emit(ctx, event.Event{
-				Type:      event.EventMemoryRecalled,
-				SessionID: sessionID,
-				Data:      event.MemoryRecalledData{Memories: used},
-			}); err != nil {
-				logger.Warnf(ctx, "Failed to emit memory recalled event: %v", err)
-			}
-			logger.Infof(ctx, "Injected %d long-term memories into agent context", len(used))
+func faqHistoryRestrictsSources(history []chat.Message) bool {
+	for _, message := range history {
+		if message.Role != "user" {
+			continue
+		}
+		content := message.Content
+		if message.OriginalUserText != nil {
+			content = *message.OriginalUserText
+		}
+		if agent.HasFAQSourceRestriction(content) {
+			return true
 		}
 	}
+	return false
+}
 
-	// Mid-run steering: when the caller supplied a sink, the engine will drain
-	// user-appended messages at every round boundary and persist accepted ones
-	// through it. Nil (IM/embed) keeps the old behaviour untouched.
-	if req.SteerSink != nil {
-		engine.SetSteerSink(req.SteerSink)
-		if receiver, ok := engine.(interface{ SetSteerFAQ(agent.SteerFAQFunc) }); ok {
-			receiver.SetSteerFAQ(s.steerFAQ(req, agentConfig, eventBus, summaryModel, rerankModel, llmContext))
-		}
-	}
+type agentTurnPrep struct {
+	config            *types.AgentConfig
+	qaCtx             context.Context
+	layout            sandbox.WorkspaceLayout
+	deferEmptyStaging bool
+	engine            interfaces.AgentEngine
+	recall            interfaces.MemoryRecall
+	agentQuery        string
+	agentImageURLs    []string
+}
 
-	engine.SetRunMode(req.Mode)
-	if req.RunNote != "" {
-		if noted, ok := engine.(interface{ SetRunNote(string) }); ok {
-			noted.SetRunNote(req.RunNote)
-		}
+func cloneAgentConfigForRun(cfg *types.AgentConfig) *types.AgentConfig {
+	cloned := cloneAgentConfig(cfg)
+	if cloned != nil {
+		cloned.AttachmentSandboxCopies = nil
 	}
-	collaborating := false
-	if bound, ok := engine.(interface{ HasCollaboration() bool }); ok {
-		collaborating = bound.HasCollaboration()
-	}
-	promptSuspend := s.cfg != nil && s.cfg.Agent.PromptSuspend()
-	if req.Suspendable && (promptSuspend || collaborating) {
-		if request, err := json.Marshal(resumableAgentRequest(ctx, req)); err != nil {
-			logger.Warnf(ctx, "Run cannot be suspended, encoding its request failed: %v", err)
-		} else {
-			engine.EnableSuspension(request)
-			// Scheduler-owned children always suspend on prompts: their approvals
-			// are forwarded to the parent and resumed by the scheduler.
-			if b := collaboration.FromContext(ctx); !promptSuspend && (b == nil || b.Child == nil) {
-				if restricted, ok := engine.(interface{ RestrictSuspensionToCollaboration() }); ok {
-					restricted.RestrictSuspensionToCollaboration()
-				}
-			}
-		}
-	}
-
-	// A compaction that ends on a stored turn is written back onto it, so the
-	// next turn loads the summary instead of summarizing the same history
-	// again. Without multi-turn there is no stored history to end on.
-	if agentConfig.MultiTurnEnabled {
-		engine.SetContextCheckpointSink(messageCheckpointSink{repo: s.messageRepo, sessionID: sessionID})
-	}
-
-	var agentQuery string
-	var agentImageURLs []string
-	if req.Resume == nil {
-		agentQuery, agentImageURLs = composeAgentImageQuery(
-			ctx, req.Query, req.ImageDescription, agentModelSupportsVision, req.ImageURLs,
-			agentImageDescriber(engine),
-		)
-		if agentModelSupportsVision && len(agentImageURLs) > 0 {
-			logger.Infof(ctx, "Agent model supports vision, passing %d image(s) directly", len(agentImageURLs))
-		} else if len(req.ImageURLs) > 0 && strings.Contains(agentQuery, "[用户上传图片内容]") {
-			logger.Infof(ctx, "Agent model does not support vision, appending image description")
-		} else if len(req.ImageURLs) > 0 {
-			logger.Warnf(ctx, "Agent model cannot view %d image(s) and no description was produced", len(req.ImageURLs))
-		}
-		if req.QuotedContext != "" {
-			agentQuery += "\n\n" + req.QuotedContext
-		}
-		// Stored documents are listed for read_file rather than pasted in;
-		// inline uploads without a stored document still carry their content.
-		if len(req.Attachments) > 0 {
-			agentQuery += req.Attachments.BuildAgentPrompt()
-			logger.Infof(ctx, "Appended %d attachment(s) to agent query", len(req.Attachments))
-		}
-		if manifest := buildSandboxAttachmentsPrompt(stagedAttachments, layout); manifest != "" {
-			agentQuery += manifest
-			logger.Infof(ctx, "Appended %d staged sandbox attachment path(s) to agent query", len(stagedAttachments))
-		}
-	}
-
-	// Scope envelopes (runtime_context / must_use) are injected per LLM call inside
-	// the agent engine only; we intentionally do not persist them on user messages
-	// so multi-turn history stays clean and is not skewed by stale @mention scope.
-
-	// Execute agent with streaming (asynchronously)
-	// Events will be emitted to EventBus and handled by the Handler layer
-	logger.Info(ctx, "Executing agent with streaming")
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if req.Resume != nil {
-		_, err = engine.Resume(ctx, sessionID, req.AssistantMessageID, llmContext,
-			req.Resume.Snapshot, req.Resume.Prompt)
-	} else {
-		_, err = engine.Execute(ctx, sessionID, req.AssistantMessageID, agentQuery, llmContext, agentImageURLs)
-	}
-	if err != nil {
-		// The engine has already emitted EventError for this failure.
-		logger.Errorf(ctx, "Agent execution failed: %v", err)
-	}
-	// Return empty - events will be handled by Handler via EventBus subscription
-	return nil
+	return cloned
 }
 
 type dataURIImageDescriber interface {
@@ -595,6 +369,7 @@ func (s *sessionService) buildAgentConfig(
 		RetrieveKBOnlyWhenMentioned:   customAgent.Config.RetrieveKBOnlyWhenMentioned,
 		FallbackStrategy:              customAgent.Config.FallbackStrategy,
 		FallbackResponse:              customAgent.Config.FallbackResponse,
+		FixedResponses:                customAgent.Config.FixedResponses,
 		LLMCallTimeout:                customAgent.Config.LLMCallTimeout,
 		MaxCompletionTokens:           customAgent.Config.MaxCompletionTokens,
 		MaxToolOutputChars:            customAgent.Config.MaxToolOutputChars,

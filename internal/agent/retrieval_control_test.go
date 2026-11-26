@@ -83,6 +83,39 @@ func TestRetrievalProgressRequiresObservedNewEvidence(t *testing.T) {
 	require.Error(t, control.acquire(gap, "again", retrievalRead, "测试账号", "read_document", `{}`), "a no-progress result cannot be mislabeled as a necessary read")
 }
 
+func TestRetrievalNoProgressAllowsUnmatchedOptionalQuotes(t *testing.T) {
+	control := newRetrievalControl("云存档和崩溃采集有计费标准吗", "scope")
+	gap, err := control.register(retrievalFactProposal{GoalQuote: "云存档和崩溃采集有计费标准吗", Fact: "pricing"})
+	require.NoError(t, err)
+	require.NoError(t, control.acquire(gap, "first", retrievalInitial, "", "search", `{}`))
+	require.NoError(t, control.observe("first", "崩溃采集基于第三方服务实现", retrievalSuccess))
+	require.NoError(t, control.review(gap, "first", retrievalProgress, []string{"崩溃采集基于第三方服务实现"}))
+	require.NoError(t, control.acquire(gap, "read", retrievalRead, "崩溃采集", "read_document", `{"id":"doc"}`))
+	require.NoError(t, control.observe("read", "独立游戏云存档提供 V1 与 V2 接口", retrievalSuccess))
+	// Passing an excerpt from an earlier call on no_progress must not reject the verdict.
+	require.NoError(t, control.review(gap, "read", retrievalNoProgress, []string{"崩溃采集基于第三方服务实现"}))
+	require.Equal(t, retrievalNoProgress, control.snapshot().Gaps[0].LastReview)
+}
+
+func TestRetrievalNonEvidenceVerdictsDoNotStoreQuotes(t *testing.T) {
+	for _, verdict := range []retrievalStatus{retrievalNoProgress, retrievalExhausted, retrievalNeedsUser} {
+		t.Run(string(verdict), func(t *testing.T) {
+			control := newRetrievalControl("支付配置", "scope")
+			gap, err := control.register(retrievalFactProposal{GoalQuote: "支付配置", Fact: "payment"})
+			require.NoError(t, err)
+			require.NoError(t, control.acquire(gap, "first", retrievalInitial, "", "search", `{}`))
+			require.NoError(t, control.observe("first", "未找到", retrievalSuccess))
+			require.NoError(t, control.review(gap, "first", verdict, []string{"新证据"}))
+			require.Empty(t, control.snapshot().Gaps[0].Evidence)
+			if verdict == retrievalNoProgress {
+				require.NoError(t, control.acquire(gap, "supplement", retrievalSupplement, "支付", "search", `{}`))
+				require.NoError(t, control.observe("supplement", "新证据", retrievalSuccess))
+				require.NoError(t, control.review(gap, "supplement", retrievalProgress, []string{"新证据"}))
+			}
+		})
+	}
+}
+
 func TestRetrievalTerminalStatesBlockOnlyTheirOwnGap(t *testing.T) {
 	for _, status := range []retrievalStatus{retrievalSatisfied, retrievalNeedsUser, retrievalExhausted} {
 		t.Run(string(status), func(t *testing.T) {

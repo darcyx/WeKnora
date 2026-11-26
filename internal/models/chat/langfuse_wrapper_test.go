@@ -131,3 +131,16 @@ func TestLangfuseTracksRequestedReasoningEffort(t *testing.T) {
 		})
 	}
 }
+
+func TestLangfuseTracksIsolatedTemperatureZero(t *testing.T) {
+	params := buildLangfuseModelParams(&ChatOptions{Isolated: true, Temperature: 0.7})
+	if value, ok := params["requested_temperature"]; !ok || value != float64(0) {
+		t.Fatalf("requested_temperature = %v, present = %v", value, ok)
+	}
+	if _, ok := params["temperature"]; ok {
+		t.Fatal("provider temperature cannot be inferred from isolated options")
+	}
+	if _, ok := buildLangfuseModelParams(&ChatOptions{})["temperature"]; ok {
+		t.Fatal("ordinary unset temperature was recorded")
+	}
+}

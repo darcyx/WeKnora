@@ -44,6 +44,26 @@ func mergeFAQSearchResult(faq, documents *types.ToolResult) *types.ToolResult {
 	combined.Output = faq.Output + "\n\n" + documents.Output
 	combined.Error = strings.TrimSpace(faq.Error + " " + documents.Error)
 	combined.RetrievalFailures = append(slices.Clone(faq.RetrievalFailures), documents.RetrievalFailures...)
+	combined.PublishedSources = nil
+	sourceIndexes := make(map[string]int)
+	for _, stage := range []*types.ToolResult{faq, documents} {
+		structured, observed, citable := extractToolPublishedSources(stage)
+		if !structured {
+			continue
+		}
+		if combined.PublishedSources == nil {
+			combined.PublishedSources = []types.PublishedSourceRef{}
+		}
+		for _, id := range observed {
+			isCitable := slices.Contains(citable, id)
+			if index, ok := sourceIndexes[id]; ok {
+				combined.PublishedSources[index].Citable = combined.PublishedSources[index].Citable || isCitable
+				continue
+			}
+			sourceIndexes[id] = len(combined.PublishedSources)
+			combined.PublishedSources = append(combined.PublishedSources, types.PublishedSourceRef{ID: id, Citable: isCitable})
+		}
+	}
 	displayType := "search_stages"
 	if combined.Success {
 		displayType = "search_results"

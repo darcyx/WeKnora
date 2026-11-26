@@ -51,6 +51,7 @@ type Message struct {
 	Images              []ImageAttachment `json:"images,omitempty"`
 	KnowledgeReferences []*SearchResult   `json:"knowledge_references"`
 	AgentSteps          []AgentStep       `json:"agent_steps,omitempty"` // Agent execution steps (only for assistant messages)
+	Feedback            *MessageFeedback  `json:"feedback,omitempty"`
 	IsCompleted         bool              `json:"is_completed"`
 	Channel             string            `json:"channel,omitempty"` // Source channel: "web", "api", "im", etc.
 	CreatedAt           time.Time         `json:"created_at"`
@@ -285,7 +286,7 @@ type SubmitMessageFeedbackRequest struct {
 
 // SubmitMessageFeedback records a session-scoped one-shot like/dislike vote.
 // A digit-only messageID selects a FAQ entry (seq_id); other IDs select an
-// assistant message by request_id. sessionID is required in both cases. Resubmitting on a message that already has a vote fails with the
+// assistant message by message ID. sessionID is required in both cases. Resubmitting on a message that already has a vote fails with the
 // server's 409 (see errors.ErrMessageFeedbackAlreadySubmitted).
 func (c *Client) SubmitMessageFeedback(
 	ctx context.Context,

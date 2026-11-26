@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,6 +46,7 @@ func TestRetrievalGuardOutageStillReads(t *testing.T) {
 	e, search := newRetrievalProbeEngine(t)
 	e.EnableRetrievalGuard()
 	search.output = `<retrieval><document id="a"/></retrieval>`
+	search.published = []types.PublishedSourceRef{{ID: "a", Citable: true}}
 	require.True(t, retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
 	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read",
 		[]byte(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "document content"}

@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/reranking"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 // stubReranker returns canned scores (or an error) without any network call.
@@ -244,5 +245,47 @@ func TestEmptySearchStatementDoesNotSendKeywordModeBackToKeyword(t *testing.T) {
 	msg := emptySearchStatement("ERR_4012", map[string]interface{}{"mode": SearchModeKeyword}, 1)
 	if strings.Contains(msg, "retry with mode=keyword") {
 		t.Fatalf("keyword-mode statement suggests keyword mode: %q", msg)
+	}
+}
+
+type countingKBService struct {
+	interfaces.KnowledgeBaseService
+	calls [][]string
+}
+
+func (c *countingKBService) GetKnowledgeBasesByIDsOnly(_ context.Context, ids []string) ([]*types.KnowledgeBase, error) {
+	cp := append([]string(nil), ids...)
+	c.calls = append(c.calls, cp)
+	out := make([]*types.KnowledgeBase, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, &types.KnowledgeBase{ID: id})
+	}
+	return out, nil
+}
+
+func TestRerankResultsWithKBsSkipsDuplicateKBFetch(t *testing.T) {
+	t.Parallel()
+	kbSvc := &countingKBService{}
+	tool := NewSearchKnowledgeTool(kbSvc, nil, nil, nil, &stubReranker{scores: []float64{0.9, 0.8}}, &config.Config{
+		Conversation: &config.ConversationConfig{RerankThreshold: 0.5},
+	})
+	results := []*searchResultWithMeta{
+		{SearchResult: &types.SearchResult{ID: "c1", KnowledgeBaseID: "kb-1", Content: "alpha", Score: 0.9}},
+		{SearchResult: &types.SearchResult{ID: "c2", KnowledgeBaseID: "kb-2", Content: "beta", Score: 0.8}},
+	}
+
+	known := []*types.KnowledgeBase{{ID: "kb-1"}, {ID: "kb-2"}}
+	if _, _, err := tool.rerankResultsWithKBs(context.Background(), "query", results, known, false, false); err != nil {
+		t.Fatalf("rerankResultsWithKBs: %v", err)
+	}
+	if len(kbSvc.calls) != 0 {
+		t.Fatalf("expected 0 DB calls when all KBs are known, got %v", kbSvc.calls)
+	}
+
+	if _, _, err := tool.rerankResultsWithKBs(context.Background(), "query", results, []*types.KnowledgeBase{{ID: "kb-1"}}, false, false); err != nil {
+		t.Fatalf("rerankResultsWithKBs partial: %v", err)
+	}
+	if len(kbSvc.calls) != 1 || len(kbSvc.calls[0]) != 1 || kbSvc.calls[0][0] != "kb-2" {
+		t.Fatalf("expected 1 DB call for missing kb-2, got %v", kbSvc.calls)
 	}
 }

@@ -740,6 +740,35 @@
             </div>
           </div>
 
+          <!-- FAQ 预检快模型（Agent 模式，留空则使用系统默认） -->
+          <div v-if="isAgentMode" class="setting-row">
+            <div class="setting-info">
+              <label>{{ $t('agentEditor.faqPreflight.modelLabel') }}</label>
+              <p class="desc">{{ $t('agentEditor.faqPreflight.modelDesc') }}</p>
+            </div>
+            <div class="setting-control">
+              <ModelSelector model-type="KnowledgeQA"
+                :selected-model-id="formData.config.faq_preflight_model_id" :all-models="allModels"
+                clearable
+                @update:selected-model-id="(val: string) => formData.config.faq_preflight_model_id = val"
+                @add-model="handleAddModel('llm')"
+                :placeholder="$t('agentEditor.faqPreflight.modelPlaceholder')" />
+            </div>
+          </div>
+
+          <!-- FAQ 预检直出规则（Agent 模式，留空则回退系统提示词） -->
+          <div v-if="isAgentMode" class="setting-row setting-row-vertical">
+            <div class="setting-info">
+              <label>{{ $t('agentEditor.faqPreflight.policyLabel') }}</label>
+              <p class="desc">{{ $t('agentEditor.faqPreflight.policyDesc') }}</p>
+            </div>
+            <div class="setting-control setting-control-full">
+              <t-textarea v-model="formData.config.faq_preflight_policy"
+                :placeholder="$t('agentEditor.faqPreflight.policyPlaceholder')"
+                :autosize="{ minRows: 3, maxRows: 8 }" />
+            </div>
+          </div>
+
         </div>
       </div>
 
@@ -2979,6 +3008,8 @@ const defaultFormData = {
     faq_priority_enabled: true, // 是否启用 FAQ 优先策略
     faq_direct_answer_threshold: 0.9, // FAQ 直接回答阈值（相似度高于此值直接使用 FAQ 答案）
     faq_score_boost: 1.2, // FAQ 分数加权系数
+    faq_preflight_model_id: '', // FAQ 预检快模型 ID（为空表示使用系统默认）
+    faq_preflight_policy: '', // FAQ 预检直出规则（为空表示回退系统提示词）
     // 网络搜索设置
     web_search_enabled: false,
     web_search_max_results: 5,

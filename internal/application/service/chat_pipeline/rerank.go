@@ -120,11 +120,12 @@ func (p *PluginRerank) OnEvent(ctx context.Context,
 	p.skipDisabledGeneratedQuestions(ctx, chatManage.SearchResult)
 
 	opts := reranking.Options{
-		Threshold:        chatManage.RerankThreshold,
-		TopK:             max(1, chatManage.RerankTopK),
-		MaxCandidates:    max(reranking.DefaultMaxCandidates, chatManage.RerankTopK),
-		FallbackMinScore: reranking.FallbackMinScore(chatManage.SearchTargets.HasRecallThresholdOverride()),
-		ImageKeepScore:   reranking.ImageKeepScoreFor(chatManage.VectorThreshold),
+		Threshold:           chatManage.RerankThreshold,
+		TopK:                max(1, chatManage.RerankTopK),
+		MaxCandidates:       max(reranking.DefaultMaxCandidates, chatManage.RerankTopK),
+		FallbackMinScore:    reranking.FallbackMinScore(chatManage.SearchTargets.HasRecallThresholdOverride()),
+		ImageKeepScore:      reranking.ImageKeepScoreFor(chatManage.VectorThreshold),
+		ImageOCRScoreFactor: reranking.DefaultImageOCRScoreFactor,
 	}
 	if p.kbService != nil {
 		opts.LoadImage = p.kbService.ReadChunkImage

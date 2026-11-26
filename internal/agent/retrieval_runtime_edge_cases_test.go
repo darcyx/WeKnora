@@ -194,24 +194,3 @@ func TestReviewedReadBatchIsSerialized(t *testing.T) {
 	}
 	require.Len(t, reader.calls, 2)
 }
-
-func TestObservedDocumentReferenceSurvivesIllegalText(t *testing.T) {
-	render := func(text string) string {
-		return `<documents><document id="a"><chunk id="c1"><content>` + text + `</content></chunk></document><document id="b"><chunk id="c2"/></document></documents>`
-	}
-	for name, tc := range map[string]struct {
-		content, id string
-		want        bool
-	}{
-		"clean text":           {render("配置说明"), "b", true},
-		"form feed from a PDF": {render("第一页\f第二页"), "b", true},
-		"NUL byte":             {render("a\x00b"), "c2", true},
-		"invalid UTF-8":        {render("a\xffb"), "b", true},
-		"unknown id":           {render("第一页\f第二页"), "z", false},
-		"empty id":             {render("x"), "", false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			require.Equal(t, tc.want, observedDocumentReference(tc.content, tc.id))
-		})
-	}
-}

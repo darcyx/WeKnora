@@ -332,3 +332,90 @@ func TestRerank_maxCandidatesKeepsBestRetrievalScores(t *testing.T) {
 		t.Fatalf("indices = %v, want [1 3]", res.Indices)
 	}
 }
+
+func TestRerank_imageOCRDiscountedOnlyWhenTextOrFAQPasses(t *testing.T) {
+	t.Parallel()
+
+	t.Run("mixed text and image_ocr discounts image_ocr after threshold", func(t *testing.T) {
+		in := []*types.SearchResult{
+			{ID: "ocr-1", Content: "console dashboard menu delivery rate", Score: 0.9, ChunkType: string(types.ChunkTypeImageOCR)},
+			{ID: "text-1", Content: "official delivery rate documentation", Score: 0.85, ChunkType: string(types.ChunkTypeText)},
+		}
+		res := Rerank(context.Background(), &stubReranker{scores: []float64{0.85, 0.82}}, "delivery rate", in, Options{
+			Threshold:           0.3,
+			ImageOCRScoreFactor: DefaultImageOCRScoreFactor,
+		})
+		if got := ids(res.Results); got != "text-1,ocr-1" {
+			t.Fatalf("results = %s, want text-1,ocr-1", got)
+		}
+		ocr := res.Results[1]
+		if ocr.Metadata["ocr_discounted"] != "true" {
+			t.Fatalf("expected ocr_discounted metadata, got %v", ocr.Metadata)
+		}
+		orig := 0.6*0.85 + 0.3*0.9 + 0.1
+		if ocr.Metadata["ocr_original_score"] != "0.8800" {
+			t.Fatalf("ocr_original_score = %q, want 0.8800", ocr.Metadata["ocr_original_score"])
+		}
+		if want := orig * DefaultImageOCRScoreFactor; math.Abs(ocr.Score-want) > 1e-9 {
+			t.Fatalf("discounted score = %v, want %v", ocr.Score, want)
+		}
+	})
+
+	t.Run("mixed faq and image_ocr also discounts image_ocr", func(t *testing.T) {
+		in := []*types.SearchResult{
+			{ID: "ocr-1", Content: "screenshot text", Score: 0.8, ChunkType: string(types.ChunkTypeImageOCR)},
+			{ID: "faq-1", Content: "FAQ answer", Score: 0.8, ChunkType: string(types.ChunkTypeFAQ)},
+		}
+		res := Rerank(context.Background(), &stubReranker{scores: []float64{0.8, 0.8}}, "q", in, Options{
+			Threshold:           0.3,
+			ImageOCRScoreFactor: DefaultImageOCRScoreFactor,
+		})
+		if got := ids(res.Results); got != "faq-1,ocr-1" {
+			t.Fatalf("results = %s, want faq-1,ocr-1", got)
+		}
+		if res.Results[1].Metadata["ocr_discounted"] != "true" {
+			t.Fatalf("expected ocr_discounted metadata, got %v", res.Results[1].Metadata)
+		}
+	})
+
+	t.Run("pure image_ocr batch (scanned PDF or flowchart) is exempt", func(t *testing.T) {
+		in := []*types.SearchResult{
+			{ID: "ocr-1", Content: "flowchart step 1", Score: 0.8, ChunkType: string(types.ChunkTypeImageOCR)},
+			{ID: "cap-1", Content: "flowchart diagram caption", Score: 0.7, ChunkType: string(types.ChunkTypeImageCaption)},
+		}
+		res := Rerank(context.Background(), &stubReranker{scores: []float64{0.85, 0.6}}, "flowchart", in, Options{
+			Threshold:           0.3,
+			ImageOCRScoreFactor: DefaultImageOCRScoreFactor,
+		})
+		if got := ids(res.Results); got != "ocr-1,cap-1" {
+			t.Fatalf("results = %s, want ocr-1,cap-1", got)
+		}
+		ocr := res.Results[0]
+		if ocr.Metadata["ocr_discounted"] != "" {
+			t.Fatalf("pure image batch must not discount image_ocr, got %v", ocr.Metadata)
+		}
+		want := 0.6*0.85 + 0.3*0.8 + 0.1
+		if math.Abs(ocr.Score-want) > 1e-9 {
+			t.Fatalf("score = %v, want %v", ocr.Score, want)
+		}
+	})
+
+	t.Run("threshold uses raw model_score before discounting", func(t *testing.T) {
+		in := []*types.SearchResult{
+			{ID: "ocr-1", Content: "error code screenshot", Score: 0.5, ChunkType: string(types.ChunkTypeImageOCR)},
+			{ID: "text-1", Content: "unrelated text", Score: 0.5, ChunkType: string(types.ChunkTypeText)},
+		}
+		// ocr-1 barely clears threshold 0.30 (0.31 >= 0.30); text-1 fails threshold (0.10 < 0.30).
+		// Because threshold runs on raw model_score and text-1 did not pass, ocr-1 survives undiscounted.
+		res := Rerank(context.Background(), &stubReranker{scores: []float64{0.31, 0.10}}, "q", in, Options{
+			Threshold:           0.30,
+			ImageOCRScoreFactor: DefaultImageOCRScoreFactor,
+		})
+		if got := ids(res.Results); got != "ocr-1" {
+			t.Fatalf("results = %s, want ocr-1", got)
+		}
+		if res.Results[0].Metadata["ocr_discounted"] != "" {
+			t.Fatalf("expected no discount when text candidate did not pass threshold, got %v", res.Results[0].Metadata)
+		}
+	})
+}

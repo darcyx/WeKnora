@@ -67,15 +67,12 @@ func (f fallbackFetcher) Fetch(ctx context.Context, rawURL string) (*types.WebPa
 }
 
 func providerSideFailure(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false
-	}
 	var fetchErr *webfetch.FetchError
 	if !errors.As(err, &fetchErr) {
 		return true
 	}
 	switch fetchErr.Code {
-	case webfetch.ErrorProviderAuth, webfetch.ErrorHTTP429, webfetch.ErrorHTTP5xx:
+	case webfetch.ErrorProviderAuth, webfetch.ErrorProviderFetch, webfetch.ErrorHTTP429, webfetch.ErrorHTTP5xx:
 		return true
 	}
 	return false

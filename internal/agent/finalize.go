@@ -75,20 +75,29 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	providerDone := false
 	terminalContent := ""
 	splitter := agenttools.NewThinkStreamSplitter()
+	sentinelGate := newFixedSentinelStreamGate(e.config.FixedResponses)
+	refGate := newReferenceSectionStreamGate()
 
 	var llmResult *streamLLMResult
 	var err error
-	// This phase has its own single overflow retry. The last tool results and
-	// the tool-free synthesis request differ from the preceding ReAct round.
-	for attempt := 0; attempt < 2; attempt++ {
+	// This phase allows one overflow retry (compacting oversized context) and
+	// one tool-call-only retry (some OpenAI-compatible models keep emitting a
+	// tool call when the transcript ends on a tool result even with tools
+	// omitted; appending an explicit user turn breaks tool-calling momentum
+	// without throwing away gathered evidence).
+	var toolOnlyResult *streamLLMResult
+	var toolOnlyMessages []chat.Message
+	overflowRetried := false
+	for attempt := 0; attempt < 3; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		inputTokens := e.finalAnswerInputTokens(messages, runtimeNotice)
 		budget := e.clampCompletionBudgetToContext(inputTokens)
 		if e.config.MaxContextTokens > 0 && inputTokens+budget > e.config.MaxContextTokens {
-			return fmt.Errorf("final answer synthesis cannot fit after compaction: estimated input %d tokens "+
+			err = fmt.Errorf("final answer synthesis cannot fit after compaction: estimated input %d tokens "+
 				"plus completion budget %d exceeds context window %d", inputTokens, budget, e.config.MaxContextTokens)
+			break
 		}
 		llmResult, err = e.streamLLMToEventBus(
 			ctx,
@@ -108,6 +117,8 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 				}
 				_, answerContent := splitter.Feed(chunk.Content)
 				if splitter.TakeAnswerReset() {
+					sentinelGate.Reset()
+					refGate.Reset()
 					e.retractAnswer(ctx, sessionID, answerID)
 					published.Reset()
 				}
@@ -115,6 +126,10 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 					_, tail := splitter.Flush()
 					answerContent += tail
 					providerDone = true
+				}
+				answerContent = refGate.Feed(sentinelGate.Feed(answerContent))
+				if chunk.Done && !sentinelGate.Held() {
+					answerContent += refGate.Flush()
 				}
 				// Do not close the answer until the whole stream has succeeded: a
 				// later error may require replacing this attempt with a retry.
@@ -154,9 +169,39 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if err == nil || attempt == 1 || !overflow {
+		if err == nil {
+			visible := strings.TrimSpace(agenttools.StripThinkBlocks(llmResult.Content))
+			if visible == "" && len(llmResult.ToolCalls) > 0 && toolOnlyResult == nil {
+				toolOnlyResult = llmResult
+				toolOnlyMessages = messages
+				logger.Warnf(ctx, "[Agent][FinalAnswer] Tool-call-only synthesis (tool_calls=%d); retrying with explicit plain-text instruction",
+					len(llmResult.ToolCalls))
+				messages = append(slices.Clone(messages), chat.Message{
+					Role: "user",
+					Content: "Tool execution has already ended and tools are unavailable. " +
+						"Do not call any tools; directly write the final answer to the original question " +
+						"based solely on the evidence gathered above.",
+				})
+				if e.finalAnswerNeedsCompaction(messages, runtimeNotice) {
+					messages, _ = e.compactFinalAnswerContext(ctx, messages, state.CurrentRound+1,
+						runtimeNotice, compaction.ReasonThreshold)
+				}
+				if published.Len() > 0 {
+					e.retractAnswer(ctx, sessionID, answerID)
+				}
+				published.Reset()
+				providerDone, terminalContent = false, ""
+				splitter = agenttools.NewThinkStreamSplitter()
+				sentinelGate.Reset()
+				refGate.Reset()
+				continue
+			}
 			break
 		}
+		if overflowRetried || !overflow {
+			break
+		}
+		overflowRetried = true
 		logger.Warnf(ctx, "[Agent][FinalAnswer] Context overflow; compacting before one retry: %v", err)
 		compacted, changed := e.compactFinalAnswerContext(ctx, messages, state.CurrentRound+1,
 			runtimeNotice, compaction.ReasonOverflow)
@@ -173,6 +218,22 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		published.Reset()
 		providerDone, terminalContent = false, ""
 		splitter = agenttools.NewThinkStreamSplitter()
+		sentinelGate.Reset()
+		refGate.Reset()
+	}
+	if toolOnlyResult != nil && (err != nil || strings.TrimSpace(agenttools.StripThinkBlocks(llmResult.Content)) == "") {
+		if err != nil {
+			logger.Warnf(ctx, "[Agent][FinalAnswer] Tool-only retry failed; using fallback: %v", err)
+		}
+		if published.Len() > 0 {
+			e.retractAnswer(ctx, sessionID, answerID)
+		}
+		published.Reset()
+		terminalContent = ""
+		splitter = agenttools.NewThinkStreamSplitter()
+		sentinelGate.Reset()
+		refGate.Reset()
+		llmResult, messages, err = toolOnlyResult, toolOnlyMessages, nil
 	}
 	if err != nil {
 		logger.Errorf(ctx, "[Agent][FinalAnswer] Final answer generation failed: %v", err)
@@ -190,14 +251,20 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	if err != nil {
 		return err
 	}
-	if holdAnswer {
+	if holdAnswer || sentinelGate.Held() || refGate.Held() {
 		// An interrupted step can still produce its private report despite the final instruction.
 		if state.Plan != nil && isPrivatePlanReport(public) {
 			public = e.fallbackAnswer()
 		}
-		terminalContent = fullAnswer
-	}
-	if public != fullAnswer {
+		if published.Len() > 0 && strings.HasPrefix(public, published.String()) {
+			fullAnswer, terminalContent, tail = public, "", public[published.Len():]
+		} else {
+			if published.Len() > 0 {
+				e.retractAnswer(ctx, sessionID, answerID)
+			}
+			fullAnswer, terminalContent, tail = public, "", public
+		}
+	} else if public != fullAnswer {
 		if published.Len() > 0 {
 			e.retractAnswer(ctx, sessionID, answerID)
 		}

@@ -96,13 +96,20 @@ func TestMergeCitationsIntoItems_AddsNewSlugsAndUnionsChunksAcrossBatches(t *tes
 		},
 	}
 
-	gotE, gotC, _ := mergeCitationsIntoItems(entities, concepts, nil, newSlugs)
+	gotE, gotC, uncited := mergeCitationsIntoItems(entities, concepts, nil, newSlugs)
 
 	if len(gotE) != 2 {
 		t.Fatalf("expected 2 entities, got %d (%+v)", len(gotE), gotE)
 	}
 	if len(gotC) != 1 {
 		t.Fatalf("expected 1 concept, got %d (%+v)", len(gotC), gotC)
+	}
+	if uncited != 0 {
+		t.Errorf("expected uncited = 0 after new_slugs backfilled entity/known, got %d", uncited)
+	}
+	known := findBySlug(gotE, "entity/known")
+	if known == nil || !equalStrings(known.SourceChunks, []string{"c020"}) {
+		t.Errorf("entity/known source_chunks = %+v, want [c020] (must not drop duplicate new_slug citations)", known)
 	}
 	fresh := findBySlug(gotE, "entity/fresh")
 	if fresh == nil {

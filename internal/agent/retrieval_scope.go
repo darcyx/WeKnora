@@ -191,6 +191,12 @@ func restoreRetrievalForScope(saved retrievalState, scope string) (*retrievalCon
 // ledger, which only forgets spent search allowances. Returning the error would
 // fail every later turn, because the stored ledger is never rewritten.
 func (e *AgentEngine) restoreSavedRetrieval(ctx context.Context, saved retrievalState) (*retrievalControl, error) {
+	for _, attempt := range saved.Attempts {
+		if attempt.Completed && attempt.Outcome == retrievalSuccess && kbToolNames[attempt.Tool] && !attempt.StructuredSources {
+			logger.Warnf(ctx, "Discarding retrieval snapshot without structured source identities; starting a fresh ledger")
+			return nil, nil
+		}
+	}
 	c, err := restoreRetrievalForScope(saved, e.retrieval.snapshot().Scope)
 	if errors.Is(err, errRetrievalSnapshotOutdated) || errors.Is(err, errRetrievalScopeUnverified) {
 		logger.Warnf(ctx, "Discarding retrieval snapshot version %d; starting a fresh ledger: %v", saved.Version, err)

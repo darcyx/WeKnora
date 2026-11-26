@@ -1977,6 +1977,14 @@ export default {
       hint: '空欄または0でデフォルト（120秒）を使用します',
       placeholder: '秒数を入力してください。推奨範囲は60〜1800'
     },
+    faqPreflight: {
+      modelLabel: 'FAQ プリフライト高速モデル',
+      modelDesc: 'FAQ プリフライト判定に使用するチャットモデル。空欄の場合はシステムデフォルトを使用します',
+      modelPlaceholder: 'モデルを選択（空欄でシステムデフォルト）',
+      policyLabel: 'FAQ プリフライト直接回答ルール',
+      policyDesc: 'FAQ プリフライト一致時の直接回答ルール（任意）。空欄の場合はシステムプロンプトにフォールバックします',
+      policyPlaceholder: '空欄の場合はシステムプロンプトにフォールバックします'
+    },
     imageUpload: {
       navLabel: '添付ファイルのアップロード',
       sectionTitle: '添付ファイルのアップロード',

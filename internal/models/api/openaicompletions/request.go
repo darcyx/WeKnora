@@ -372,8 +372,12 @@ func (c *Client) applyThinking(body map[string]any, opts *api.Options, stream bo
 	}
 	effortField := orDefault(s.ReasoningEffortField, "reasoning_effort")
 	budget := 0
-	if enabled && opts != nil && s.ThinkingBudgetField != "" {
-		budget = opts.ThinkingBudgetTokens
+	if enabled && s.ThinkingBudgetField != "" {
+		if opts != nil && opts.ThinkingBudgetTokens > 0 {
+			budget = opts.ThinkingBudgetTokens
+		} else if effort == "" && level.Graded() {
+			budget = defaultOpenAIThinkingBudget(level)
+		}
 	}
 	if effort != "" && s.ThinkingBudgetExcludesEffort {
 		// The two fields are mutually exclusive on this vendor and sending
@@ -466,4 +470,23 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func defaultOpenAIThinkingBudget(level api.ReasoningEffort) int {
+	switch level {
+	case api.ReasoningMinimal:
+		return 1024
+	case api.ReasoningLow:
+		return 2048
+	case api.ReasoningMedium:
+		return 8192
+	case api.ReasoningHigh:
+		return 16384
+	case api.ReasoningXHigh:
+		return 32768
+	case api.ReasoningMax:
+		return 63999
+	default:
+		return 0
+	}
 }
