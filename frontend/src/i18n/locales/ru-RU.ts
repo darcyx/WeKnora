@@ -8,7 +8,9 @@ import model from './ru-RU/model.ts'
 import settings from './ru-RU/settings.ts'
 import system from './ru-RU/system.ts'
 
+import { feedbackAdminEN } from '../feedbackAdminMessages'
 export default {
+  feedbackAdmin: feedbackAdminEN,
   ...common,
   ...auth,
   ...chat,

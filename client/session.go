@@ -297,6 +297,7 @@ type StreamResponse struct {
 	Usage *TokenUsage `json:"usage,omitempty"`
 
 	ID                  string                 `json:"id"`                             // Unique identifier
+	MessageID           string                 `json:"message_id,omitempty"`           // Assistant message ID
 	ResponseType        ResponseType           `json:"response_type"`                  // Response type
 	Content             string                 `json:"content"`                        // Current content fragment
 	Done                bool                   `json:"done"`                           // Whether completed

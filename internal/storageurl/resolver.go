@@ -40,6 +40,7 @@ type FileServiceResolver struct {
 	tenantService   interfaces.TenantService
 	ctx             context.Context
 	cache           map[fileServiceKey]interfaces.FileService
+	handles         map[string]interfaces.FileService
 	owners          map[uint64]*types.Tenant
 	authorize       func(context.Context, string) error
 }
@@ -57,6 +58,7 @@ func NewFileServiceResolver(
 		defaultSvc: defaultSvc,
 		ctx:        context.Background(),
 		cache:      make(map[fileServiceKey]interfaces.FileService),
+		handles:    make(map[string]interfaces.FileService),
 		owners:     make(map[uint64]*types.Tenant),
 	}
 	if len(storageResolvers) > 0 {
@@ -101,10 +103,7 @@ func (r *FileServiceResolver) ResolveFileService(filePath string) interfaces.Fil
 		}
 	}
 	if _, ok := types.ParseResourcePath(filePath); ok {
-		if r.resourceCatalog != nil {
-			return r.resolveResource(filePath)
-		}
-		return r.defaultSvc
+		return r.resolveResourceHandle(filePath)
 	}
 	backendID, _, _ := types.ParseStorageBackendPath(filePath)
 	provider := types.ParseProviderScheme(filePath)
@@ -117,6 +116,45 @@ func (r *FileServiceResolver) ResolveFileService(filePath string) interfaces.Fil
 		}
 	}
 	return r.resolveStorage(r.tenant, backendID, provider, backendID == "")
+}
+
+// resolveResourceHandle picks the FileService that owns a `resource://` handle.
+//
+// The IM path wires a resource catalog into the resolver and resolves the handle
+// itself. The API path has no catalog of its own — it only receives the storage
+// backend service — so it asks that service to resolve the handle against the
+// backend recorded on the resource row. Skipping that step and handing the
+// handle to the process-wide default is what produced URLs like
+// `<bucket>.cos.<region>.myqcloud.com/storage%3A//<backend>/cos%3A//…` on
+// deployments whose global default is a raw COS driver: the driver percent-encodes
+// the canonical physical path because it was never scoped to that backend.
+//
+// A nil result means the handle names no backend (legacy rows) or cannot be
+// resolved; those keep the historical process-wide default so older resources
+// still render. An error is not recoverable that way — the backend exists but
+// failed — so it degrades to no rewrite, which the client answers with the
+// authenticated /files proxy.
+func (r *FileServiceResolver) resolveResourceHandle(reference string) interfaces.FileService {
+	if r.resourceCatalog != nil {
+		return r.resolveResource(reference)
+	}
+	backendResolver, ok := r.storageResolver.(interfaces.ResourceFileServiceResolver)
+	if !ok {
+		return r.defaultSvc
+	}
+	if svc, ok := r.handles[reference]; ok {
+		return svc
+	}
+	svc, err := backendResolver.ResolveResourceFileService(r.ctx, reference, LocalStorageBaseDir())
+	if err != nil {
+		logger.Warnf(r.ctx, "resolve resource storage failed: src=%s err=%v", reference, err)
+		return nil
+	}
+	if svc == nil {
+		return r.defaultSvc
+	}
+	r.handles[reference] = svc
+	return svc
 }
 
 func (r *FileServiceResolver) resolveResource(reference string) interfaces.FileService {
