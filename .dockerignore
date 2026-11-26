@@ -44,6 +44,11 @@ WeKnora-lite
 /build/
 /artifacts/browserskill/
 cmd/desktop/build/bin/
+# Rebuild native archives for the image architecture; do not overwrite them in COPY . .
+third_party/anydoc-go/target/
+third_party/anydoc-go/lib/
+third_party/anydoc-go/patched-anydoc/
+third_party/anydoc-go/.anydoc-*
 
 # 本地数据 / 模型文件
 /models/

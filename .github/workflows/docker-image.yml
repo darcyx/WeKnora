@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  actions: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -14,7 +18,41 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+      app: ${{ steps.changes.outputs.app }}
+      docreader: ${{ steps.changes.outputs.docreader }}
+      sandbox: ${{ steps.changes.outputs.sandbox }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Test image selection
+        run: bash scripts/test-docker-build-changes.sh
+
+      - name: Select changed images
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=""
+          # Tags and unsuccessful previous runs publish every image: failures
+          # may have pushed only some images, including from force-pushed commits.
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/docker-image.yml/runs?branch=$GITHUB_REF_NAME&event=push&per_page=2" \
+              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)][0] | select(.conclusion == \"success\") | .head_sha // empty") || base=""
+            if [ -n "$base" ]; then
+              git fetch --no-tags --depth=1 origin "$base" || base=""
+            fi
+          fi
+          bash scripts/docker-build-changes.sh "$base" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
   build-ui:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -56,6 +94,8 @@ jobs:
           cache-to: type=gha,scope=build-ui,mode=max
 
   build-docreader:
+    needs: changes
+    if: needs.changes.outputs.docreader == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Free Disk Space
@@ -115,6 +155,8 @@ jobs:
           cache-to: type=gha,scope=build-docreader,mode=max
 
   build-sandbox:
+    needs: changes
+    if: needs.changes.outputs.sandbox == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -214,6 +256,8 @@ jobs:
           cache-to: type=gha,scope=build-sandbox-desktop-cube,mode=max
 
   build-app:
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     strategy:
       matrix:
         include:
