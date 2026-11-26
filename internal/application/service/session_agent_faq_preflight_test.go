@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -38,13 +39,17 @@ func (s *preflightKBs) HybridSearch(_ context.Context, _ string, params types.Se
 }
 
 func TestFAQSemanticPreflightUsesAgentEmbeddingTopK(t *testing.T) {
-	s, req, cfg, _ := preflightFixture(t)
-	kbs := s.knowledgeBaseService.(*preflightKBs)
-	kbs.rows = nil
-	s.cfg = &config.Config{Conversation: &config.ConversationConfig{EmbeddingTopK: 200}}
-	cfg.EmbeddingTopK = 20
-	s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, &agentFAQEvaluation{})
-	require.Equal(t, 20, kbs.matchCount)
+	for _, tc := range []struct{ configured, want int }{{9, 9}, {20, 10}} {
+		t.Run(fmt.Sprintf("topK_%d", tc.configured), func(t *testing.T) {
+			s, req, cfg, _ := preflightFixture(t)
+			kbs := s.knowledgeBaseService.(*preflightKBs)
+			kbs.rows = nil
+			s.cfg = &config.Config{Conversation: &config.ConversationConfig{EmbeddingTopK: 200}}
+			cfg.EmbeddingTopK = tc.configured
+			s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, nil, nil, nil, nil, &agentFAQEvaluation{})
+			require.Equal(t, tc.want, kbs.matchCount)
+		})
+	}
 }
 
 type preflightChunks struct {

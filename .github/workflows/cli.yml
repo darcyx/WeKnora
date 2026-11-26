@@ -64,10 +64,18 @@ jobs:
             diff_range="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
           elif [ "${{ github.event_name }}" = "push" ]; then
             base="$BASE_SHA"
-            if [ -z "$base" ] || [[ "$base" =~ ^0+$ ]]; then
-              base=$(git rev-parse HEAD^)
+            if [ -n "$base" ] && [[ ! "$base" =~ ^0+$ ]] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$base" || true
             fi
-            diff_range="$base..$GITHUB_SHA"
+            if [ -z "$base" ] || [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              echo "Previous commit unavailable; checking changes in the current commit only."
+              base=$(git rev-parse --verify HEAD^ 2>/dev/null || true)
+            fi
+            if [ -n "$base" ]; then
+              diff_range="$base..$GITHUB_SHA"
+            else
+              diff_range=""
+            fi
           else
             diff_range=""
           fi
@@ -76,6 +84,13 @@ jobs:
               git diff --name-only --diff-filter=ACMR -z "$diff_range" -- ':(glob)cli/**/*.go' |
                 xargs -0 -r gofmt -l
             )
+            if [ -n "$unformatted_cli" ]; then
+              echo "The following cli Go files are not gofmt-formatted:"
+              echo "$unformatted_cli"
+              exit 1
+            fi
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            unformatted_cli=$(git ls-files -z -- ':(glob)cli/**/*.go' | xargs -0 -r gofmt -l)
             if [ -n "$unformatted_cli" ]; then
               echo "The following cli Go files are not gofmt-formatted:"
               echo "$unformatted_cli"
