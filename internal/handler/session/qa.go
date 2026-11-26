@@ -210,22 +210,27 @@ func marshalAppInfo(ext map[string]interface{}) (string, error) {
 	return string(payload), nil
 }
 
-// redactAppInfo returns a copy of v without keys that name credentials.
+// redactAppInfo returns a copy of v without keys that name credentials,
+// retaining the top-level "token" key required by platform skills.
 func redactAppInfo(v interface{}) interface{} {
+	return redactAppInfoNode(v, true)
+}
+
+func redactAppInfoNode(v interface{}, topLevel bool) interface{} {
 	switch typed := v.(type) {
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(typed))
 		for key, value := range typed {
-			if isCredentialKey(key) {
+			if !(topLevel && strings.EqualFold(key, "token")) && isCredentialKey(key) {
 				continue
 			}
-			out[key] = redactAppInfo(value)
+			out[key] = redactAppInfoNode(value, false)
 		}
 		return out
 	case []interface{}:
 		out := make([]interface{}, len(typed))
 		for i, value := range typed {
-			out[i] = redactAppInfo(value)
+			out[i] = redactAppInfoNode(value, false)
 		}
 		return out
 	default:
@@ -235,7 +240,10 @@ func redactAppInfo(v interface{}) interface{} {
 
 func isCredentialKey(key string) bool {
 	key = strings.ToLower(key)
-
+	normalized := strings.NewReplacer("_", "", "-", "").Replace(key)
+	if strings.HasSuffix(normalized, "token") || normalized == "tokenvalue" {
+		return true
+	}
 	for _, marker := range []string{"password", "secret", "authorization", "apikey", "api_key", "cookie"} {
 		if strings.Contains(key, marker) {
 			return true

@@ -20,7 +20,7 @@ type historyRetryRepo struct {
 	cancel   context.CancelFunc
 }
 
-func (r *historyRetryRepo) ListMessagesBySessionBeforeCursor(ctx context.Context, sessionID string, before time.Time, beforeID string, limit int) ([]*types.Message, error) {
+func (r *historyRetryRepo) ListMessagesBySessionBeforeCursorForLLM(ctx context.Context, sessionID string, before time.Time, beforeID string, limit int) ([]*types.Message, error) {
 	r.calls++
 	if r.calls <= r.failures {
 		if r.cancel != nil && r.calls == r.failures {
@@ -28,7 +28,7 @@ func (r *historyRetryRepo) ListMessagesBySessionBeforeCursor(ctx context.Context
 		}
 		return nil, r.err
 	}
-	return r.historyRepo.ListMessagesBySessionBeforeCursor(ctx, sessionID, before, beforeID, limit)
+	return r.historyRepo.ListMessagesBySessionBeforeCursorForLLM(ctx, sessionID, before, beforeID, limit)
 }
 
 func TestAgentQAHistoryRetriesOnceAndStopsWithoutHistory(t *testing.T) {

@@ -25,6 +25,6 @@ func TestMarshalAppInfoDropsCredentialFields(t *testing.T) {
 	}
 	got, err := marshalAppInfo(ext)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"platform":"h5","token_count":5,"max_tokens":42,"gameInfo":{"appId":"123","servers":[{"name":"s1"}]}}`, got)
+	require.JSONEq(t, `{"platform":"h5","token":"backend-token","token_count":5,"max_tokens":42,"gameInfo":{"appId":"123","servers":[{"name":"s1"}]}}`, got)
 	require.Contains(t, ext["gameInfo"], "token", "input must not be mutated")
 }
