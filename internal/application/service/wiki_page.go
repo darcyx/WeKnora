@@ -125,6 +125,7 @@ func (s *wikiPageService) prepareWikiPageForCreate(ctx context.Context, page *ty
 	if page.ID == "" {
 		page.ID = uuid.New().String()
 	}
+	page.Slug = normalizeSlug(page.Slug)
 	if page.Slug == "" {
 		return errors.New("wiki page slug is required")
 	}

@@ -24,9 +24,15 @@ type faqEntryLoadFiles struct {
 	downloadErr error
 	readErr     error
 	cancel      context.CancelFunc
+	onDownload  func() error
 }
 
 func (s *faqEntryLoadFiles) GetFile(_ context.Context, path string) (io.ReadCloser, error) {
+	if s.onDownload != nil {
+		if err := s.onDownload(); err != nil {
+			return nil, err
+		}
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -101,15 +107,25 @@ func testFAQImportEntryLoadFailure(t *testing.T, stage string, maxRetry int, rep
 	running := &runningFAQImportInfo{
 		TaskID: payload.TaskID, InstanceID: payload.InstanceID, EnqueuedAt: payload.EnqueuedAt,
 	}
-	if replaced {
-		running.InstanceID = "replacement"
-		pending.Message = "replacement import is pending"
-	}
 	redisClient := redis.NewClient(&redis.Options{Addr: miniredis.RunT(t).Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
 	f.svc.redisClient = redisClient
 	require.NoError(t, f.svc.saveFAQImportProgress(f.ctx, pending))
 	require.NoError(t, f.svc.setRunningFAQImportInfo(f.ctx, payload.KBID, running))
+	if replaced {
+		replacement := *running
+		replacement.InstanceID = "replacement"
+		replacementProgress := *pending
+		replacementProgress.Message = "replacement import is pending"
+		files.onDownload = func() error {
+			if err := f.svc.saveFAQImportProgress(f.ctx, &replacementProgress); err != nil {
+				return err
+			}
+			return f.svc.setRunningFAQImportInfo(f.ctx, payload.KBID, &replacement)
+		}
+		running = &replacement
+		pending = &replacementProgress
+	}
 
 	// A real worker supplies retry metadata; a plain context would make every attempt final.
 	worker := asynq.NewServerFromRedisClient(redisClient, asynq.Config{

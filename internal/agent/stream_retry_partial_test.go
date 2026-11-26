@@ -123,6 +123,21 @@ func TestStreamCancellationKeepsPartialAnswer(t *testing.T) {
 	}
 }
 
+func TestStreamCancellationPreservesPartialReasoning(t *testing.T) {
+	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeThinking, Content: "partial reasoning"}}}}}
+	engine := newTestEngine(t, model)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	engine.eventBus.On(event.EventAgentThought, func(context.Context, event.Event) error { cancel(); return nil })
+	state, err := engine.executeLoop(ctx, &types.AgentState{}, "question", emptyMessages(), emptyTools(), "session", "message")
+	require.NoError(t, err)
+	require.Empty(t, state.FinalAnswer)
+	require.False(t, state.IsComplete)
+	require.Len(t, model.calls, 1)
+	require.Len(t, state.RoundSteps, 1)
+	require.Equal(t, "partial reasoning", state.RoundSteps[0].ReasoningContent)
+}
+
 func TestLeaseLossDuringAnswerPreservesPartialAndReportsFailure(t *testing.T) {
 	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
 		{ResponseType: types.ResponseTypeAnswer, Content: "partial"},
@@ -167,6 +182,7 @@ func TestStreamCancellationKeepsAnswerWithPendingPageButton(t *testing.T) {
 			state, err := engine.executeLoop(ctx, &types.AgentState{}, "question", emptyMessages(), emptyTools(), "session", "message")
 			require.NoError(t, err)
 			require.False(t, state.IsComplete)
+			require.Len(t, model.calls, 1, "cancellation must not retry or synthesize")
 			if tool == agenttools.ToolOpenPage {
 				require.Equal(t, "the report", state.FinalAnswer, "a page button does not make the written answer a tool preamble")
 			} else {
@@ -182,10 +198,10 @@ func TestStreamCancellationKeepsAnswerWithAssembledPageButton(t *testing.T) {
 	for _, tool := range []string{agenttools.ToolOpenPage, agenttools.ToolViewPage} {
 		t.Run(tool, func(t *testing.T) {
 			model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
-				{ResponseType: types.ResponseTypeAnswer, Content: "the report"},
-				{ResponseType: types.ResponseTypeError, Content: "context canceled", Done: true, ToolCalls: []types.LLMToolCall{{
+				{ResponseType: types.ResponseTypeAnswer, Content: "the report", ToolCalls: []types.LLMToolCall{{
 					ID: "page", Type: "function", Function: types.FunctionCall{Name: tool, Arguments: `{"page":"agents"}`},
 				}}},
+				{ResponseType: types.ResponseTypeError, Content: "context canceled", Done: true},
 			}}}}
 			engine := newTestEngine(t, model)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -197,6 +213,7 @@ func TestStreamCancellationKeepsAnswerWithAssembledPageButton(t *testing.T) {
 			state, err := engine.executeLoop(ctx, &types.AgentState{}, "question", emptyMessages(), emptyTools(), "session", "message")
 			require.NoError(t, err)
 			require.False(t, state.IsComplete)
+			require.Len(t, model.calls, 1, "cancellation must not retry or synthesize")
 			if tool == agenttools.ToolOpenPage {
 				require.Equal(t, "the report", state.FinalAnswer)
 				require.Empty(t, state.RoundSteps, "the answer must not be duplicated as a thought")

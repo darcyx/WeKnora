@@ -184,6 +184,8 @@ streamLoop:
 		}
 	}
 	if err := ctx.Err(); err != nil {
+		result.Content = answerText.String()
+		result.ReasoningContent = reasoningText.String()
 		return result, err
 	}
 	guardTail, guardErr := answerGuard.Flush()

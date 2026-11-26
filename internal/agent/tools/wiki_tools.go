@@ -446,7 +446,7 @@ func (p pendingWikiPage) render(body string) string {
 //
 // It returns the joined output plus the slugs whose body was trimmed and the
 // slugs that were not rendered at all.
-func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, []string, []string, []renderedWikiPage) {
+func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (string, []string, []string, []renderedWikiPage) {
 	if len(pages) == 0 {
 		return "", nil, nil, nil
 	}
@@ -466,8 +466,8 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, [
 		total += size
 	}
 
-	usable := budget - wikiBudgetReserve
-	if usable <= 0 || total <= usable {
+	usable := budget - reserve
+	if total <= usable {
 		return strings.Join(rendered, separator), nil, nil, renderedWikiPages(pages, rendered)
 	}
 
@@ -475,7 +475,7 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, [
 	// actual evidence before treating auxiliary links as fixed overhead. Work on
 	// copies so another rendering does not lose the original metadata.
 	pages = append([]pendingWikiPage(nil), pages...)
-	perPage := (budget - wikiBudgetReserve) / len(pages)
+	perPage := usable / len(pages)
 	for i := range pages {
 		p := &pages[i]
 		bodyFloor := min(wikiMinPageBody, utf8.RuneCountInString(p.body))
@@ -535,7 +535,7 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget int) (string, [
 		omitted = append(omitted, p.page.Slug)
 	}
 	if keep == 0 {
-		return "", nil, omitted
+		return "", nil, omitted, nil
 	}
 
 	caps := splitBudgetFairly(usable-fixedCost(keep), bodySizes[:keep])
@@ -699,6 +699,7 @@ type wikiReadPageRender struct {
 	truncated []string
 	omitted   []string
 	ok        bool
+	rendered  []renderedWikiPage
 }
 
 // betterThan reports whether r shows the model strictly more pages than other,
@@ -717,59 +718,38 @@ func (r wikiReadPageRender) betterThan(other wikiReadPageRender) bool {
 // wikiReadPageFullRender renders the pages and their complete trailers, charging
 // reserve to the trailers.
 func wikiReadPageFullRender(pages []pendingWikiPage, errs []string, budget, reserve int) wikiReadPageRender {
-	output, truncatedSlugs, omittedSlugs := renderWikiPagesWithinBudget(pages, budget, reserve)
+	output, truncatedSlugs, omittedSlugs, rendered := renderWikiPagesWithinBudget(pages, budget, reserve)
 	trailers := wikiReadPageTrailers(errs, truncatedSlugs, omittedSlugs)
 	return wikiReadPageRender{
 		output:    output + trailers,
+		rendered:  rendered,
 		truncated: truncatedSlugs,
 		omitted:   omittedSlugs,
 		ok:        utf8.RuneCountInString(output)+utf8.RuneCountInString(trailers) <= budget,
 	}
 }
 
-// wikiCompactLines returns the largest slug-line allowance whose trailer bound
-// still fits room, or 0 when not even one line does.
-func wikiCompactLines(pages []pendingWikiPage, errs []string, room int) int {
-	for lines := wikiCompactTrailerMaxLines; lines > 0; lines-- {
-		if wikiCompactTrailerBound(pages, errs, lines) <= room {
-			return lines
-		}
-	}
-	return 0
-}
-
-// renderWikiPagesCompact renders a batch against a ceiling too small to hold
-// the pages plus the full trailers. The largest compact trailer that still
-// leaves the first page its stub body is charged up front, so pages plus
-// trailers are within budget by construction. When even the compact trailers do
-// not fit, a plain sentence stands in for the whole result: it carries no paired
-// markup, so nothing can be left unbalanced.
+// renderWikiPagesCompact tries progressively shorter trailers so a page can
+// fit when the full list of omitted slugs would use the entire budget.
 func renderWikiPagesCompact(pages []pendingWikiPage, errs []string, budget int) wikiReadPageRender {
-	pageFloor := utf8.RuneCountInString(pages[0].render(wikiOmittedBodyMarker))
-	maxLines := wikiCompactLines(pages, errs, budget-pageFloor)
-	if maxLines == 0 {
-		// No line fits beside the page floor, so the page is out of reach
-		// either way; spend the ceiling on naming as many dropped pages as the
-		// summaries allow.
-		maxLines = wikiCompactLines(pages, errs, budget)
-	}
-	reserve := wikiCompactTrailerBound(pages, errs, maxLines)
-	output, truncatedSlugs, omittedSlugs := renderWikiPagesWithinBudget(pages, budget, reserve)
-	trailers := wikiReadPageCompactTrailers(errs, truncatedSlugs, omittedSlugs, maxLines)
-	if utf8.RuneCountInString(output)+utf8.RuneCountInString(trailers) <= budget {
-		return wikiReadPageRender{
-			output:    output + trailers,
-			truncated: truncatedSlugs,
-			omitted:   omittedSlugs,
-			ok:        true,
+	var best wikiReadPageRender
+	for maxLines := wikiCompactTrailerMaxLines; maxLines >= 0; maxLines-- {
+		reserve := wikiCompactTrailerBound(pages, errs, maxLines)
+		output, truncated, omitted, rendered := renderWikiPagesWithinBudget(pages, budget, reserve)
+		trailers := wikiReadPageCompactTrailers(errs, truncated, omitted, maxLines)
+		candidate := wikiReadPageRender{output: output + trailers, truncated: truncated, omitted: omitted, rendered: rendered, ok: utf8.RuneCountInString(output)+utf8.RuneCountInString(trailers) <= budget}
+		if candidate.betterThan(best) {
+			best = candidate
 		}
 	}
-	return wikiReadPageRender{
-		output:    wikiReadPageTinyBudgetNote(len(pages), budget),
-		truncated: truncatedSlugs,
-		omitted:   omittedSlugs,
-		ok:        true,
+	if best.ok {
+		return best
 	}
+	omitted := make([]string, 0, len(pages))
+	for _, page := range pages {
+		omitted = append(omitted, page.page.Slug)
+	}
+	return wikiReadPageRender{output: wikiReadPageTinyBudgetNote(len(pages), budget), omitted: omitted, ok: true}
 }
 
 // renderWikiReadPageOutput renders the resolved pages and their trailers into
@@ -788,10 +768,15 @@ func renderWikiReadPageOutput(
 	pages []pendingWikiPage,
 	errs []string,
 	budget int,
-) (string, []string, []string) {
+) wikiReadPageRender {
+	// A complete page needs no truncation or omission trailer.
+	complete := wikiReadPageFullRender(pages, errs, budget, utf8.RuneCountInString(wikiReadPageTrailers(errs, nil, nil)))
+	if complete.ok && len(complete.truncated) == 0 && len(complete.omitted) == 0 {
+		return complete
+	}
 	first := wikiReadPageFullRender(pages, errs, budget, wikiBudgetReserve)
 	if first.ok && len(first.omitted) == 0 {
-		return first.output, first.truncated, first.omitted
+		return first
 	}
 
 	best := first
@@ -814,7 +799,7 @@ func renderWikiReadPageOutput(
 			"compacted them over %d resolved page(s), %d rendered",
 			budget, len(pages), len(pages)-len(best.omitted))
 	}
-	return best.output, best.truncated, best.omitted
+	return best
 }
 
 // wikiReadPageTinyBudgetNote is the last resort for a ceiling smaller than the
@@ -1187,28 +1172,28 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		return &types.ToolResult{Success: false, Error: strings.Join(errs, "; ")}, nil
 	}
 
-	finalOutput, truncatedSlugs, omittedSlugs, renderedPages := renderWikiPagesWithinBudget(pending, OutputBudget(ctx))
-	if len(omittedSlugs) > 0 {
-		hint := "Read the needed page again with knowledge_base_ids limited to its known allowed knowledge base."
-		if len(slugsToFetch) > 1 {
-			hint = "Call wiki_read_page again with fewer slugs, or limit knowledge_base_ids to the known allowed knowledge base."
+	rendered := renderWikiReadPageOutput(ctx, pending, errs, OutputBudget(ctx))
+	finalOutput, truncatedSlugs, omittedSlugs, renderedPages := rendered.output, rendered.truncated, rendered.omitted, rendered.rendered
+	if len(slugsToFetch) == 1 {
+		prefixEnd := 0
+		if len(renderedPages) > 0 {
+			prefixEnd = renderedPages[len(renderedPages)-1].end
 		}
-		finalOutput += fmt.Sprintf(
-			"\n\n<omitted_pages reason=\"output budget exceeded\">\n%s\n</omitted_pages>"+
-				"\n<hint>These pages were resolved but not rendered. "+
-				"%s</hint>",
-			strings.Join(omittedSlugs, "\n"), hint,
-		)
-	}
-	if len(errs) > 0 {
-		finalOutput += fmt.Sprintf("\n\n<errors>\n%s\n</errors>", strings.Join(errs, "\n"))
+		runes := []rune(finalOutput)
+		trailer := string(runes[prefixEnd:])
+		trailer = strings.ReplaceAll(trailer, "Call wiki_read_page again with fewer slugs to read them.", "Use knowledge_base_ids to select a knowledge base.")
+		trailer = strings.ReplaceAll(trailer, "read them with fewer slugs at a time.", "use knowledge_base_ids to select.")
+		finalOutput = string(runes[:prefixEnd]) + trailer
 	}
 	for _, slug := range slugsToFetch {
 		if kbs := alsoIn[slug]; len(kbs) > 0 && len(foundKBs[slug]) > 0 {
-			finalOutput += fmt.Sprintf(
+			note := fmt.Sprintf(
 				"\n<note>Ambiguous slug: '%s' also exists in allowed KB %v, not rendered because of knowledge_base_ids.</note>",
 				slug, kbs,
 			)
+			if utf8.RuneCountInString(finalOutput)+utf8.RuneCountInString(note) <= OutputBudget(ctx) {
+				finalOutput += note
+			}
 		}
 	}
 

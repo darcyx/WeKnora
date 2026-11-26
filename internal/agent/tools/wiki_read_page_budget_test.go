@@ -418,6 +418,9 @@ func TestWikiReadPageCompactTrailersKeepAPageOnScreen(t *testing.T) {
 		"entity/assistive-technology-vendor-map",
 	}
 	service := &fakeWikiPageService{pages: wikiPageBatch(slugs, 8000)}
+	for i, slug := range slugs {
+		service.pages[wikiPageKey("kb-1", slug)].SourceRefs = []string{fmt.Sprintf("doc-%d|Source %d", i, i)}
+	}
 
 	for _, budget := range []int{1000, 1200} {
 		t.Run(fmt.Sprintf("ceiling-%d", budget), func(t *testing.T) {
@@ -428,6 +431,16 @@ func TestWikiReadPageCompactTrailersKeepAPageOnScreen(t *testing.T) {
 			assertWellFormedPages(t, result.Output, strings.Count(result.Output, "<wiki_page>"))
 			require.GreaterOrEqual(t, strings.Count(result.Output, "<wiki_page>"), 1,
 				"the compact trailers must leave room for a page")
+			var expected []types.PublishedSourceRef
+			for i := range slugs {
+				id := fmt.Sprintf("doc-%d", i)
+				if strings.Contains(result.Output, `knowledge_id="`+id+`"`) {
+					expected = append(expected, types.PublishedSourceRef{ID: id, Citable: false})
+				}
+			}
+			require.NotEmpty(t, expected)
+			require.Less(t, len(expected), len(slugs))
+			require.Equal(t, expected, result.PublishedSources)
 
 			truncated, _ := result.Data["truncated_slugs"].([]string)
 			require.NotEmpty(t, truncated)
@@ -483,7 +496,7 @@ func TestWikiReadPageReservesBodyWhenRelationshipsExhaustBudget(t *testing.T) {
 	page := newBulkyWikiPage("kb-platform", "entity/taptap", 2500)
 	pending := pendingWikiPage{page: page, kbID: "kb-platform", body: "TAPTAP EVIDENCE " + strings.Repeat("x", 2500),
 		outLinks: []string{strings.Repeat("related ", 1200)}, inLinks: []string{strings.Repeat("incoming ", 600)}, sources: []string{`<source knowledge_id="doc-1"/>`}}
-	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 5000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 5000, wikiBudgetReserve)
 	require.Contains(t, out, "TAPTAP EVIDENCE")
 	require.Contains(t, out, "kb-platform")
 	require.Contains(t, out, "doc-1")
@@ -500,13 +513,13 @@ func TestWikiBudgetKeepsSameSlugSourcesDistinctAndEmptyBodyHonest(t *testing.T) 
 		{page: first, kbID: "kb-a", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="a"/>`}, body: "甲知识正文" + strings.Repeat("甲", 1000)},
 		{page: second, kbID: "kb-b", outLinks: []string{strings.Repeat("关系", 2200)}, sources: []string{`<source knowledge_id="b"/>`}, body: "乙知识正文" + strings.Repeat("乙", 1000)},
 	}
-	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 6000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 6000, wikiBudgetReserve)
 	require.Empty(t, omitted)
 	for _, want := range []string{"kb-a", "kb-b", `knowledge_id="a"`, `knowledge_id="b"`, "甲知识正文", "乙知识正文"} {
 		require.Contains(t, out, want)
 	}
 	require.LessOrEqual(t, utf8.RuneCountInString(out), 6000)
-	out, truncated, _, _ := renderWikiPagesWithinBudget([]pendingWikiPage{{page: first, kbID: "kb-a", body: ""}}, 5000)
+	out, truncated, _, _ := renderWikiPagesWithinBudget([]pendingWikiPage{{page: first, kbID: "kb-a", body: ""}}, 5000, wikiBudgetReserve)
 	require.Empty(t, truncated)
 	require.NotContains(t, out, "body omitted")
 }
@@ -518,7 +531,7 @@ func TestWikiBudgetKeepsFirstBodyWhenManyPagesExceedBudget(t *testing.T) {
 		page := newTestWikiPage("kb-a", slug)
 		pages = append(pages, pendingWikiPage{page: page, kbID: "kb-a", body: "PAGE EVIDENCE " + strings.Repeat("正", 1000), outLinks: []string{strings.Repeat("关系", 3000)}, sources: []string{`<source knowledge_id="doc-1"/>`}})
 	}
-	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 5000)
+	out, _, omitted, _ := renderWikiPagesWithinBudget(pages, 5000, wikiBudgetReserve)
 	require.Contains(t, out, "PAGE EVIDENCE")
 	require.Contains(t, out, `knowledge_id="doc-1"`)
 	require.NotEmpty(t, omitted)
@@ -582,7 +595,7 @@ func TestWikiOmittedPageDoesNotMarkSummarySeen(t *testing.T) {
 	require.Contains(t, next.Output, second.Summary, "a wholly omitted page must not be marked seen")
 }
 
-func TestWikiRegistryTruncationDoesNotMarkSummariesSeen(t *testing.T) {
+func TestWikiBudgetTracksVisibleSummaries(t *testing.T) {
 	first := newTestWikiPage("kb-a", "entity/first")
 	first.OutLinks = []string{"entity/target"}
 	later := newTestWikiPage("kb-a", "entity/later")
@@ -599,15 +612,17 @@ func TestWikiRegistryTruncationDoesNotMarkSummariesSeen(t *testing.T) {
 		slugs = append(slugs, fmt.Sprintf("entity/missing-%03d", i))
 	}
 	result := readPageOutput(t, WithOutputBudget(context.Background(), 1200), tool, slugs)
-	require.Greater(t, utf8.RuneCountInString(result.Output), 1200, "error trailer must trigger registry truncation")
-	require.Contains(t, result.Output, target.Summary, "the raw output alone would otherwise mark this summary seen")
+	require.LessOrEqual(t, utf8.RuneCountInString(result.Output), 1200)
 	next := readPageOutput(t, context.Background(), tool, []string{later.Slug})
-	require.Contains(t, next.Output, target.Summary, "a possibly truncated result must not commit seen state")
+	if strings.Contains(result.Output, target.Summary) {
+		require.NotContains(t, next.Output, target.Summary)
+	} else {
+		require.Contains(t, next.Output, target.Summary)
+	}
 }
 
-// An error trailer of missing slugs pushes the output over budget; the page
-// itself still sits intact in the registry's head window, so its sources stay published.
-func TestWikiPublishedSourcesSurviveErrorTrailerTruncation(t *testing.T) {
+// A compact error trailer leaves the visible page and its sources intact.
+func TestWikiPublishedSourcesWithCompactErrorTrailer(t *testing.T) {
 	page := newTestWikiPage("kb-a", "entity/valid")
 	page.SourceRefs = []string{"doc-1|登录文档"}
 	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{
@@ -618,9 +633,8 @@ func TestWikiPublishedSourcesSurviveErrorTrailerTruncation(t *testing.T) {
 		slugs = append(slugs, fmt.Sprintf("entity/missing-%03d", i))
 	}
 	result := readPageOutput(t, WithOutputBudget(context.Background(), 1200), tool, slugs)
-	require.Greater(t, utf8.RuneCountInString(result.Output), 1200)
-	visible := TruncateToolOutput(result.Output, 1200)
-	require.Contains(t, visible, `knowledge_id="doc-1"`, "the page must stay visible after registry truncation")
+	require.LessOrEqual(t, utf8.RuneCountInString(result.Output), 1200)
+	require.Contains(t, result.Output, `knowledge_id="doc-1"`)
 	require.Equal(t, []string{"doc-1"}, result.Data["source_knowledge_ids"])
 	require.Equal(t, []types.PublishedSourceRef{{ID: "doc-1", Citable: false}}, result.PublishedSources)
 }
@@ -690,7 +704,7 @@ func TestWikiReadPageBudgetRetainsUpToFiveSourcesBeforeSingleFallback(t *testing
 		inLinks:  []string{strings.Repeat("incoming ", 500)},
 		sources:  sources,
 	}
-	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 1800)
+	out, _, omitted, _ := renderWikiPagesWithinBudget([]pendingWikiPage{pending}, 1800, wikiBudgetReserve)
 	require.Empty(t, omitted)
 	require.Contains(t, out, "LOGIN EVIDENCE")
 	for i := 1; i <= 5; i++ {
@@ -742,7 +756,7 @@ func TestWikiPublishedSourcesIgnorePageTagsInBody(t *testing.T) {
 	}
 }
 
-func TestWikiPublishedSourcesExcludePartialPage(t *testing.T) {
+func TestWikiPublishedSourcesExcludeOmittedPage(t *testing.T) {
 	page := newTestWikiPage("kb-a", "entity/partial")
 	page.Content = `示例 <wiki_page><source knowledge_id="doc-1"/></wiki_page>`
 	page.SourceRefs = []string{"doc-1|登录文档"}
@@ -751,6 +765,19 @@ func TestWikiPublishedSourcesExcludePartialPage(t *testing.T) {
 	}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
 
 	result := readPageOutput(t, WithOutputBudget(context.Background(), 200), tool, []string{page.Slug})
-	require.Greater(t, utf8.RuneCountInString(result.Output), 200)
+	require.LessOrEqual(t, utf8.RuneCountInString(result.Output), 200)
 	require.Empty(t, result.PublishedSources)
+}
+
+func TestWikiReadPageExactFitPreservesPageAndSources(t *testing.T) {
+	page := newTestWikiPage("kb-a", "entity/exact")
+	page.SourceRefs = []string{"doc-1|source"}
+	tool := NewWikiReadPageTool(&fakeWikiPageService{pages: map[string]*types.WikiPage{wikiPageKey("kb-a", page.Slug): page}}, nil, NewWikiScopesFromKBIDs([]string{"kb-a"}), NewWikiRouteResolver())
+	full := readPageOutput(t, context.Background(), tool, []string{page.Slug})
+	budget := utf8.RuneCountInString(full.Output)
+	exact := readPageOutput(t, WithOutputBudget(context.Background(), budget), tool, []string{page.Slug})
+	require.Equal(t, full.Output, exact.Output)
+	require.Equal(t, []types.PublishedSourceRef{{ID: "doc-1", Citable: false}}, exact.PublishedSources)
+	require.Empty(t, exact.Data["truncated_slugs"])
+	require.Empty(t, exact.Data["omitted_slugs"])
 }
