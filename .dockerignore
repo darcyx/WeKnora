@@ -4,12 +4,18 @@
 .gitignore
 .gitattributes
 
-# 编辑器 / IDE 本地配置
+# 编辑器 / IDE / 本地工具缓存
 .cursor/
 .claude/
 .codebuddy/
+.codegraph/
+.baoyu-skills/
+.playwright-mcp/
+.playwright-cli/
+.pnpm-store/
 .vscode/
 .idea/
+llm_debug/
 *.swp
 *.swo
 .DS_Store
@@ -21,12 +27,16 @@
 **/__pycache__/
 **/*.pyc
 
-# Node / 前端
+# Node / 前端 / 非后端子项目
 # 注意:build-ui 用的 context 是 ./frontend,根 .dockerignore 对它无效,
-# 其它镜像(app/docreader/sandbox)的 Dockerfile 都不引用 frontend/,
-# 所以这里可以直接排除整个 frontend/ 目录。
+# website-docs/ 中的 embed.go 和 01..07/*.md 会被 internal/productdocs 编译嵌入,
+# 只能排除其中体积最大的静态站点资源目录(public/homepage)。
 **/node_modules/
 frontend/
+website-docs/public/
+website-docs/homepage/
+mcp-server/
+miniprogram/
 WeKnora-Chrome-Extension/
 
 # 日志 / 临时文件

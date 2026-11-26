@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -87,6 +89,7 @@ type AgentConfig struct {
 	ReasoningEffort             string                    `json:"reasoning_effort,omitempty"`
 	CitationEnabled             *bool                     `json:"citation_enabled"`
 	MaxIterations               int                       `json:"max_iterations"` // -1 = unlimited
+	PlanningEnabled             bool                      `json:"planning_enabled"`
 	LLMCallTimeout              int                       `json:"llm_call_timeout,omitempty"`
 	AllowedTools                []string                  `json:"allowed_tools"`
 	MCPSelectionMode            string                    `json:"mcp_selection_mode"`
@@ -107,6 +110,8 @@ type AgentConfig struct {
 	FAQPriorityEnabled          bool                      `json:"faq_priority_enabled"`
 	FAQDirectAnswerThreshold    float64                   `json:"faq_direct_answer_threshold"`
 	FAQScoreBoost               float64                   `json:"faq_score_boost"`
+	FAQPreflightModelID         string                    `json:"faq_preflight_model_id,omitempty"`
+	FAQPreflightPolicy          string                    `json:"faq_preflight_policy,omitempty"`
 	WebSearchEnabled            bool                      `json:"web_search_enabled"`
 	WebSearchMaxResults         int                       `json:"web_search_max_results"`
 	WebSearchProviderID         string                    `json:"web_search_provider_id,omitempty"`
@@ -141,6 +146,85 @@ type AgentConfig struct {
 	AttachmentParseWaitTimeoutSec int                `json:"attachment_parse_wait_timeout_sec,omitempty"`
 	MemoryEnabled                 *bool              `json:"memory_enabled,omitempty"`
 	IntentPrompts                 map[string]string  `json:"intent_prompts,omitempty"`
+
+	// Extra preserves server-side JSON keys not yet modeled on AgentConfig so
+	// fetch-then-PUT updates from an older SDK/CLI never silently wipe newer
+	// server fields.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+type agentConfigAlias AgentConfig
+
+var (
+	agentConfigKnownKeysOnce sync.Once
+	agentConfigKnownKeys     map[string]struct{}
+)
+
+func knownAgentConfigJSONKeys() map[string]struct{} {
+	agentConfigKnownKeysOnce.Do(func() {
+		t := reflect.TypeOf(agentConfigAlias{})
+		keys := make(map[string]struct{}, t.NumField())
+		for i := range t.NumField() {
+			tag := t.Field(i).Tag.Get("json")
+			if tag == "" || tag == "-" {
+				continue
+			}
+			name, _, _ := strings.Cut(tag, ",")
+			if name != "" {
+				keys[name] = struct{}{}
+			}
+		}
+		agentConfigKnownKeys = keys
+	})
+	return agentConfigKnownKeys
+}
+
+func (c *AgentConfig) UnmarshalJSON(data []byte) error {
+	var alias agentConfigAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	known := knownAgentConfigJSONKeys()
+	for k := range raw {
+		if _, ok := known[k]; ok {
+			delete(raw, k)
+		}
+	}
+	if len(raw) == 0 {
+		alias.Extra = nil
+	} else {
+		alias.Extra = raw
+	}
+	*c = AgentConfig(alias)
+	return nil
+}
+
+func (c AgentConfig) MarshalJSON() ([]byte, error) {
+	if len(c.Extra) == 0 {
+		return json.Marshal(agentConfigAlias(c))
+	}
+	baseBytes, err := json.Marshal(agentConfigAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(baseBytes, &merged); err != nil {
+		return nil, err
+	}
+	known := knownAgentConfigJSONKeys()
+	for k, v := range c.Extra {
+		if _, isKnown := known[k]; isKnown {
+			continue
+		}
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
 }
 
 type QuestionSuggestionConfig struct {

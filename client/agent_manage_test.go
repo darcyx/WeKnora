@@ -3,8 +3,15 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -117,5 +124,110 @@ func TestPatchAgentSkills(t *testing.T) {
 				t.Errorf("agent ID = %q", agent.ID)
 			}
 		})
+	}
+}
+
+func TestAgentConfigRoundTripPreservesKnownAndUnknownFields(t *testing.T) {
+	raw := `{
+		"agent_mode": "smart-reasoning",
+		"model_id": "m-1",
+		"thinking": true,
+		"reasoning_effort": "low",
+		"citation_enabled": false,
+		"planning_enabled": true,
+		"faq_preflight_model_id": "m-faq",
+		"faq_preflight_policy": "strict-policy",
+		"future_server_flag": true,
+		"future_nested": {"threshold": 0.85, "tags": ["a", "b"]}
+	}`
+	var cfg AgentConfig
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !cfg.PlanningEnabled || cfg.FAQPreflightModelID != "m-faq" || cfg.FAQPreflightPolicy != "strict-policy" {
+		t.Fatalf("missing newly added fields: %+v", cfg)
+	}
+	if len(cfg.Extra) != 2 {
+		t.Fatalf("Extra keys = %v, want 2 unknown keys", cfg.Extra)
+	}
+	// Mutate a known field and verify round-trip keeps both known & unknown fields.
+	cfg.ModelID = "m-2"
+	out, err := json.Marshal(&cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	if got["model_id"] != "m-2" {
+		t.Errorf("model_id = %v, want m-2", got["model_id"])
+	}
+	if got["faq_preflight_model_id"] != "m-faq" {
+		t.Errorf("faq_preflight_model_id = %v, want m-faq", got["faq_preflight_model_id"])
+	}
+	if got["planning_enabled"] != true {
+		t.Errorf("planning_enabled = %v, want true", got["planning_enabled"])
+	}
+	if got["future_server_flag"] != true {
+		t.Errorf("future_server_flag = %v, want true", got["future_server_flag"])
+	}
+	if nested, ok := got["future_nested"].(map[string]any); !ok || nested["threshold"] != 0.85 {
+		t.Errorf("future_nested = %#v, want threshold=0.85", got["future_nested"])
+	}
+}
+
+func TestAgentConfigCoversServerCustomAgentConfigFields(t *testing.T) {
+	serverPath := filepath.Join("..", "internal", "types", "custom_agent.go")
+	if _, err := os.Stat(serverPath); err != nil {
+		t.Skipf("server source not present at %s: %v", serverPath, err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, serverPath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", serverPath, err)
+	}
+	serverKeys := map[string]struct{}{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != "CustomAgentConfig" {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range st.Fields.List {
+				if field.Tag == nil {
+					continue
+				}
+				tag := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Get("json")
+				if tag == "" || tag == "-" {
+					continue
+				}
+				name, _, _ := strings.Cut(tag, ",")
+				if name != "" {
+					serverKeys[name] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(serverKeys) == 0 {
+		t.Fatal("failed to extract CustomAgentConfig fields from server source")
+	}
+	clientKeys := knownAgentConfigJSONKeys()
+	var missing []string
+	for k := range serverKeys {
+		if _, ok := clientKeys[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("client.AgentConfig is missing server CustomAgentConfig JSON fields: %v", missing)
 	}
 }
