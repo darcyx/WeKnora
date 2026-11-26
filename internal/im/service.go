@@ -450,6 +450,9 @@ func withIMIdentity(ctx context.Context, channel *IMChannel, msg *IncomingMessag
 		principalID := fmt.Sprintf("%d:%s:%s:%s", tenantID, channel.ID, msg.Platform, msg.UserID)
 		ctx = types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalIMUser, ID: principalID})
 		ctx = types.WithPrincipalAuthSource(ctx, types.AuthSourceIM)
+		if SessionMode(channel.SessionMode) == SessionModeThread && msg.ThreadID != "" {
+			ctx = types.WithIMThreadSessionOwner(ctx, types.IMThreadSessionOwnerID(tenantID, channel.ID, string(msg.Platform), msg.ChatID, msg.ThreadID))
+		}
 	}
 	ctx = context.WithValue(ctx, types.TenantRoleContextKey, types.TenantRoleViewer)
 	// IM bots have no live client that can complete an in-conversation MCP OAuth
@@ -2253,12 +2256,75 @@ func isSessionNotFound(err error) bool {
 // resolveSession dispatches to the appropriate session resolution strategy
 // based on the channel's session mode.
 func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string, sessionMode string) (*ChannelSession, error) {
-	switch SessionMode(sessionMode) {
-	case SessionModeThread:
-		return s.resolveThreadSession(ctx, msg, tenantID, agentID, imChannelID)
-	default: // SessionModeUser
-		return s.resolveUserSession(ctx, msg, tenantID, agentID, imChannelID)
+	var cs *ChannelSession
+	var err error
+	thread := SessionMode(sessionMode) == SessionModeThread && msg.ThreadID != ""
+	if thread {
+		cs, err = s.resolveThreadSession(ctx, msg, tenantID, agentID, imChannelID)
+	} else {
+		cs, err = s.resolveUserSession(ctx, msg, tenantID, agentID, imChannelID)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// The mapping, not the incoming sender, authorizes migration of an old owner.
+	if cs.IMChannelID == "" {
+		var channels []string
+		if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
+			return nil, err
+		}
+		if len(channels) == 1 && channels[0] == imChannelID {
+			res := s.db.WithContext(ctx).Model(&ChannelSession{}).Where("id = ? AND (im_channel_id IS NULL OR im_channel_id = '')", cs.ID).Update("im_channel_id", imChannelID)
+			if res.Error != nil {
+				return nil, res.Error
+			}
+			if res.RowsAffected > 0 {
+				cs.IMChannelID = imChannelID
+			} else if err := s.db.WithContext(ctx).First(cs, "id = ?", cs.ID).Error; err != nil {
+				return nil, err
+			}
+		}
+	}
+	if cs.IMChannelID != imChannelID {
+		return nil, fmt.Errorf("channel session belongs to a different or ambiguous IM channel")
+	}
+	owner := types.Principal{Type: types.PrincipalIMUser, ID: fmt.Sprintf("%d:%s:%s:%s", tenantID, imChannelID, msg.Platform, msg.UserID)}.StorageID()
+	oldOwner := ""
+	if thread {
+		owner = types.IMThreadSessionOwnerID(tenantID, imChannelID, string(msg.Platform), msg.ChatID, msg.ThreadID)
+		oldOwner = fmt.Sprintf("%s%d:%s:%s:%s", types.SessionOwnerIMThreadPrefix, tenantID, imChannelID, strings.TrimSpace(string(msg.Platform)), strings.TrimSpace(msg.ThreadID))
+	}
+	var existing types.Session
+	err = s.db.WithContext(ctx).Select("id", "user_id").Where("tenant_id = ? AND id = ?", tenantID, cs.SessionID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return cs, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if existing.UserID == owner {
+		return cs, nil
+	}
+	res := s.db.WithContext(ctx).Model(&types.Session{}).Where("tenant_id = ? AND id = ? AND (user_id IS NULL OR user_id = '' OR user_id = ?)", tenantID, cs.SessionID, oldOwner).Updates(map[string]interface{}{"user_id": owner, "owner_auth_source": types.AuthSourceIM})
+	if res.Error != nil {
+		return nil, fmt.Errorf("bind IM session owner: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		var count int64
+		if err := s.db.WithContext(ctx).Model(&types.Session{}).Where("tenant_id = ? AND id = ? AND user_id = ?", tenantID, cs.SessionID, owner).Count(&count).Error; err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			if err := s.db.WithContext(ctx).Model(&types.Session{}).Where("tenant_id = ? AND id = ?", tenantID, cs.SessionID).Count(&count).Error; err != nil {
+				return nil, err
+			}
+			if count == 0 {
+				return cs, nil
+			} // Let HandleMessage recycle stale mappings.
+			return nil, fmt.Errorf("IM session owner does not match channel mapping")
+		}
+	}
+	return cs, nil
 }
 
 // buildUserSessionTitle produces a human-distinguishable title for a user-mode
@@ -2328,8 +2394,8 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 	var cs ChannelSession
 	result := s.db.Where(
 		"platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? "+
-			"AND agent_id = ? AND thread_id = '' AND deleted_at IS NULL",
-		string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
+			"AND agent_id = ? AND im_channel_id = ? AND thread_id = '' AND deleted_at IS NULL",
+		string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID, imChannelID).
 		First(&cs)
 
 	if result.Error == nil {
@@ -2340,13 +2406,36 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 		return nil, fmt.Errorf("query channel session: %w", result.Error)
 	}
 
+	var channels []string
+	if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
+		return nil, err
+	}
+	if len(channels) == 1 && channels[0] == imChannelID {
+		var legacy ChannelSession
+		err := s.db.WithContext(ctx).Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND thread_id = '' AND (im_channel_id IS NULL OR im_channel_id = '') AND deleted_at IS NULL", msg.Platform, msg.UserID, msg.ChatID, tenantID, agentID).First(&legacy).Error
+		if err == nil {
+			return &legacy, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+
 	// Create a new WeKnora session. Start untitled when there's text to summarise
 	// so it gets a content-based title after the first message (see HandleMessage);
 	// fall back to the IM identity title otherwise.
 	title := imInitialSessionTitle(msg, buildUserSessionTitle)
 
+	ownerID := types.SessionOwnerIDFromContext(ctx)
+	if ownerID == "" {
+		ownerID = types.Principal{
+			Type: types.PrincipalIMUser,
+			ID:   fmt.Sprintf("%d:%s:%s:%s", tenantID, imChannelID, msg.Platform, msg.UserID),
+		}.StorageID()
+	}
 	newSession := &types.Session{
 		TenantID:    tenantID,
+		UserID:      ownerID,
 		Title:       title,
 		Description: fmt.Sprintf("Auto-created from %s IM integration", msg.Platform),
 	}
@@ -2374,8 +2463,8 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 		var existing ChannelSession
 		if findErr := s.db.Where(
 			"platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? "+
-				"AND agent_id = ? AND thread_id = '' AND deleted_at IS NULL",
-			string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
+				"AND agent_id = ? AND im_channel_id = ? AND thread_id = '' AND deleted_at IS NULL",
+			string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID, imChannelID).
 			First(&existing).Error; findErr != nil {
 			return nil, fmt.Errorf("create channel session: %w (lookup fallback: %v)", err, findErr)
 		}
@@ -2404,8 +2493,8 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 
 	var cs ChannelSession
 	result := s.db.Where(
-		"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
-		string(msg.Platform), msg.ChatID, threadID, tenantID, agentID,
+		"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND im_channel_id = ? AND deleted_at IS NULL",
+		string(msg.Platform), msg.ChatID, threadID, tenantID, agentID, imChannelID,
 	).First(&cs)
 
 	if result.Error == nil {
@@ -2416,12 +2505,32 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 		return nil, fmt.Errorf("query thread session: %w", result.Error)
 	}
 
+	var channels []string
+	if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
+		return nil, err
+	}
+	if len(channels) == 1 && channels[0] == imChannelID {
+		var legacy ChannelSession
+		err := s.db.WithContext(ctx).Where("platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND (im_channel_id IS NULL OR im_channel_id = '') AND deleted_at IS NULL", msg.Platform, msg.ChatID, threadID, tenantID, agentID).First(&legacy).Error
+		if err == nil {
+			return &legacy, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+
 	// Start untitled when there's text to summarise so it gets a content-based
 	// title after the first message; fall back to the chat/thread identity title.
 	title := imInitialSessionTitle(msg, buildThreadSessionTitle)
 
+	ownerID := types.SessionOwnerIDFromContext(ctx)
+	if ownerID == "" || !strings.HasPrefix(ownerID, types.SessionOwnerIMThreadPrefix) {
+		ownerID = types.IMThreadSessionOwnerID(tenantID, imChannelID, string(msg.Platform), msg.ChatID, threadID)
+	}
 	newSession := &types.Session{
 		TenantID:    tenantID,
+		UserID:      ownerID,
 		Title:       title,
 		Description: fmt.Sprintf("Thread-based session from %s IM", msg.Platform),
 	}
@@ -2449,8 +2558,8 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 		}
 		var existing ChannelSession
 		if findErr := s.db.Where(
-			"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
-			string(msg.Platform), msg.ChatID, threadID, tenantID, agentID,
+			"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND im_channel_id = ? AND deleted_at IS NULL",
+			string(msg.Platform), msg.ChatID, threadID, tenantID, agentID, imChannelID,
 		).First(&existing).Error; findErr != nil {
 			return nil, fmt.Errorf("create thread session: %w (lookup fallback: %v)", err, findErr)
 		}

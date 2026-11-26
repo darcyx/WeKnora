@@ -659,6 +659,15 @@ func (e *AgentEngine) streamThinkingToEventBus(
 			// Keep the saved partial answer aligned with the verified text
 			// actually streamed; any held unvalidated reference section is excluded.
 			fullContent = strings.TrimRight(streamed.String(), " \t\r\n")
+		} else {
+			// Nothing was streamed to the user yet (e.g. sentinelGate or refGate
+			// buffered the draft). Never persist raw [[FIXED:...]] sentinels or
+			// unsanitized reference sections on cancellation.
+			if sentinelGate.Held() || classifySentinelPrefix(fullContent) != sentinelPrefixNo {
+				fullContent = ""
+			} else {
+				fullContent = e.sanitizeFollowUpButtons(e.sanitizeReferenceSection(fullContent))
+			}
 		}
 	}
 	resp := &types.ChatResponse{

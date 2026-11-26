@@ -56,6 +56,8 @@ func TestValidateDataAnalysisSQLAcceptsLogicalAndPhysicalTables(t *testing.T) {
 	schema := &TableSchema{TableName: "k_doc_a"}
 	for _, query := range []string{
 		`SELECT COUNT(*) FROM dataset`,
+		`SELECT* FROM dataset`,
+		`SELECT(count(*)) FROM dataset`,
 		`SELECT * FROM "dataset" WHERE "amount" > 1`,
 		`SELECT * FROM "k_doc_a" LIMIT 10`,
 	} {
@@ -193,6 +195,13 @@ func TestDataAnalysisExecuteEndToEndUsesDatasetTable(t *testing.T) {
 	if !strings.Contains(result.Output, `"total":"2"`) {
 		t.Fatalf("unexpected output:\n%s", result.Output)
 	}
+	for _, query := range []string{`SELECT* FROM dataset`, `SELECT(count(*)) FROM dataset`} {
+		args, _ := json.Marshal(DataAnalysisInput{KnowledgeID: knowledge.ID, SQL: query})
+		got, err := tool.Execute(ctx, args)
+		if err != nil || got == nil || !got.Success {
+			t.Fatalf("execute %s: result=%+v err=%v", query, got, err)
+		}
+	}
 	// Neither the physical table name nor the knowledge ID is echoed back to
 	// the model through the query text.
 	if strings.Contains(result.Output, "k_3f1c2a8e") || strings.Contains(result.Output, knowledge.ID) {
@@ -239,5 +248,38 @@ func TestDataAnalysisExecuteAggregatesTextNumbers(t *testing.T) {
 				t.Fatalf("unexpected aggregate: %s", result.Output)
 			}
 		})
+	}
+}
+
+func TestDataAnalysisPreviewPreservesNullAndBoundsBytes(t *testing.T) {
+	db := newPlainDuckDB(t)
+	knowledge := &types.Knowledge{ID: "doc", FileType: "csv", FilePath: "doc.csv"}
+	tool := NewDataAnalysisTool(nil, &mapKnowledgeService{docs: map[string]*types.Knowledge{"doc": knowledge}}, nil, &csvFileService{files: map[string]string{"doc.csv": "id\n1\n2\n3\n4\n5\n"}}, db, "test-preview")
+	ctx := context.Background()
+	t.Cleanup(func() { tool.Cleanup(ctx) })
+	args, _ := json.Marshal(DataAnalysisInput{KnowledgeID: "doc", SQL: `SELECT NULL AS missing, '' AS empty FROM dataset`})
+	result, err := tool.Execute(WithOutputBudget(ctx, 80), args)
+	if err != nil || !result.Success {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if result.Data["truncated"] != true {
+		t.Fatalf("expected byte truncation: %+v", result.Data)
+	}
+	rows := result.Data["rows"].([]map[string]string)
+	if len(rows) == 0 || rows[0]["missing"] != "<nil>" || rows[0]["empty"] != "" {
+		t.Fatalf("NULL vs empty lost: %+v", rows)
+	}
+	if _, ok := result.Data["warnings"]; ok {
+		t.Fatalf("truncated preview must not claim complete-result warnings")
+	}
+}
+
+func TestEmptyTruncatedSQLPreviewDoesNotClaimNoMatches(t *testing.T) {
+	analysis := (&DataAnalysisTool{}).formatQueryResults(nil, "SELECT * FROM dataset", nil, true)
+	database := (&DatabaseQueryTool{}).formatQueryResults(nil, nil, true)
+	for _, output := range []string{analysis, database} {
+		if strings.Contains(output, "No matching records") || !strings.Contains(output, "preview size limit") {
+			t.Fatalf("misleading output: %s", output)
+		}
 	}
 }

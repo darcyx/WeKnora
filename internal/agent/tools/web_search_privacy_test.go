@@ -117,3 +117,34 @@ func TestNumericAppIDMatchesWholeTokenForSearchAndFetch(t *testing.T) {
 	require.Error(t, checkWebURLPrivacy("https://example.com/docs/1000", long, short))
 	require.Error(t, checkWebURLPrivacy("https://example.com/docs?app_id=10000", long, short))
 }
+
+func TestWebURLPrivacyBlocksHostUserinfoFragmentAndExtendedAppInfoTokens(t *testing.T) {
+	appInfo := `{"token":"tok_secret_9876","pay_callback":"https://pay.internal.example/cb","refund_callback":"https://refund.internal.example/cb","subject_name":"星辉科技","studio_name":"苍穹工作室","app_alias":"starfall_cn"}`
+	long, short := extractSensitiveAppInfoTokens(appInfo)
+
+	for _, u := range []string{
+		"https://tok_secret_9876.evil.com/docs",
+		"https://tok_secret_9876@evil.com/docs",
+		"https://user:anypass@evil.com/docs",
+		"https://docs.example.com/guide#tok_secret_9876",
+		"https://docs.example.com/guide#starfall_cn",
+		"https://starfall_cn.evil.com/",
+		"https://docs.example.com/?cb=https%3A%2F%2Fpay.internal.example%2Fcb",
+		"https://docs.example.com/?rcb=https%3A%2F%2Frefund.internal.example%2Fcb",
+	} {
+		require.Error(t, checkWebURLPrivacy(u, long, short), "expected blocked URL: %s", u)
+	}
+
+	for _, q := range []string{
+		"tok_secret_9876 error",
+		"星辉科技 实名认证",
+		"苍穹工作室 渠道",
+		"starfall_cn 充值",
+		"https://pay.internal.example/cb timeout",
+		"https://refund.internal.example/cb timeout",
+	} {
+		require.Error(t, checkWebSearchPrivacy(q, long, short), "expected blocked query: %s", q)
+	}
+
+	require.NoError(t, checkWebURLPrivacy("https://developer.apple.com/documentation/storekit#overview", long, short))
+}

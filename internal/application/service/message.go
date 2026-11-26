@@ -713,11 +713,11 @@ func (s *messageService) SearchMessages(ctx context.Context, params *types.Messa
 	return result, nil
 }
 
-// restrictToOwnedSessions drops results from sessions the caller does not own.
+// restrictToOwnedSessions drops results from sessions outside the caller's tenant/kind/owner scope.
 func (s *messageService) restrictToOwnedSessions(
 	ctx context.Context, tenantID uint64, ownerID string, items []*types.MessageSearchResultItem,
 ) ([]*types.MessageSearchResultItem, error) {
-	if ownerID == "" || len(items) == 0 {
+	if len(items) == 0 {
 		return items, nil
 	}
 	sessionIDs := make([]string, 0, len(items))
@@ -752,16 +752,42 @@ func (s *messageService) vectorSearchViaKB(ctx context.Context, params *types.Me
 	if cfg == nil {
 		return nil, nil // Chat history KB not configured, skip vector search
 	}
+	tenantID := types.MustTenantIDFromContext(ctx)
 
 	// Read global retrieval config for search parameters
 	rc := s.getRetrievalConfig(ctx)
+	matchCount := rc.GetEffectiveEmbeddingTopK()
+
+	// Pre-scope vector retrieval to the caller's owned normal sessions whenever
+	// feasible so other users' chats in the shared chat-history KB do not crowd
+	// out TopK/Rerank results.
+	const maxInlineOwnerKnowledgeIDs = 2000
+	var scopedKnowledgeIDs []string
+	if params.OwnerID != "" || len(params.SessionIDs) > 0 {
+		ids, err := s.messageRepo.GetOwnedMessageKnowledgeIDs(
+			ctx, tenantID, params.OwnerID, params.SessionIDs, maxInlineOwnerKnowledgeIDs+1,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve owned message knowledge IDs: %w", err)
+		}
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		if len(ids) <= maxInlineOwnerKnowledgeIDs {
+			scopedKnowledgeIDs = ids
+		} else {
+			// User has many indexed messages; widen candidate recall before owner filtering & rerank.
+			matchCount = max(matchCount*4, 100)
+		}
+	}
 
 	// Use KB HybridSearch with vector-only mode (keyword search is done separately on the messages table)
 	searchParams := types.SearchParams{
 		QueryText:            params.Query,
-		MatchCount:           rc.GetEffectiveEmbeddingTopK(),
+		MatchCount:           matchCount,
 		VectorThreshold:      rc.GetEffectiveVectorThreshold(),
 		DisableKeywordsMatch: true, // We handle keyword search separately on the messages table
+		KnowledgeIDs:         scopedKnowledgeIDs,
 	}
 
 	kbResults, err := s.kbService.HybridSearch(ctx, cfg.KnowledgeBaseID, searchParams)
@@ -773,43 +799,74 @@ func (s *messageService) vectorSearchViaKB(ctx context.Context, params *types.Me
 		return nil, nil
 	}
 
-	// Rerank results if a rerank model is configured
-	kbResults = s.rerankResults(ctx, rc, params.Query, kbResults)
-	if len(kbResults) == 0 {
-		return nil, nil
-	}
-
-	// Map KB search results back to messages via knowledge_id
-	knowledgeIDs := make([]string, 0, len(kbResults))
-	scoreByKnowledgeID := make(map[string]float64)
+	// Resolve and enforce tenant/kind/owner/session filtering BEFORE rerank so
+	// other users' or non-normal sessions cannot occupy Rerank TopK slots.
+	candidateKnowledgeIDs := make([]string, 0, len(kbResults))
+	seenKID := make(map[string]struct{}, len(kbResults))
 	for _, r := range kbResults {
-		knowledgeIDs = append(knowledgeIDs, r.KnowledgeID)
-		scoreByKnowledgeID[r.KnowledgeID] = r.Score
+		if r == nil || r.KnowledgeID == "" {
+			continue
+		}
+		if _, dup := seenKID[r.KnowledgeID]; dup {
+			continue
+		}
+		seenKID[r.KnowledgeID] = struct{}{}
+		candidateKnowledgeIDs = append(candidateKnowledgeIDs, r.KnowledgeID)
 	}
 
-	// Look up messages by their knowledge_id
-	messages, err := s.messageRepo.GetMessagesByKnowledgeIDs(ctx, knowledgeIDs)
+	messages, err := s.messageRepo.GetMessagesByKnowledgeIDs(ctx, tenantID, params.OwnerID, candidateKnowledgeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get messages by knowledge IDs: %w", err)
 	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
 
-	// Filter by session IDs if specified
-	sessionFilter := make(map[string]bool)
+	sessionFilter := make(map[string]bool, len(params.SessionIDs))
 	for _, sid := range params.SessionIDs {
 		sessionFilter[sid] = true
 	}
-
-	var results []*types.MessageSearchResultItem
+	messagesByKnowledgeID := make(map[string][]*types.MessageWithSession, len(messages))
 	for _, msg := range messages {
 		if len(sessionFilter) > 0 && !sessionFilter[msg.SessionID] {
 			continue
 		}
-		score := scoreByKnowledgeID[msg.KnowledgeID]
-		results = append(results, &types.MessageSearchResultItem{
-			MessageWithSession: *msg,
-			Score:              score,
-			MatchType:          "vector",
-		})
+		messagesByKnowledgeID[msg.KnowledgeID] = append(messagesByKnowledgeID[msg.KnowledgeID], msg)
+	}
+	if len(messagesByKnowledgeID) == 0 {
+		return nil, nil
+	}
+
+	ownedKBResults := make([]*types.SearchResult, 0, len(kbResults))
+	for _, r := range kbResults {
+		if r != nil && len(messagesByKnowledgeID[r.KnowledgeID]) > 0 {
+			ownedKBResults = append(ownedKBResults, r)
+		}
+	}
+	if len(ownedKBResults) == 0 {
+		return nil, nil
+	}
+
+	// Rerank only the caller's owned candidates.
+	ownedKBResults = s.rerankResults(ctx, rc, params.Query, ownedKBResults)
+	if len(ownedKBResults) == 0 {
+		return nil, nil
+	}
+
+	var results []*types.MessageSearchResultItem
+	seenMsg := make(map[string]struct{}, len(ownedKBResults))
+	for _, r := range ownedKBResults {
+		for _, msg := range messagesByKnowledgeID[r.KnowledgeID] {
+			if _, dup := seenMsg[msg.ID]; dup {
+				continue
+			}
+			seenMsg[msg.ID] = struct{}{}
+			results = append(results, &types.MessageSearchResultItem{
+				MessageWithSession: *msg,
+				Score:              r.Score,
+				MatchType:          "vector",
+			})
+		}
 	}
 
 	// Sort by score descending

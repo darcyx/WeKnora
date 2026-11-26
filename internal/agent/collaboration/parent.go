@@ -3,6 +3,7 @@ package collaboration
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -71,12 +72,38 @@ func (b *Binding) Context(ctx context.Context) context.Context {
 }
 
 // Start renews the parent lease until the returned cleanup function is called.
+// Re-entrant on the same Binding: nested calls (e.g. wakeParent -> Resume ->
+// executeLoop) share a single heartbeat goroutine instead of racing on CAS.
 func (b *Binding) Start(ctx context.Context) (context.Context, func()) {
 	if b.ParentOwner == "" {
 		return ctx, func() {}
 	}
-	ctx, cancel := context.WithCancel(b.Context(ctx))
+	b.heartbeatMu.Lock()
+	if b.heartbeatRefs > 0 && b.heartbeatCtx != nil {
+		b.heartbeatRefs++
+		sharedCtx := b.heartbeatCtx
+		b.heartbeatMu.Unlock()
+
+		nestedCtx, nestedCancel := context.WithCancel(b.Context(ctx))
+		stopPropagate := context.AfterFunc(sharedCtx, nestedCancel)
+		var once sync.Once
+		return nestedCtx, func() {
+			once.Do(func() {
+				stopPropagate()
+				nestedCancel()
+				b.releaseHeartbeat()
+			})
+		}
+	}
+
+	hbCtx, hbCancel := context.WithCancel(b.Context(ctx))
 	done := make(chan struct{})
+	b.heartbeatCtx = hbCtx
+	b.heartbeatCancel = hbCancel
+	b.heartbeatDone = done
+	b.heartbeatRefs = 1
+	b.heartbeatMu.Unlock()
+
 	go func() {
 		defer close(done)
 		tick := time.NewTicker(b.Runtime.heartbeatInterval())
@@ -84,11 +111,11 @@ func (b *Binding) Start(ctx context.Context) (context.Context, func()) {
 		lease := time.Now().Add(b.Runtime.Lease)
 		for {
 			select {
-			case <-ctx.Done():
+			case <-hbCtx.Done():
 				return
 			case <-tick.C:
 				completed := false
-				err := b.Runtime.Store.Change(ctx, b.Scope, func(g *Group) error {
+				err := b.Runtime.Store.Change(hbCtx, b.Scope, func(g *Group) error {
 					completed = g.Status == "completed"
 					if completed {
 						return nil
@@ -108,17 +135,43 @@ func (b *Binding) Start(ctx context.Context) (context.Context, func()) {
 				if err == nil && completed {
 					return
 				} // normal completion must not cancel final event delivery
-				if err != nil && !isFenceError(err) && time.Now().Before(lease) && ctx.Err() == nil {
+				if err != nil && !isFenceError(err) && time.Now().Before(lease) && hbCtx.Err() == nil {
 					continue
 				}
 				if err != nil {
-					cancel()
+					hbCancel()
 					return
 				}
 			}
 		}
 	}()
-	return ctx, func() { cancel(); <-done }
+	var once sync.Once
+	return hbCtx, func() {
+		once.Do(func() {
+			b.releaseHeartbeat()
+		})
+	}
+}
+
+func (b *Binding) releaseHeartbeat() {
+	b.heartbeatMu.Lock()
+	b.heartbeatRefs--
+	if b.heartbeatRefs > 0 {
+		b.heartbeatMu.Unlock()
+		return
+	}
+	cancel := b.heartbeatCancel
+	done := b.heartbeatDone
+	b.heartbeatCtx = nil
+	b.heartbeatCancel = nil
+	b.heartbeatDone = nil
+	b.heartbeatMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 // CheckParent rejects expired, replaced or closed parent executions.

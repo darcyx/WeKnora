@@ -646,7 +646,7 @@ type faqPromptKBResolver struct {
 	infos []*agent.KnowledgeBaseInfo
 }
 
-func (r faqPromptKBResolver) resolveKBAndDocInfos(context.Context, *types.AgentConfig) ([]*agent.KnowledgeBaseInfo, []*agent.SelectedDocumentInfo) {
+func (r faqPromptKBResolver) resolveKBAndDocInfos(context.Context, *types.AgentConfig, *agentKnowledgeBaseSnapshot) ([]*agent.KnowledgeBaseInfo, []*agent.SelectedDocumentInfo) {
 	return r.infos, nil
 }
 

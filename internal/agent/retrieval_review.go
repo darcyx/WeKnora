@@ -9,6 +9,10 @@ import (
 // Registering and reviewing are one decision: a rejected review must not leave
 // a new fact or prerequisite edge behind for a subsequent search to use.
 func (c *retrievalControl) applyReview(review retrievalReview) error {
+	return c.applyReviewWithOptions(review, true)
+}
+
+func (c *retrievalControl) applyReviewWithOptions(review retrievalReview, requireDistinctions bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.persistenceFailed {
@@ -17,13 +21,18 @@ func (c *retrievalControl) applyReview(review retrievalReview) error {
 	if len(review.Evidence) > 0 && (review.Status != retrievalSatisfied || review.CallID != "" || len(review.Quotes) > 0) {
 		return fmt.Errorf("evidence is only valid for satisfied and cannot be combined with call_id or quotes")
 	}
+	prev := c.snapshotLocked()
 	next := &retrievalControl{state: c.snapshotLocked(), userInputs: c.userInputs}
 	if review.Status == retrievalUserConditions {
 		if err := next.resolveUserConditions(review); err != nil {
 			return err
 		}
 		c.state = next.state
-		return c.persistLocked()
+		if err := c.persistLocked(); err != nil {
+			c.state = prev
+			return err
+		}
+		return nil
 	}
 	if len(review.UserAnswers) > 0 {
 		return fmt.Errorf("user_answers is only valid for user_conditions")
@@ -33,7 +42,7 @@ func (c *retrievalControl) applyReview(review retrievalReview) error {
 			return fmt.Errorf("new_fact requires either a necessary clarification or sufficient existing evidence, without gap_id")
 		}
 		var err error
-		review.GapID, err = next.register(*review.NewFact)
+		review.GapID, err = next.registerFact(*review.NewFact, requireDistinctions)
 		if err != nil {
 			return err
 		}
@@ -116,7 +125,11 @@ func (c *retrievalControl) applyReview(review retrievalReview) error {
 		}
 	}
 	c.state = next.state
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.state = prev
+		return err
+	}
+	return nil
 }
 
 func clarificationFields(fields []string) ([]string, error) {

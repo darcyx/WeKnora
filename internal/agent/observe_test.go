@@ -3,10 +3,13 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/agent/skills"
 	agenttoken "github.com/Tencent/WeKnora/internal/agent/token"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
@@ -432,9 +435,16 @@ func TestBuildMustUseBlock_SkipsMCPWithoutTools(t *testing.T) {
 }
 
 func TestRenderUserTurnContent_IncludesScopeBlocks(t *testing.T) {
+	skillDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(skillDir, "analysis"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "analysis", "SKILL.md"), []byte("---\nname: analysis\ndescription: Analysis\n---\n"), 0o644))
+	mgr := skills.NewManager(&skills.ManagerConfig{Enabled: true, SkillDirs: []string{skillDir}}, nil)
+	require.NoError(t, mgr.Initialize(t.Context()))
+
 	engine := &AgentEngine{
 		knowledgeBasesInfo: []*KnowledgeBaseInfo{{ID: "kb-1", Name: "Docs"}},
 		pinnedSkills:       []*PinnedSkillInfo{{Name: "analysis"}},
+		skillsManager:      mgr,
 	}
 	out := engine.RenderUserTurnContent("sess-1", "hello")
 	assert.Contains(t, out, "<runtime_context")

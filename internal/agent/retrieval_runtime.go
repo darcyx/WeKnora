@@ -127,6 +127,21 @@ func (e *AgentEngine) runtimeDocumentObserved(state retrievalState, id string) b
 			return true
 		}
 	}
+	if e.questionOrigin != nil && e.questionOrigin.Document != nil && e.questionOrigin.Document.KnowledgeID == id {
+		return true
+	}
+	if e.pageContext != nil {
+		if e.pageContext.Document != nil && e.pageContext.Document.KnowledgeID == id {
+			return true
+		}
+		if e.pageContext.Message != nil {
+			for _, ref := range e.pageContext.Message.References {
+				if ref.KnowledgeID == id {
+					return true
+				}
+			}
+		}
+	}
 	for _, kb := range e.knowledgeBasesInfo {
 		if kb == nil {
 			continue

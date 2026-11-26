@@ -157,6 +157,12 @@ func faqFingerprint(meta *types.FAQChunkMetadata) string {
 	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
+type faqKBInfoResolver interface {
+	resolveKBAndDocInfos(context.Context, *types.AgentConfig, *agentKnowledgeBaseSnapshot) ([]*agent.KnowledgeBaseInfo, []*agent.SelectedDocumentInfo)
+}
+
+var _ faqKBInfoResolver = (*agentService)(nil)
+
 // faqAssistantRequirements renders the engine base only when its inputs can be
 // established before engine creation. Otherwise the normal agent must answer.
 func (s *sessionService) faqAssistantRequirements(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig) (string, bool) {
@@ -172,13 +178,11 @@ func (s *sessionService) faqAssistantRequirements(ctx context.Context, req *type
 		if pure == rag {
 			template = pure
 		} else {
-			resolver, ok := s.agentService.(interface {
-				resolveKBAndDocInfos(context.Context, *types.AgentConfig) ([]*agent.KnowledgeBaseInfo, []*agent.SelectedDocumentInfo)
-			})
+			resolver, ok := s.agentService.(faqKBInfoResolver)
 			if !ok {
 				return "", false
 			}
-			kbInfos, _ := resolver.resolveKBAndDocInfos(ctx, cfg)
+			kbInfos, _ := resolver.resolveKBAndDocInfos(ctx, cfg, nil)
 			if ctx.Err() != nil {
 				return "", false
 			}
@@ -268,7 +272,8 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 		return
 	}
 	sourceHistory, sourceHistoryComplete := faqSourceHistory(history)
-	input, err := json.Marshal(map[string]any{"search_question": query, "user_message": req.Query, "application_context": req.AppInfo, "recent_context": recent, "source_context": sourceHistory, "assistant_requirements": requirements, "candidates": candidates, "candidate_set_is_exhaustive": false})
+	sanitizedAppInfo := types.SanitizeAppInfoJSON(req.AppInfo)
+	input, err := json.Marshal(map[string]any{"search_question": query, "user_message": req.Query, "application_context": sanitizedAppInfo, "recent_context": recent, "source_context": sourceHistory, "assistant_requirements": requirements, "candidates": candidates, "candidate_set_is_exhaustive": false})
 	if err != nil {
 		evaluation.Outcome = "err_scope_marshal"
 		evaluation.observe("faq_scope", query, nil, matches, err)
@@ -359,7 +364,7 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 	kind := decision.AnswerKind
 	resolvesSteps := kind == "steps" || kind == "explicitly_unavailable"
 	if decision.Decision != "direct_answer" || decision.SelectedID == "" ||
-		!faqFactsGrounded(decision.MatchedFacts, req.Query, req.AppInfo, recent) ||
+		!faqFactsGrounded(decision.MatchedFacts, req.Query, sanitizedAppInfo, recent) ||
 		decision.Unanswered == nil || len(decision.Unanswered) > 0 || decision.RequiresSteps == nil ||
 		(!resolvesSteps && (kind != "other" || *decision.RequiresSteps)) {
 		evaluation.Outcome = "miss_scope_unconfirmed"
@@ -399,7 +404,7 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 			evaluation.Match, evaluation.Answer = &match, candidates[i].Answer
 			return
 		}
-		reviewInput, err := json.Marshal(map[string]any{"user_message": req.Query, "application_context": req.AppInfo, "recent_context": recent, "assistant_requirements": requirements, "candidate": map[string]any{"question": candidates[i].Question, "similar_questions": candidates[i].SimilarQuestions, "answer": candidates[i].Answer}})
+		reviewInput, err := json.Marshal(map[string]any{"user_message": req.Query, "application_context": sanitizedAppInfo, "recent_context": recent, "assistant_requirements": requirements, "candidate": map[string]any{"question": candidates[i].Question, "similar_questions": candidates[i].SimilarQuestions, "answer": candidates[i].Answer}})
 		if err != nil {
 			evaluation.Outcome = "err_review_marshal"
 			evaluation.observe("faq_review", query, nil, matches, err)
@@ -467,7 +472,7 @@ func (s *sessionService) evaluateAgentFAQCoverage(ctx context.Context, req *type
 		faqText := candidates[i].Question + "\n" + strings.Join(candidates[i].SimilarQuestions, "\n") + "\n" + candidates[i].Answer
 		for _, pair := range audit.Preconditions {
 			condition, evidence := strings.TrimSpace(pair.ConditionQuote), strings.TrimSpace(pair.EvidenceQuote)
-			if condition == "" || !strings.Contains(faqText, condition) || !faqFactsGrounded([]string{req.Query, evidence}, req.Query, req.AppInfo, recent) {
+			if condition == "" || !strings.Contains(faqText, condition) || !faqFactsGrounded([]string{req.Query, evidence}, req.Query, sanitizedAppInfo, recent) {
 				valid = false
 			}
 		}

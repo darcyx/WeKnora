@@ -58,10 +58,17 @@ func (e *AgentEngine) Resume(
 	} else if !wait {
 		return nil, fmt.Errorf("between-round resume requires collaboration ownership")
 	}
+	enteredLoop := false
+	var state *types.AgentState
 	if e.collaboration != nil {
 		var stop func()
 		ctx, stop = e.collaboration.Start(ctx)
 		defer stop()
+		defer func() {
+			if !enteredLoop {
+				e.collaboration.End(state != nil && state.Suspended != nil)
+			}
+		}()
 	}
 	logger.Infof(ctx, "[Agent] Resuming: session=%s, message=%s, prompt=%s, round=%d",
 		sessionID, messageID, func() string {
@@ -72,7 +79,7 @@ func (e *AgentEngine) Resume(
 		}(), snap.CurrentRound+1)
 	defer e.toolRegistry.Cleanup(ctx)
 
-	state := &types.AgentState{
+	state = &types.AgentState{
 		RoundSteps:    append([]types.AgentStep{}, snap.CompletedSteps...),
 		KnowledgeRefs: append([]*types.SearchResult{}, snap.KnowledgeRefs...),
 		CurrentRound:  snap.CurrentRound,
@@ -190,9 +197,6 @@ func (e *AgentEngine) Resume(
 				state.CurrentRound+1, suspended.PromptID)
 			state.Suspended = suspended
 			state.SuspendedStep = &step
-			if e.collaboration != nil {
-				e.collaboration.End(true)
-			}
 			e.emitCompletionEvent(context.WithoutCancel(ctx), state, sessionID, messageID, startTime)
 			return state, nil
 		}
@@ -210,6 +214,7 @@ func (e *AgentEngine) Resume(
 		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound)
 	}
 
+	enteredLoop = true
 	if _, err := e.executeLoop(ctx, state, snap.Query, messages, tools, sessionID, messageID); err != nil {
 		return nil, err
 	}

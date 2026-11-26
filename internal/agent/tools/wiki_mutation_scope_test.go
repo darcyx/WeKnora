@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,17 @@ func (s *mutationScopeWikiService) UpdateAutoLinkedContent(ctx context.Context, 
 func (s *mutationScopeWikiService) DeletePage(_ context.Context, kbID, slug string) error {
 	delete(s.pages, wikiPageKey(kbID, slug))
 	return nil
+}
+
+func (s *mutationScopeWikiService) RenamePage(_ context.Context, kbID, oldSlug, newSlug string) (*types.WikiPage, error) {
+	page := s.pages[wikiPageKey(kbID, oldSlug)]
+	if page == nil {
+		return nil, errors.New("not found")
+	}
+	delete(s.pages, wikiPageKey(kbID, oldSlug))
+	page.Slug = newSlug
+	s.pages[wikiPageKey(kbID, newSlug)] = page
+	return page, nil
 }
 
 func (s *mutationScopeWikiService) CreateIssue(

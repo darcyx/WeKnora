@@ -379,3 +379,66 @@ func TestWikiPageSnapshotPostgresConcurrentContributions(t *testing.T) {
 	require.Equal(t, page.Content, stored.Content)
 	require.Zero(t, countWikiRevisions(t, db, page.ID))
 }
+
+func TestWikiRenameRejectsStaleWritesAndPreservesBacklinks(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.WikiPageIssue{}))
+	repo := NewWikiPageRepository(db)
+	ctx := context.Background()
+	page := createWikiSnapshotPage(t, db)
+	stale := *page
+	renamed := *page
+	renamed.Slug = "concept/renamed"
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", page.ID).Update("in_links", types.StringArray{"concurrent"}).Error)
+	require.NoError(t, repo.RenamePage(types.WithWikiPageWriteSnapshot(ctx, page), &renamed, page.Slug))
+	require.Contains(t, renamed.InLinks, "concurrent")
+	stale.Content = "stale edit"
+	require.ErrorIs(t, repo.Update(ctx, &stale), ErrWikiPageConflict)
+	// Conversely, a rename from a stale version must not erase a later edit.
+	current, err := repo.GetByID(ctx, page.ID)
+	require.NoError(t, err)
+	old := *current
+	current.Content = "new edit"
+	require.NoError(t, repo.Update(ctx, current))
+	old.Slug = "concept/another"
+	require.ErrorIs(t, repo.RenamePage(ctx, &old, "concept/renamed"), ErrWikiPageConflict)
+	stored, err := repo.GetByID(ctx, page.ID)
+	require.NoError(t, err)
+	require.Equal(t, "new edit", stored.Content)
+}
+
+func TestWikiAutoLinkSnapshotRejectsConcurrentEdits(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	repo := NewWikiPageRepository(db)
+	ctx := context.Background()
+	page := createWikiSnapshotPage(t, db)
+	guarded := types.WithWikiPageWriteSnapshot(ctx, page)
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", page.ID).Updates(map[string]any{"content": "human edit", "version": page.Version + 1}).Error)
+	page.Content = "rewritten link"
+	require.ErrorIs(t, repo.UpdateAutoLinkedContent(guarded, page), ErrWikiPageConflict)
+	saved, err := repo.GetByID(ctx, page.ID)
+	require.NoError(t, err)
+	require.Equal(t, "human edit", saved.Content)
+}
+
+func TestWikiParentRenameRejectsStaleChildUpdate(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.WikiPageIssue{}))
+	repo := NewWikiPageRepository(db)
+	ctx := context.Background()
+	parent := createWikiSnapshotPage(t, db)
+	child := createWikiSnapshotPage(t, db)
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", child.ID).Updates(map[string]any{"knowledge_base_id": parent.KnowledgeBaseID, "parent_slug": parent.Slug}).Error)
+	child, err := repo.GetByID(ctx, child.ID)
+	require.NoError(t, err)
+	childCtx := types.WithWikiPageWriteSnapshot(ctx, child)
+	oldSlug := parent.Slug
+	renamed := *parent
+	renamed.Slug = "concept/parent-renamed"
+	require.NoError(t, repo.RenamePage(types.WithWikiPageWriteSnapshot(ctx, parent), &renamed, oldSlug))
+	child.Content = "human edit"
+	require.ErrorIs(t, repo.UpdateWithRevision(childCtx, child, nil), ErrWikiPageConflict)
+	saved, err := repo.GetByID(ctx, child.ID)
+	require.NoError(t, err)
+	require.Equal(t, renamed.Slug, saved.ParentSlug)
+}

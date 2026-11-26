@@ -57,8 +57,8 @@ func TestOwnedSessionIDsExcludesOtherPeople(t *testing.T) {
 	if owned[ids["bob"]] {
 		t.Error("alice must not be able to reach bob's conversations")
 	}
-	if !owned[ids["legacy"]] {
-		t.Error("tenant-level sessions stay reachable, matching how they are listed")
+	if owned[ids["legacy"]] {
+		t.Error("sessions with empty user_id (including legacy IM sessions) must not leak to other users in search")
 	}
 	if owned[ids["other"]] {
 		t.Error("a workspace boundary is not something an owner check may cross")

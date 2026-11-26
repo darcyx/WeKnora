@@ -8,6 +8,7 @@ import (
 
 	agenttoken "github.com/Tencent/WeKnora/internal/agent/token"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 const (
@@ -31,7 +32,7 @@ func serializeConversation(messages []chat.Message) string {
 	var parts []string
 	for i := range messages {
 		msg := &messages[i]
-		text := messageText(*msg)
+		text := types.SanitizeAppInfoInText(messageText(*msg))
 		switch msg.Role {
 		case "system":
 			continue
@@ -144,7 +145,7 @@ func rawArchive(messages []chat.Message, budget int, estimator *agenttoken.Estim
 }
 
 func archiveLine(msg *chat.Message) string {
-	text := messageText(*msg)
+	text := types.SanitizeAppInfoInText(messageText(*msg))
 	switch msg.Role {
 	case "user":
 		return fmt.Sprintf("- User: %s\n", truncate(text, 500))

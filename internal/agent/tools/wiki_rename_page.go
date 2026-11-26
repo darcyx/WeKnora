@@ -85,6 +85,12 @@ func (t *wikiRenamePageTool) Execute(ctx context.Context, args json.RawMessage) 
 	if params.NewSlug == params.Slug {
 		return &types.ToolResult{Success: false, Error: "new_slug must be different from old slug"}, nil
 	}
+	if params.Slug == "index" || params.NewSlug == "index" {
+		return &types.ToolResult{Success: false, Error: "Cannot rename the protected index page"}, nil
+	}
+	if isSummaryNamespace(params.Slug) || isSummaryNamespace(params.NewSlug) {
+		return &types.ToolResult{Success: false, Error: "Cannot rename pages into or out of the protected summary/ namespace"}, nil
+	}
 
 	kbIDs, scopeErr := wikiMutationKBs(t.kbIDs, params.KnowledgeBaseID)
 	if scopeErr != nil {
@@ -96,32 +102,24 @@ func (t *wikiRenamePageTool) Execute(ctx context.Context, args json.RawMessage) 
 	if err != nil {
 		return &types.ToolResult{Success: false, Error: "Failed to resolve page to rename: " + err.Error()}, nil
 	}
-
-	inLinks := make([]string, len(existingPage.InLinks))
-	copy(inLinks, existingPage.InLinks)
-
-	// Create new page with new slug but same content
-	newPage := &types.WikiPage{
-		TenantID:        existingPage.TenantID,
-		KnowledgeBaseID: kbID,
-		Slug:            params.NewSlug,
-		Title:           existingPage.Title,
-		Summary:         existingPage.Summary,
-		Content:         existingPage.Content,
-		PageType:        existingPage.PageType,
-		Status:          existingPage.Status,
-		Aliases:         append(types.StringArray(nil), existingPage.Aliases...),
-		ParentSlug:      existingPage.ParentSlug,
-		FolderID:        existingPage.FolderID,
-		SortOrder:       existingPage.SortOrder,
-		SourceRefs:      append(types.StringArray(nil), existingPage.SourceRefs...),
-		ChunkRefs:       append(types.StringArray(nil), existingPage.ChunkRefs...),
-		InLinks:         append(types.StringArray(nil), existingPage.InLinks...),
-		PageMetadata:    append(types.JSON(nil), existingPage.PageMetadata...),
+	if existingPage.PageType == types.WikiPageTypeIndex || strings.EqualFold(existingPage.PageType, types.WikiPageTypeSummary) {
+		return &types.ToolResult{
+			Success: false,
+			Error:   fmt.Sprintf("Cannot rename protected %s page [[%s]]", existingPage.PageType, params.Slug),
+		}, nil
 	}
-	_, err = t.wikiPageService.CreatePage(ctx, newPage)
+
+	// Rename in place to preserve page UUID and revision history.
+	renamed, err := t.wikiPageService.RenamePage(ctx, kbID, params.Slug, params.NewSlug)
 	if err != nil {
-		return &types.ToolResult{Success: false, Error: "Failed to create renamed page: " + err.Error()}, nil
+		return &types.ToolResult{Success: false, Error: "Failed to rename page: " + err.Error()}, nil
+	}
+	// The rename returns backlinks read under its lock, including concurrent additions.
+	inLinks := make([]string, 0, len(renamed.InLinks))
+	for _, src := range renamed.InLinks {
+		if src != params.Slug && src != params.NewSlug {
+			inLinks = append(inLinks, src)
+		}
 	}
 
 	changes, updatedSlugs, rewriteErr := applyIncomingWikiContentRewrite(
@@ -138,26 +136,16 @@ func (t *wikiRenamePageTool) Execute(ctx context.Context, args json.RawMessage) 
 	)
 	if rewriteErr != nil {
 		rollbackErr := rollbackWikiContentChanges(ctx, t.wikiPageService, changes)
-		cleanupErr := t.wikiPageService.DeletePage(ctx, kbID, params.NewSlug)
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wikiRollbackTimeout)
+		defer cancel()
+		_, revertErr := t.wikiPageService.RenamePage(rollbackCtx, kbID, params.NewSlug, params.Slug)
 		return &types.ToolResult{
 			Success: false,
 			Error: "Rename aborted while updating incoming links: " +
-				joinWikiMutationErrors(rewriteErr, rollbackErr, cleanupErr),
+				joinWikiMutationErrors(rewriteErr, rollbackErr, revertErr),
 		}, nil
 	}
 	updatedCount := len(updatedSlugs)
-
-	// Delete old page
-	err = t.wikiPageService.DeletePage(ctx, kbID, params.Slug)
-	if err != nil {
-		rollbackErr := rollbackWikiContentChanges(ctx, t.wikiPageService, changes)
-		cleanupErr := t.wikiPageService.DeletePage(ctx, kbID, params.NewSlug)
-		return &types.ToolResult{
-			Success: false,
-			Error: "Rename aborted because the old page could not be deleted: " +
-				joinWikiMutationErrors(err, rollbackErr, cleanupErr),
-		}, nil
-	}
 	t.routes.forget(params.Slug, kbID)
 	t.routes.remember(params.NewSlug, kbID)
 

@@ -85,6 +85,8 @@ type qaRequestContext struct {
 	channel               string                   // Source channel: "web", "api", "im", etc.
 	attachments           types.MessageAttachments // Processed base64 file attachments (legacy inline uploads)
 	appInfo               string                   // Compact JSON serialized from the request ext object
+	runNote               string                   // Optional per-run context note (restored on resume)
+	quotedContext         string                   // Optional quoted message context (restored on resume)
 	attachmentIDs         []string                 // Pre-uploaded session-scoped document IDs, resolved after SSE starts
 	attachmentMetas       types.MessageAttachments // Metadata-only view of attachmentIDs for the persisted user message
 	suggestionAttribution *types.SuggestionAttribution
@@ -161,6 +163,8 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 		LocalBrowserEnabled: rc.localBrowserEnabled,
 		Attachments:         rc.attachments,
 		AppInfo:             rc.appInfo,
+		RunNote:             rc.runNote,
+		QuotedContext:       rc.quotedContext,
 		QuestionOrigin:      rc.questionOrigin,
 		PageContext:         rc.pageContext,
 		AssistantAccess:     rc.assistantAccess,
@@ -197,59 +201,26 @@ func uploadOnlyQuery(ctx context.Context, req *CreateKnowledgeQARequest) string 
 }
 
 // marshalAppInfo copies the extension object as compact JSON for the current
-// agent turn, retaining the top-level token while omitting other credential fields.
+// agent turn, preserving only the top-level token.
 // An empty ext object means there is no <app_info> block to inject.
 func marshalAppInfo(ext map[string]interface{}) (string, error) {
 	if len(ext) == 0 {
 		return "", nil
 	}
-	payload, err := json.Marshal(redactAppInfo(ext))
+	payload, err := json.Marshal(types.RedactLiveAppInfo(ext))
 	if err != nil {
 		return "", fmt.Errorf("marshal ext app info: %w", err)
 	}
 	return string(payload), nil
 }
 
-// redactAppInfo returns a copy of v without keys that name credentials,
-// retaining the top-level "token" key required by platform skills.
+// redactAppInfo returns a copy of v without keys that name credentials.
 func redactAppInfo(v interface{}) interface{} {
-	return redactAppInfoNode(v, true)
-}
-
-func redactAppInfoNode(v interface{}, topLevel bool) interface{} {
-	switch typed := v.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(typed))
-		for key, value := range typed {
-			if !(topLevel && strings.EqualFold(key, "token")) && isCredentialKey(key) {
-				continue
-			}
-			out[key] = redactAppInfoNode(value, false)
-		}
-		return out
-	case []interface{}:
-		out := make([]interface{}, len(typed))
-		for i, value := range typed {
-			out[i] = redactAppInfoNode(value, false)
-		}
-		return out
-	default:
-		return v
-	}
+	return types.RedactAppInfo(v)
 }
 
 func isCredentialKey(key string) bool {
-	key = strings.ToLower(key)
-	normalized := strings.NewReplacer("_", "", "-", "").Replace(key)
-	if strings.HasSuffix(normalized, "token") || normalized == "tokenvalue" {
-		return true
-	}
-	for _, marker := range []string{"password", "secret", "authorization", "apikey", "api_key", "cookie"} {
-		if strings.Contains(key, marker) {
-			return true
-		}
-	}
-	return false
+	return types.IsCredentialKey(key)
 }
 
 // parseQARequest parses and validates a QA request, returns the request context

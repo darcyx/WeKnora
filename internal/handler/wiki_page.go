@@ -588,6 +588,8 @@ func (h *WikiPageHandler) UpdatePage(c *gin.Context) {
 		return
 	}
 
+	ctx = types.WithWikiPageWriteSnapshot(ctx, existing)
+
 	// Merge the provided fields onto the stored page so absent fields keep
 	// their value — the service's UpdatePage semantics are "full intended
 	// state", and sending it a half-empty struct would clear real data.

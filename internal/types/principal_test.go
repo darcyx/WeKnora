@@ -75,6 +75,23 @@ func TestSessionOwnerIDFromContextUsesEmbedSessionPrincipal(t *testing.T) {
 	}
 }
 
+func TestSessionOwnerIDFromContextUsesIMUserPrincipal(t *testing.T) {
+	ctx := WithPrincipal(context.Background(), Principal{
+		Type: PrincipalIMUser,
+		ID:   "42:ch1:feishu:open-id-1",
+	})
+	ctx = context.WithValue(ctx, UserIDContextKey, "system-42")
+
+	if got := SessionOwnerIDFromContext(ctx); got != "im_user:42:ch1:feishu:open-id-1" {
+		t.Fatalf("SessionOwnerIDFromContext() = %q", got)
+	}
+
+	threadCtx := WithIMThreadSessionOwner(ctx, IMThreadSessionOwnerID(42, "ch1", "feishu", "chat-1", "thread-9"))
+	if got := SessionOwnerIDFromContext(threadCtx); got != "im_thread:42:ch1:feishu:Y2hhdC0x:thread-9" {
+		t.Fatalf("SessionOwnerIDFromContext(thread) = %q", got)
+	}
+}
+
 func TestMCPOAuthPrincipalMapsEmbedSessionToVisitor(t *testing.T) {
 	sess := EmbedSessionPrincipal(10000, "ch1", "sess1")
 	ctx := WithEmbedVisitorID(context.Background(), "visitor-abc")

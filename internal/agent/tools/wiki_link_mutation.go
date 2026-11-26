@@ -2,12 +2,27 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
+
+const wikiRollbackTimeout = 10 * time.Second
+
+func isWikiNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, repository.ErrWikiPageNotFound) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
 
 type wikiContentRewrite func(string) (string, bool)
 
@@ -30,19 +45,25 @@ func applyIncomingWikiContentRewrite(
 	var updatedSlugs []string
 	for _, sourceSlug := range dedupNonEmptyStrings(inLinks) {
 		page, err := service.GetPageBySlug(ctx, kbID, sourceSlug)
-		if err != nil || page == nil {
-			if err == nil {
-				err = fmt.Errorf("empty result")
+		if err != nil {
+			// Stale/dirty InLinks pointing at already-deleted pages should not
+			// hard-abort a rename or delete; skip missing referrers.
+			if isWikiNotFoundError(err) {
+				continue
 			}
 			return changes, updatedSlugs, fmt.Errorf("load incoming page %s: %w", sourceSlug, err)
+		}
+		if page == nil {
+			continue
 		}
 		updatedContent, changed := rewrite(page.Content)
 		if !changed {
 			continue
 		}
+		before := types.WithWikiPageWriteSnapshot(ctx, page)
 		original := page.Content
 		page.Content = updatedContent
-		if err := service.UpdateAutoLinkedContent(ctx, page); err != nil {
+		if err := service.UpdateAutoLinkedContent(before, page); err != nil {
 			page.Content = original
 			return changes, updatedSlugs, fmt.Errorf("update incoming page %s: %w", sourceSlug, err)
 		}
@@ -57,11 +78,17 @@ func rollbackWikiContentChanges(
 	service interfaces.WikiPageService,
 	changes []appliedWikiContentChange,
 ) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wikiRollbackTimeout)
+	defer cancel()
 	var failures []string
 	for i := len(changes) - 1; i >= 0; i-- {
 		change := changes[i]
+		guarded := types.WithWikiPageWriteSnapshot(rollbackCtx, change.page)
 		change.page.Content = change.originalContent
-		if err := service.UpdateAutoLinkedContent(ctx, change.page); err != nil {
+		if err := service.UpdateAutoLinkedContent(guarded, change.page); err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", change.page.Slug, err))
 		}
 	}

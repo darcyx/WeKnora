@@ -305,6 +305,10 @@ func resumableAgentRequest(ctx context.Context, req *types.QARequest) types.Resu
 		AssistantAccess:     req.AssistantAccess,
 		UserMessageID:       req.UserMessageID,
 		Language:            types.LanguageFromContextOrDefault(ctx),
+		AppInfo:             types.SanitizeAppInfoJSON(req.AppInfo),
+		LocalBrowserEnabled: req.LocalBrowserEnabled,
+		RunNote:             req.RunNote,
+		QuotedContext:       req.QuotedContext,
 	}
 	if req.CustomAgent != nil {
 		r.AgentID, r.AgentTenantID = req.CustomAgent.ID, req.CustomAgent.TenantID
@@ -375,7 +379,7 @@ func (s *sessionService) buildAgentConfig(
 		MaxToolOutputChars:            customAgent.Config.MaxToolOutputChars,
 		EmbeddingTopK:                 customAgent.Config.EmbeddingTopK,
 		RetainRetrievalHistory:        customAgent.Config.RetainRetrievalHistory,
-		AppInfo:                       req.AppInfo,
+		AppInfo:                       types.SanitizeLiveAppInfoJSON(req.AppInfo),
 		SharedAgentReadOnly:           req.SharedAgentReadOnly,
 		AssistantAccess:               types.CapAccessLevel(req.AssistantAccess, customAgent.Config.AccessLevel),
 		// The model is always told it may call tools in parallel; without
@@ -603,8 +607,8 @@ func applyPerRequestMCPScope(
 	if len(requested) == 0 {
 		return
 	}
-	if agentConfig.MCPSelectionMode == "none" {
-		logger.Warnf(ctx, "Ignoring @MCP mention: agent MCP selection is disabled (mode=none)")
+	if agentConfig.MCPSelectionMode == "" || agentConfig.MCPSelectionMode == "none" {
+		logger.Warnf(ctx, "Ignoring @MCP mention: agent MCP selection is disabled (mode=%q)", agentConfig.MCPSelectionMode)
 		return
 	}
 	mentioned := dedupPreservingOrder(requested)
@@ -639,14 +643,14 @@ func resolvePerRequestMCPScope(
 		}
 	}
 	switch selectionMode {
-	case "none":
+	case "none", "":
 		return nil, selectionMode
 	case "selected":
 		effective = intersectPreservingRequestOrder(mentioned, agentMCPs)
-	case "all", "":
+	case "all":
 		effective = mentioned
 	default:
-		effective = mentioned
+		return nil, selectionMode
 	}
 	if len(effective) == 0 {
 		return nil, selectionMode

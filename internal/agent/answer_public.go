@@ -47,6 +47,14 @@ func (e *AgentEngine) publicAnswer(ctx context.Context, content string, messages
 }
 
 func (e *AgentEngine) publicAnswerChecked(ctx context.Context, content string, messages []chat.Message) (answer string, err error) {
+	if e.retrieval != nil {
+		e.retrieval.mu.Lock()
+		failed := e.retrieval.persistenceFailed
+		e.retrieval.mu.Unlock()
+		if failed {
+			return "", errRetrievalStateSave
+		}
+	}
 	defer func() {
 		if err == nil {
 			if ctx.Err() != nil {

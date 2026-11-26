@@ -609,6 +609,7 @@ func escapeXMLText(s string) string {
 // annotated as static project metadata (not verified live runtime config) and
 // normalizes multi-value device_type strings without mutating e.appInfo.
 func renderAppInfoBlock(appInfo string) string {
+	appInfo = types.SanitizeLiveAppInfoJSON(appInfo)
 	attrs := ` type="static_project_metadata" live_config_verified="false"`
 	note := ""
 	if devices := parseAppInfoDeviceTypes(appInfo); len(devices) > 1 {
@@ -1008,13 +1009,13 @@ func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	runtimeCtx = e.modelContext.EncodeKnownIssues(e.modelContext.CompactKnownText(runtimeCtx))
 	pinnedSkills := e.pinnedSkills
 	var unavailablePinned []string
-	if e.skillsManager != nil && len(pinnedSkills) > 0 {
+	if len(pinnedSkills) > 0 {
 		filtered := make([]*PinnedSkillInfo, 0, len(pinnedSkills))
 		for _, skill := range pinnedSkills {
 			if skill == nil || skill.Name == "" {
 				continue
 			}
-			if e.skillsManager.IsSkillAvailable(skill.Name) {
+			if e.skillsManager != nil && e.skillsManager.IsSkillAvailable(skill.Name) {
 				filtered = append(filtered, skill)
 			} else {
 				unavailablePinned = append(unavailablePinned, sanitizeMustUseField(skill.Name))

@@ -2,6 +2,8 @@ package im
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -126,4 +128,133 @@ func TestSessionResolutionRecoversConcurrentCreation(t *testing.T) {
 			require.Equal(t, wantLive, liveMappings)
 		})
 	}
+}
+
+func TestSessionResolutionOwnersIsolateChatsAndRebindLegacy(t *testing.T) {
+	s := newResolutionService(t)
+	makeMsg := func(chat string) *IncomingMessage {
+		return &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: chat, ThreadID: "same", Content: "hello"}
+	}
+	a, err := s.resolveSession(context.Background(), makeMsg("chat-a"), 1, "agent", "channel", "thread")
+	require.NoError(t, err)
+	b, err := s.resolveSession(context.Background(), makeMsg("chat-b"), 1, "agent", "channel", "thread")
+	require.NoError(t, err)
+	var first, second types.Session
+	require.NoError(t, s.db.First(&first, "id = ?", a.SessionID).Error)
+	require.NoError(t, s.db.First(&second, "id = ?", b.SessionID).Error)
+	require.NotEqual(t, first.UserID, second.UserID)
+	old := "im_thread:1:channel:feishu:same"
+	require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", a.SessionID).Update("user_id", old).Error)
+	_, err = s.resolveSession(context.Background(), makeMsg("chat-a"), 1, "agent", "channel", "thread")
+	require.NoError(t, err)
+	require.NoError(t, s.db.First(&first, "id = ?", a.SessionID).Error)
+	require.Equal(t, types.IMThreadSessionOwnerID(1, "channel", "feishu", "chat-a", "same"), first.UserID)
+	other, err := s.resolveSession(context.Background(), makeMsg("chat-a"), 1, "agent", "different-channel", "thread")
+	require.NoError(t, err)
+	require.NotEqual(t, a.SessionID, other.SessionID)
+}
+
+func TestSessionResolutionRebindsSameUserHistory(t *testing.T) {
+	s := newResolutionService(t)
+	msg := func(chat, user string) *IncomingMessage {
+		return &IncomingMessage{Platform: PlatformFeishu, UserID: user, ChatID: chat}
+	}
+	a, err := s.resolveSession(context.Background(), msg("a", "alice"), 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	b, err := s.resolveSession(context.Background(), msg("b", "alice"), 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	c, err := s.resolveSession(context.Background(), msg("c", "bob"), 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	require.NoError(t, s.db.Model(&types.Session{}).Where("id IN ?", []string{a.SessionID, b.SessionID, c.SessionID}).Update("user_id", "").Error)
+	require.NoError(t, s.db.Create(&IMChannel{ID: "channel", TenantID: 1, AgentID: "agent", Platform: "feishu"}).Error)
+	require.NoError(t, s.db.Model(&ChannelSession{}).Where("id = ?", c.ID).Update("im_channel_id", "").Error)
+	migration, err := os.ReadFile("../../migrations/sqlite/000054_im_session_channel_scope.up.sql")
+	require.NoError(t, err)
+	require.NoError(t, s.db.Exec(string(migration)).Error)
+	_, err = s.resolveSession(context.Background(), msg("a", "alice"), 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	var sessions []types.Session
+	require.NoError(t, s.db.Where("id IN ?", []string{a.SessionID, b.SessionID, c.SessionID}).Find(&sessions).Error)
+	for _, session := range sessions {
+		if session.ID == c.SessionID {
+			require.Empty(t, session.UserID)
+		} else {
+			require.Equal(t, "im_user:1:channel:feishu:alice", session.UserID)
+		}
+	}
+}
+
+func TestSessionResolutionAllowsStaleMappingRecovery(t *testing.T) {
+	s := newResolutionService(t)
+	msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "a"}
+	cs, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	require.NoError(t, s.db.Delete(&types.Session{}, "id = ?", cs.SessionID).Error)
+	existing, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+	require.NoError(t, err)
+	require.Equal(t, cs.ID, existing.ID)
+}
+
+func TestSessionResolutionBindsOnlyUnambiguousBlankChannel(t *testing.T) {
+	for _, ambiguous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ambiguous=%v", ambiguous), func(t *testing.T) {
+			s := newResolutionService(t)
+			msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "a"}
+			cs, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+			require.NoError(t, err)
+			require.NoError(t, s.db.Model(&ChannelSession{}).Where("id = ?", cs.ID).Update("im_channel_id", "").Error)
+			require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", cs.SessionID).Update("user_id", "").Error)
+			require.NoError(t, s.db.Create(&IMChannel{ID: "channel", TenantID: 1, AgentID: "agent", Platform: "feishu"}).Error)
+			if ambiguous {
+				require.NoError(t, s.db.Create(&IMChannel{ID: "other", TenantID: 1, AgentID: "agent", Platform: "feishu"}).Error)
+				require.NoError(t, s.db.Delete(&IMChannel{}, "id = ?", "other").Error)
+			}
+			resolved, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+			require.NoError(t, err)
+			if ambiguous {
+				require.NotEqual(t, cs.SessionID, resolved.SessionID)
+			} else {
+				require.Equal(t, cs.SessionID, resolved.SessionID)
+			}
+			var session types.Session
+			require.NoError(t, s.db.First(&session, "id = ?", cs.SessionID).Error)
+			if ambiguous {
+				require.Empty(t, session.UserID)
+			} else {
+				require.Equal(t, "im_user:1:channel:feishu:alice", session.UserID)
+			}
+		})
+	}
+}
+
+func TestSessionResolutionSeparateChannels(t *testing.T) {
+	for _, mode := range []string{"user", "thread"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newResolutionService(t)
+			msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "group", ThreadID: "same"}
+			a, err := s.resolveSession(context.Background(), msg, 1, "agent", "a", mode)
+			require.NoError(t, err)
+			b, err := s.resolveSession(context.Background(), msg, 1, "agent", "b", mode)
+			require.NoError(t, err)
+			require.NotEqual(t, a.SessionID, b.SessionID)
+			again, err := s.resolveSession(context.Background(), msg, 1, "agent", "a", mode)
+			require.NoError(t, err)
+			require.Equal(t, a.SessionID, again.SessionID)
+		})
+	}
+}
+
+func TestSessionChannelMigrationDownRejectsDuplicatesBeforeChangingIndexes(t *testing.T) {
+	s := newResolutionService(t)
+	msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "group"}
+	_, err := s.resolveSession(context.Background(), msg, 1, "agent", "a", "user")
+	require.NoError(t, err)
+	_, err = s.resolveSession(context.Background(), msg, 1, "agent", "b", "user")
+	require.NoError(t, err)
+	down, err := os.ReadFile("../../migrations/sqlite/000054_im_session_channel_scope.down.sql")
+	require.NoError(t, err)
+	require.Error(t, s.db.Exec(string(down)).Error)
+	var count int64
+	require.NoError(t, s.db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_channel_lookup', 'idx_channel_thread_lookup')").Scan(&count).Error)
+	require.EqualValues(t, 2, count)
 }

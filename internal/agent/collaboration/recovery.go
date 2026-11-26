@@ -2,10 +2,17 @@ package collaboration
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrPermanentRecovery marks a checkpoint that cannot be resumed.
+var ErrPermanentRecovery = errors.New("parent recovery is permanently unavailable")
+
+// ErrRecoveryIdentityUnavailable keeps finalization pending while access may be restored.
+var ErrRecoveryIdentityUnavailable = errors.New("parent recovery identity is inactive")
 
 // ParentWait is a replay-safe checkpoint. It exists only while the engine is
 // waiting, never while a model request or side-effecting tool is in flight.
@@ -133,8 +140,31 @@ func (r *Runtime) wakeParent(ctx context.Context, scope Scope) {
 			}
 			return
 		}
-		if err != nil && ctx.Err() == nil {
-			_ = r.Cancel(b.Context(context.WithoutCancel(ctx)), scope)
+		if err != nil && ctx.Err() == nil && !errors.Is(err, ErrConflict) && !errors.Is(err, ErrClosed) {
+			// On a transient failure before the replay-safe ParentWait was
+			// cleared, release the lease so the next scheduler tick can retry
+			// instead of killing the group and leaving the parent message stuck.
+			// If ParentWait was already cleared, transition to ParentClosePending
+			// so the scheduler cleanly finalizes the parent message.
+			_ = r.Store.Change(b.Context(context.WithoutCancel(ctx)), scope, func(g *Group) error {
+				if g.Status != "active" {
+					return nil
+				}
+				g.ParentOwner = ""
+				g.ParentLease = time.Time{}
+				if g.ParentWait != nil && !errors.Is(err, ErrPermanentRecovery) {
+					return nil
+				}
+				g.ParentWait = nil
+				g.ParentClosePending = true
+				g.Status = "cancelling"
+				for _, m := range g.Members {
+					if active(current(m)) {
+						current(m).CancelRequested = true
+					}
+				}
+				return nil
+			})
 		}
 	}()
 }

@@ -429,10 +429,10 @@ func (r *messageRepository) SearchMessagesByKeyword(
 		Where("messages.deleted_at IS NULL").
 		Where(contentLikeExpr, "%"+escapeLikeKeyword(keyword)+"%", likeEscapeChar)
 
-	// Matches the scoping used when listing sessions, including the legacy
-	// allowance for tenant-level sessions created before per-user ownership.
+	// Strictly match the caller's session owner ID so empty/unowned rows (such as
+	// legacy IM sessions) can never leak across users in conversation search.
 	if ownerID != "" {
-		query = query.Where("(sessions.user_id = ? OR sessions.user_id IS NULL OR sessions.user_id = '')", ownerID)
+		query = query.Where("sessions.user_id = ?", ownerID)
 	}
 
 	if len(sessionIDs) > 0 {
@@ -469,7 +469,7 @@ func (r *messageRepository) OwnedSessionIDs(
 		Where("deleted_at IS NULL").
 		Where("id IN ?", sessionIDs)
 	if ownerID != "" {
-		query = query.Where("(user_id = ? OR user_id IS NULL OR user_id = '')", ownerID)
+		query = query.Where("user_id = ?", ownerID)
 	}
 	if err := query.Pluck("id", &ids).Error; err != nil {
 		return nil, err
@@ -480,21 +480,56 @@ func (r *messageRepository) OwnedSessionIDs(
 	return owned, nil
 }
 
+// GetOwnedMessageKnowledgeIDs returns distinct indexed knowledge_ids from normal
+// sessions owned by ownerID (and optionally filtered to sessionIDs). Pass limit > 0
+// to bound the returned slice size (returning up to limit+1 rows so callers can detect
+// overflow beyond the inline filter threshold).
+func (r *messageRepository) GetOwnedMessageKnowledgeIDs(
+	ctx context.Context, tenantID uint64, ownerID string, sessionIDs []string, limit int,
+) ([]string, error) {
+	query := r.db.WithContext(ctx).
+		Table("messages").
+		Joins("INNER JOIN sessions ON sessions.id = messages.session_id AND sessions.deleted_at IS NULL").
+		Where("sessions.tenant_id = ? AND sessions.kind = ''", tenantID).
+		Where("messages.deleted_at IS NULL").
+		Where("messages.knowledge_id IS NOT NULL AND messages.knowledge_id != ''")
+	if ownerID != "" {
+		query = query.Where("sessions.user_id = ?", ownerID)
+	}
+	if len(sessionIDs) > 0 {
+		query = query.Where("messages.session_id IN ?", sessionIDs)
+	}
+	query = query.Distinct("messages.knowledge_id")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	var ids []string
+	if err := query.Pluck("messages.knowledge_id", &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // GetMessagesByKnowledgeIDs retrieves messages by their associated Knowledge IDs
+// strictly scoped to normal sessions in the given tenant (and owner when set).
 func (r *messageRepository) GetMessagesByKnowledgeIDs(
-	ctx context.Context, knowledgeIDs []string,
+	ctx context.Context, tenantID uint64, ownerID string, knowledgeIDs []string,
 ) ([]*types.MessageWithSession, error) {
 	if len(knowledgeIDs) == 0 {
 		return nil, nil
 	}
 	var results []*types.MessageWithSession
-	if err := r.db.WithContext(ctx).
+	query := r.db.WithContext(ctx).
 		Table("messages").
 		Select("messages.*, sessions.title as session_title").
 		Joins("INNER JOIN sessions ON sessions.id = messages.session_id AND sessions.deleted_at IS NULL").
+		Where("sessions.tenant_id = ? AND sessions.kind = ''", tenantID).
 		Where("messages.deleted_at IS NULL").
-		Where("messages.knowledge_id IN ?", knowledgeIDs).
-		Find(&results).Error; err != nil {
+		Where("messages.knowledge_id IN ?", knowledgeIDs)
+	if ownerID != "" {
+		query = query.Where("sessions.user_id = ?", ownerID)
+	}
+	if err := query.Find(&results).Error; err != nil {
 		return nil, err
 	}
 	if err := attachArtifactsWithSession(ctx, r.db, results); err != nil {

@@ -3,6 +3,7 @@ package collaboration
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,14 @@ type Binding struct {
 	WaitUntil  time.Time
 	// HasInput probes durable steer without consuming it; the engine owns delivery.
 	HasInput func(context.Context) (bool, error)
+
+	// Ref-counted single heartbeat so nested wakeParent -> Resume -> executeLoop
+	// calls share one lease renewal goroutine instead of racing on the same row.
+	heartbeatMu     sync.Mutex
+	heartbeatRefs   int
+	heartbeatCtx    context.Context
+	heartbeatCancel context.CancelFunc
+	heartbeatDone   chan struct{}
 }
 type bindingKey struct{}
 

@@ -136,8 +136,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi
 
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    bash ./scripts/copy-licenses.sh /license-bundle
+RUN --mount=type=cache,target=/go/pkg/mod
 
 # Only the final Go build depends on application source and version metadata.
 ARG VERSION_ARG
@@ -244,7 +243,7 @@ COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/dataset/samples ./dataset/samples
 COPY --from=builder /root/.duckdb /home/appuser/.duckdb
 COPY --from=builder /app/WeKnora .
-COPY --from=builder /license-bundle/ ./
+
 
 # Copy and make entrypoint script executable
 COPY --from=builder /app/scripts/docker-entrypoint.sh ./scripts/docker-entrypoint.sh

@@ -283,6 +283,7 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 			return fmt.Errorf("this call includes an earlier source range; select only newly available sources and use the original fact's state and allowances for earlier sources")
 		}
 	}
+	prev := c.snapshotLocked()
 	if action == retrievalSupplement {
 		g.SupplementUsed = true
 	}
@@ -304,7 +305,11 @@ func (c *retrievalControl) acquireWithAdmission(gapID, callID string, action ret
 	c.state.Attempts = append(c.state.Attempts, retrievalAttempt{ID: callID, QuestionID: c.state.questionID(), GapID: gapID, RuntimeManaged: admission.RuntimeManaged,
 		Scope: executionScope, Action: action, Tool: tool, Arguments: arguments,
 		RecoveryCallID: recoveredCallID, RecoveryTargets: recoveryTargets, RecoveryStages: stages})
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.state = prev
+		return err
+	}
+	return nil
 }
 
 func (c *retrievalControl) observe(callID, content string, outcome retrievalOutcome, failures ...retrievalFailure) error {
@@ -314,6 +319,9 @@ func (c *retrievalControl) observe(callID, content string, outcome retrievalOutc
 func (c *retrievalControl) observeWithSources(callID, content string, outcome retrievalOutcome, structured bool, observedIDs, citableIDs []string, failures ...retrievalFailure) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.persistenceFailed {
+		return errRetrievalStateSave
+	}
 	a := c.attempt(callID)
 	if a == nil || a.Completed {
 		return fmt.Errorf("call %s is unknown or already observed", callID)
@@ -321,6 +329,7 @@ func (c *retrievalControl) observeWithSources(callID, content string, outcome re
 	if outcome != retrievalSuccess && outcome != retrievalTransient && outcome != retrievalInput && outcome != retrievalUnknown {
 		return fmt.Errorf("unknown retrieval outcome %q", outcome)
 	}
+	prev := c.snapshotLocked()
 	a.Completed, a.Content, a.Outcome = true, content, outcome
 	a.StructuredSources = structured
 	a.ObservedIDs = slices.Clone(observedIDs)
@@ -335,7 +344,11 @@ func (c *retrievalControl) observeWithSources(callID, content string, outcome re
 		outcome == retrievalUnknown && !hasRecoverableSource(failures)) {
 		g.Status = retrievalUnavailable
 	}
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.state = prev
+		return err
+	}
+	return nil
 }
 
 func (c *retrievalControl) reviewable(g *retrievalGap, a *retrievalAttempt) bool {

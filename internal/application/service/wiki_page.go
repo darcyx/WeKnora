@@ -132,6 +132,18 @@ func (s *wikiPageService) prepareWikiPageForCreate(ctx context.Context, page *ty
 	if page.KnowledgeBaseID == "" {
 		return errors.New("knowledge_base_id is required")
 	}
+	if page.TenantID == 0 {
+		if s.kbService != nil {
+			if kb, err := s.kbService.GetKnowledgeBaseByIDOnly(ctx, page.KnowledgeBaseID); err == nil && kb != nil && kb.TenantID != 0 {
+				page.TenantID = kb.TenantID
+			}
+		}
+		if page.TenantID == 0 {
+			if tenantID, ok := types.TenantIDFromContext(ctx); ok && tenantID != 0 {
+				page.TenantID = tenantID
+			}
+		}
+	}
 	if page.Status == "" {
 		page.Status = types.WikiPageStatusPublished
 	}
@@ -175,6 +187,9 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 	if snapshot, ok := types.WikiPageWriteSnapshotFromContext(ctx); ok &&
 		!types.WikiPageWriteSnapshotMatches(snapshot, existing) {
 		return nil, repository.ErrWikiPageConflict
+	}
+	if _, guarded := types.WikiPageWriteSnapshotFromContext(ctx); !guarded {
+		ctx = types.WithWikiPageWriteSnapshot(ctx, existing)
 	}
 	stripWikiPageInlineChunkCitations(page)
 
@@ -353,6 +368,9 @@ func (s *wikiPageService) UpdateAutoLinkedContent(ctx context.Context, page *typ
 		return fmt.Errorf("get existing page: %w", err)
 	}
 
+	if snapshot, ok := types.WikiPageWriteSnapshotFromContext(ctx); ok && !types.WikiPageWriteSnapshotMatches(snapshot, existing) {
+		return repository.ErrWikiPageConflict
+	}
 	oldOutLinks := existing.OutLinks
 
 	existing.Content = stripWikiInlineChunkCitations(page.Content)
@@ -363,7 +381,8 @@ func (s *wikiPageService) UpdateAutoLinkedContent(ctx context.Context, page *typ
 		return fmt.Errorf("update auto-linked content: %w", err)
 	}
 
-	s.syncInLinks(ctx, existing.TenantID, existing.KnowledgeBaseID, existing.Slug, oldOutLinks, existing.OutLinks)
+	*page = *existing
+	s.syncInLinks(types.WithWikiPageWriteSnapshot(ctx, nil), existing.TenantID, existing.KnowledgeBaseID, existing.Slug, oldOutLinks, existing.OutLinks)
 
 	return nil
 }
@@ -476,7 +495,7 @@ func (s *wikiPageService) RevertPageToVersion(
 	target.Status = rev.Status
 	target.Aliases = append(types.StringArray(nil), rev.Aliases...)
 
-	return s.UpdatePage(types.WithWikiEditSource(ctx, types.WikiEditSourceRevert), &target)
+	return s.UpdatePage(types.WithWikiPageWriteSnapshot(types.WithWikiEditSource(ctx, types.WikiEditSourceRevert), page), &target)
 }
 
 // GetPageBySlug retrieves a wiki page by its slug
@@ -560,6 +579,69 @@ func (s *wikiPageService) DeletePage(ctx context.Context, kbID string, slug stri
 	s.deleteChunkForPage(ctx, page)
 
 	return nil
+}
+
+// RenamePage renames a wiki page's slug in place, preserving its UUID, version,
+// and revision history while updating self-links, child parent_slug references,
+// target in_links, and wiki_page_issues.
+func (s *wikiPageService) RenamePage(ctx context.Context, kbID, oldSlug, newSlug string) (*types.WikiPage, error) {
+	oldSlug = normalizeSlug(oldSlug)
+	newSlug = normalizeSlug(newSlug)
+	if oldSlug == "" || newSlug == "" {
+		return nil, errors.New("old slug and new slug are required")
+	}
+	if oldSlug == newSlug {
+		return nil, errors.New("new slug must be different from old slug")
+	}
+	if oldSlug == "index" || newSlug == "index" {
+		return nil, errors.New("cannot rename the index page")
+	}
+	if strings.HasPrefix(oldSlug, "summary/") || strings.HasPrefix(newSlug, "summary/") {
+		return nil, errors.New("cannot rename pages into or out of the summary/ namespace")
+	}
+
+	page, err := s.repo.GetBySlug(ctx, kbID, oldSlug)
+	if err != nil {
+		return nil, err
+	}
+	if page.PageType == types.WikiPageTypeIndex || strings.EqualFold(page.PageType, types.WikiPageTypeSummary) {
+		return nil, fmt.Errorf("cannot rename protected %s page", page.PageType)
+	}
+
+	ctx = types.WithWikiPageWriteSnapshot(ctx, page)
+	oldOutLinks := append([]string(nil), page.OutLinks...)
+	updatedContent := strings.ReplaceAll(page.Content, "[["+oldSlug+"]]", "[["+newSlug+"]]")
+	updatedContent = strings.ReplaceAll(updatedContent, "[["+oldSlug+"|", "[["+newSlug+"|")
+	page.Content = updatedContent
+	page.Slug = newSlug
+	page.OutLinks = s.parseOutLinks(page.Content)
+
+	page.LastEditSource = types.WikiEditSourceFromContext(ctx)
+	page.LastEditorID, _ = types.UserIDFromContext(ctx)
+	page.UpdatedAt = time.Now()
+	normalizeWikiHierarchy(page)
+
+	if err := s.repo.RenamePage(ctx, page, oldSlug); err != nil {
+		return nil, fmt.Errorf("rename wiki page: %w", err)
+	}
+
+	// Refresh outbound targets' in_links so they point to newSlug instead of oldSlug.
+	nonSelfOld := make([]string, 0, len(oldOutLinks))
+	for _, target := range oldOutLinks {
+		if target != oldSlug && target != newSlug {
+			nonSelfOld = append(nonSelfOld, target)
+		}
+	}
+	nonSelfNew := make([]string, 0, len(page.OutLinks))
+	for _, target := range page.OutLinks {
+		if target != oldSlug && target != newSlug {
+			nonSelfNew = append(nonSelfNew, target)
+		}
+	}
+	s.removeInLinks(ctx, page.TenantID, kbID, oldSlug, nonSelfOld)
+	s.updateInLinks(ctx, page.TenantID, kbID, newSlug, nonSelfNew)
+
+	return page, nil
 }
 
 // GetIndex returns the index page for a knowledge base

@@ -322,20 +322,6 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 		input.SQL = rewrittenSQL
 	}
 
-	// Check if this is a read-only query
-	normalizedSQL := strings.TrimSpace(strings.ToLower(input.SQL))
-	isReadOnly := strings.HasPrefix(normalizedSQL, "select")
-
-	if !isReadOnly {
-		// Reject modification queries
-		logger.Warnf(ctx, "[Tool][DataAnalysis] Modification query rejected for session %s: %s", t.sessionID, input.SQL)
-		return &types.ToolResult{
-			Success: false,
-			Error: "DuckDB tool only supports read-only SELECT queries. " +
-				"Modification operations and configuration statements are not allowed.",
-		}, fmt.Errorf("modification queries are not allowed")
-	}
-
 	if err := validateDataAnalysisSQL(input.SQL, schema); err != nil {
 		logger.Warnf(ctx, "[Tool][DataAnalysis] SQL validation failed for session %s: %v", t.sessionID, err)
 		return &types.ToolResult{
@@ -346,7 +332,7 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 
 	logger.Infof(ctx, "[Tool][DataAnalysis] Received SQL query for session %s: %s", t.sessionID, input.SQL)
 	// Execute single query and get results
-	results, err := t.executeSingleQuery(ctx, input.SQL, schema.TableName)
+	results, truncated, err := t.executeSingleQueryPreview(ctx, input.SQL, schema.TableName, OutputBudget(ctx))
 	if err != nil {
 		if suggestion := buildMissingColumnSuggestion(err, schema); suggestion != "" {
 			return &types.ToolResult{
@@ -360,16 +346,23 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 		}, err
 	}
 
-	warnings := checkQueryResultConsistency(input.SQL, results)
-	queryOutput := t.formatQueryResults(results, input.SQL, warnings)
-	logger.Infof(ctx, "[Tool][DataAnalysis] Completed execution query, total %d rows for session %s",
-		len(results), t.sessionID)
+	var warnings []string
+	if !truncated {
+		warnings = checkQueryResultConsistency(input.SQL, results)
+	}
+	queryOutput := t.formatQueryResults(results, input.SQL, warnings, truncated)
+	logger.Infof(ctx, "[Tool][DataAnalysis] Completed execution query, total %d rows (truncated=%v) for session %s",
+		len(results), truncated, t.sessionID)
 	data := map[string]interface{}{
 		"rows":         results,
 		"row_count":    len(results),
+		"truncated":    truncated,
 		"query":        input.SQL,
 		"display_type": ToolDataAnalysis,
 		"session_id":   t.sessionID,
+	}
+	if truncated {
+		data["max_rows"] = maxDataAnalysisRows
 	}
 	if len(warnings) > 0 {
 		data["warnings"] = warnings
@@ -426,13 +419,22 @@ func validateDataAnalysisSQL(sqlQuery string, schema *TableSchema) error {
 // sessions analysing different documents never observe each other's view; the
 // view is replaced on entry and dropped on exit so a pooled connection carries
 // nothing over to its next user.
+const maxDataAnalysisRows = 1000
+
 func (t *DataAnalysisTool) executeSingleQuery(
 	ctx context.Context, sqlQuery string, physicalTable string,
 ) ([]map[string]string, error) {
+	results, _, err := t.executeSingleQueryPreview(ctx, sqlQuery, physicalTable, DefaultMaxToolOutput)
+	return results, err
+}
+
+func (t *DataAnalysisTool) executeSingleQueryPreview(
+	ctx context.Context, sqlQuery string, physicalTable string, byteBudget int,
+) ([]map[string]string, bool, error) {
 	conn, err := t.db.Conn(ctx)
 	if err != nil {
 		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to acquire connection: %v", err)
-		return nil, fmt.Errorf("failed to acquire database connection: %w", err)
+		return nil, false, fmt.Errorf("failed to acquire database connection: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -443,7 +445,7 @@ func (t *DataAnalysisTool) executeSingleQuery(
 	if _, err := conn.ExecContext(ctx, viewSQL); err != nil {
 		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to expose table '%s' as %s: %v",
 			physicalTable, DataAnalysisTableName, err)
-		return nil, fmt.Errorf("failed to expose document table: %w", err)
+		return nil, false, fmt.Errorf("failed to expose document table: %w", err)
 	}
 	defer func() {
 		dropSQL := fmt.Sprintf(`DROP VIEW IF EXISTS "%s"`, DataAnalysisTableName)
@@ -455,7 +457,7 @@ func (t *DataAnalysisTool) executeSingleQuery(
 	rows, err := conn.QueryContext(ctx, sqlQuery)
 	if err != nil {
 		logger.Errorf(ctx, "[Tool][DataAnalysis] Query execution failed: %v", err)
-		return nil, fmt.Errorf("query execution failed: %w", err)
+		return nil, false, fmt.Errorf("query execution failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -463,12 +465,18 @@ func (t *DataAnalysisTool) executeSingleQuery(
 	columns, err := rows.Columns()
 	if err != nil {
 		logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to get columns: %v", err)
-		return nil, fmt.Errorf("failed to get columns: %w", err)
+		return nil, false, fmt.Errorf("failed to get columns: %w", err)
 	}
 
-	// Process results
+	// Bound retained result rows; the DuckDB driver may materialize the query before iteration.
 	results := make([]map[string]string, 0)
+	truncated := false
+	usedBytes := 0
 	for rows.Next() {
+		if len(results) >= maxDataAnalysisRows {
+			truncated = true
+			break
+		}
 		columnValues := make([]interface{}, len(columns))
 		columnPointers := make([]interface{}, len(columns))
 		for i := range columnValues {
@@ -477,42 +485,61 @@ func (t *DataAnalysisTool) executeSingleQuery(
 
 		if err := rows.Scan(columnPointers...); err != nil {
 			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to scan row: %v", err)
-			return nil, fmt.Errorf("failed to scan row: %w", err)
+			return nil, false, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		rowMap := make(map[string]string)
 		for i, colName := range columns {
 			val := columnValues[i]
-			// Convert []byte to string for better readability
-			if b, ok := val.([]byte); ok {
-				rowMap[colName] = string(b)
-			} else {
-				rowMap[colName] = fmt.Sprintf("%v", val)
+			switch v := val.(type) {
+			case nil:
+				rowMap[colName] = "<nil>"
+			case []byte:
+				rowMap[colName] = string(v)
+			default:
+				rowMap[colName] = fmt.Sprintf("%v", v)
 			}
 		}
+		encoded, err := json.Marshal(rowMap)
+		if err != nil {
+			return nil, false, err
+		}
+		if usedBytes+len(encoded)+1 > byteBudget {
+			truncated = true
+			break
+		}
+		usedBytes += len(encoded) + 1
 		results = append(results, rowMap)
 	}
 
 	if err := rows.Err(); err != nil {
 		logger.Errorf(ctx, "[Tool][DataAnalysis] Error iterating rows: %v", err)
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		return nil, false, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	return results, nil
+	return results, truncated, nil
 }
 
 // formatQueryResults formats query results into JSONL format (one JSON object per line)
 func (t *DataAnalysisTool) formatQueryResults(
-	results []map[string]string, query string, warnings []string,
+	results []map[string]string, query string, warnings []string, truncated bool,
 ) string {
 	var output strings.Builder
 
 	output.WriteString("=== DuckDB Query Results ===\n\n")
 	output.WriteString(fmt.Sprintf("Executed SQL: %s\n\n", query))
-	output.WriteString(fmt.Sprintf("Returned %d rows\n\n", len(results)))
+	if truncated {
+		output.WriteString(fmt.Sprintf("Returned %d rows (truncated by row or output size limit; narrow or aggregate the query)\n\n", len(results)))
+	} else {
+		output.WriteString(fmt.Sprintf("Returned %d rows\n\n", len(results)))
+	}
 
 	if len(results) == 0 {
-		output.WriteString("No matching records found.\n")
+		if truncated {
+			output.WriteString("Result exceeds the preview size limit.\n")
+		} else {
+			output.WriteString("No matching records found.\n")
+		}
 		return output.String()
 	}
 

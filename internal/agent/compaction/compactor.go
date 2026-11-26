@@ -219,6 +219,7 @@ func (c *Compactor) summarize(
 	opts := &chat.ChatOptions{
 		Temperature:    0.3, // low temperature for factual summarization
 		MaxTokens:      maxTokens,
+		Thinking:       new(false),
 		CacheRetention: chat.CacheRetentionNone,
 	}
 	var lastErr error

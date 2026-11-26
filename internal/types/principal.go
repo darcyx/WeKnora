@@ -2,6 +2,7 @@ package types
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
@@ -220,10 +221,42 @@ func MCPOAuthPrincipalFromContext(ctx context.Context) Principal {
 	return EmbedVisitorPrincipal(tenantID, channelPart, visitorID)
 }
 
+// SessionOwnerIMThreadPrefix prefixes sessions.user_id for rows created by
+// thread-mode IM conversations where participants in the same thread share one
+// session without opening it to other users or channels.
+const SessionOwnerIMThreadPrefix = "im_thread:"
+
+type imThreadSessionOwnerKey struct{}
+
+// IMThreadSessionOwnerID returns the isolated session owner identifier for a
+// thread-mode IM conversation.
+func IMThreadSessionOwnerID(tenantID uint64, channelID, platform, chatID, threadID string) string {
+	return fmt.Sprintf("%s%d:%s:%s:%s:%s",
+		SessionOwnerIMThreadPrefix,
+		tenantID,
+		strings.TrimSpace(channelID),
+		strings.TrimSpace(platform),
+		base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(chatID))),
+		strings.TrimSpace(threadID),
+	)
+}
+
+// WithIMThreadSessionOwner binds a thread-mode IM session owner override onto
+// ctx while preserving the caller's per-user PrincipalIMUser identity for
+// memory, OAuth, and audit isolation.
+func WithIMThreadSessionOwner(ctx context.Context, ownerID string) context.Context {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, imThreadSessionOwnerKey{}, ownerID)
+}
+
 // SessionOwnerIDFromContext returns the sessions.user_id scope for the current
-// caller. API external users and embed chat sessions use principal-derived IDs;
-// tenant API keys are isolated per key id; MCP OAuth token storage uses
-// MCPOAuthPrincipalFromContext (visitor-level for embed).
+// caller. API external users, embed chat sessions, MCP endpoints, and IM users
+// use principal-derived IDs; thread-mode IM conversations use their thread
+// owner scope; tenant API keys are isolated per key id; MCP OAuth token
+// storage uses MCPOAuthPrincipalFromContext (visitor-level for embed).
 //
 // PrincipalMCPEndpoint must resolve to StorageID() too: the MCP `ask` tool
 // creates its session with `MCPEndpointPrincipal(...).StorageID()` and then
@@ -232,9 +265,14 @@ func MCPOAuthPrincipalFromContext(ctx context.Context) Principal {
 // stored owner ("mcp_endpoint:<tenantID>:<endpointID>"), so every ask call
 // failed with "failed to create user message: session not found".
 func SessionOwnerIDFromContext(ctx context.Context) string {
+	if ctx != nil {
+		if ownerID, ok := ctx.Value(imThreadSessionOwnerKey{}).(string); ok && strings.TrimSpace(ownerID) != "" {
+			return strings.TrimSpace(ownerID)
+		}
+	}
 	if p, ok := PrincipalFromContext(ctx); ok {
 		switch p.Type {
-		case PrincipalAPIExternalUser, PrincipalEmbedSession, PrincipalMCPEndpoint:
+		case PrincipalAPIExternalUser, PrincipalEmbedSession, PrincipalMCPEndpoint, PrincipalIMUser:
 			return p.StorageID()
 		case PrincipalAPITenant:
 			if scope, ok := TenantAPIKeyScopeFromContext(ctx); ok && scope.KeyID > 0 {

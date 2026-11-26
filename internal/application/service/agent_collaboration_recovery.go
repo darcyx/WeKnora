@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"gorm.io/gorm"
 )
 
 // BindRecovery connects approval recovery and live stream persistence.
@@ -217,19 +219,19 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 	}
 	snap, err := agent.DecodeRunSnapshot(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
 	}
 	var saved types.ResumableAgentRequest
 	if err = json.Unmarshal(snap.Request, &saved); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
 	}
 	if saved.ActingVia != "" {
 		// Automation leases, cancellation and duration belong to their own
 		// scheduler. Never revive one through ordinary parent recovery.
-		return errors.New("scheduler-owned parent cannot resume through collaboration recovery")
+		return fmt.Errorf("%w: scheduler-owned parent cannot resume through collaboration recovery", collaboration.ErrPermanentRecovery)
 	}
 	if saved.AgentID == "" || saved.SharedAgentReadOnly {
-		return errors.New("invalid parent recovery identity")
+		return fmt.Errorf("%w: invalid parent recovery identity", collaboration.ErrPermanentRecovery)
 	}
 	ctx, err = s.workerContext(ctx, b.Scope)
 	if err != nil {
@@ -247,25 +249,34 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 		return err
 	}
 	session, err := s.sessions.GetSession(ctx, b.Scope.SessionID)
+	if errors.Is(err, apperrors.ErrSessionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
+	}
 	if err != nil {
 		return err
 	}
 	if session.UserID != b.Scope.UserID || session.TenantID != b.Scope.TenantID {
-		return collaboration.ErrScope
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, collaboration.ErrScope)
 	}
 	answer, err := s.messages.GetMessage(ctx, session.ID, g.ParentMessageID)
+	if errors.Is(err, apperrors.ErrSessionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
+	}
 	if err != nil {
 		return err
 	}
 	if answer.IsCompleted {
-		return errors.New("parent message already closed")
+		return fmt.Errorf("%w: parent message already closed", collaboration.ErrPermanentRecovery)
 	}
 	custom, err := s.agents.GetAgentByID(ctx, saved.AgentID)
+	if errors.Is(err, ErrAgentNotFound) {
+		return fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
+	}
 	if err != nil {
 		return err
 	}
 	if custom == nil || custom.ID != saved.AgentID || custom.TenantID != b.Scope.TenantID || !custom.IsAgentMode() {
-		return errors.New("parent agent is no longer available in this workspace")
+		return fmt.Errorf("%w: parent agent is no longer available in this workspace", collaboration.ErrPermanentRecovery)
 	}
 	if s.streams == nil || s.ParentEvents == nil {
 		return errors.New("parent stream executor unavailable")
@@ -310,6 +321,8 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 
 		KnowledgeBaseIDs: saved.KnowledgeBaseIDs, KnowledgeIDs: saved.KnowledgeIDs, TagScopes: saved.TagScopes,
 		MCPServiceIDs: saved.MCPServiceIDs, SkillNames: saved.SkillNames, WebSearchEnabled: saved.WebSearchEnabled,
+		LocalBrowserEnabled: saved.LocalBrowserEnabled, AppInfo: types.SanitizeAppInfoJSON(saved.AppInfo),
+		RunNote: saved.RunNote, QuotedContext: saved.QuotedContext,
 		QuestionOrigin: saved.QuestionOrigin, PageContext: saved.PageContext, AssistantAccess: saved.AssistantAccess,
 		Mode: types.RunModeAttended, Suspendable: true, Resume: &types.AgentResume{Snapshot: data},
 	}
@@ -462,7 +475,10 @@ func (s *AgentCollaboration) PendingPrompts(
 					p.SessionID != m.SessionID {
 					continue
 				}
-				if p.Kind != types.AgentPromptKindToolApproval && p.Kind != types.AgentPromptKindAskUser {
+				if p.Kind != types.AgentPromptKindToolApproval &&
+					p.Kind != types.AgentPromptKindAskUser &&
+					p.Kind != types.AgentPromptKindPageAction &&
+					p.Kind != types.AgentPromptKindSecureForm {
 					continue
 				}
 				view := p.TimelineView()
@@ -627,6 +643,12 @@ func (s *AgentCollaboration) finishInterruptedParent(ctx context.Context, b *col
 		return errors.New("parent stream executor unavailable")
 	}
 	ctx, err := s.workerContext(ctx, b.Scope)
+	if errors.Is(err, collaboration.ErrRecoveryIdentityUnavailable) {
+		return err
+	}
+	if errors.Is(err, collaboration.ErrPermanentRecovery) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -638,6 +660,9 @@ func (s *AgentCollaboration) finishInterruptedParent(ctx context.Context, b *col
 		return err
 	}
 	answer, err := s.messages.GetMessage(ctx, b.Scope.SessionID, g.ParentMessageID)
+	if errors.Is(err, apperrors.ErrSessionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}

@@ -611,20 +611,19 @@ func (s *agentService) registerMCPTools(
 	// Freeze "all" to the services resolved for this turn. A child must not
 	// silently gain services added after its parent started.
 	mcpMode := config.MCPSelectionMode
-	config.MCPSelectionMode = "selected"
-	selectedIDs := append([]string(nil), config.MCPServices...)
-	config.MCPServices = nil
-	if mcpMode == "" {
+	if mcpMode == "" || mcpMode == "none" {
 		// An unset mode means "none": an agent that never configured MCP
 		// services must not reach every enabled service in the tenant.
 		// This matches the frontend's normalizeSelectionMode and the share
 		// scope guard, both of which treat an empty mode as "none".
-		mcpMode = "none"
-	}
-	if mcpMode == "none" {
+		config.MCPSelectionMode = "none"
+		config.MCPServices = nil
 		logger.Infof(ctx, "MCP services disabled by agent config (mode: none)")
 		return
 	}
+	config.MCPSelectionMode = "selected"
+	selectedIDs := append([]string(nil), config.MCPServices...)
+	config.MCPServices = nil
 
 	var mcpServices []*types.MCPService
 	var err error
@@ -1084,7 +1083,7 @@ func (s *agentService) initializeSkillsManager(
 	skillsConfig := &skills.ManagerConfig{
 		SkillDirs:          config.SkillDirs,
 		AllowedSkills:      config.AllowedSkills,
-		AvailableToolsFunc: toolRegistry.ListTools,
+		AvailableToolsFunc: toolRegistry.ListModelTools,
 		Enabled:            config.SkillsEnabled,
 	}
 
@@ -1703,11 +1702,11 @@ func (s *agentService) registerTools(
 		case tools.ToolDatabaseQuery:
 			toolToRegister = tools.NewDatabaseQueryTool(s.db, config.SearchTargets)
 		case tools.ToolWebSearch:
-			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults).WithAppInfo(config.AppInfo)
+			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults).WithAppInfo(types.SanitizeAppInfoJSON(config.AppInfo))
 			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d, providerID: %s", sessionID, config.WebSearchMaxResults, config.WebSearchProviderID)
 
 		case tools.ToolWebFetch:
-			toolToRegister = tools.NewWebFetchTool(webClient).WithAppInfo(config.AppInfo)
+			toolToRegister = tools.NewWebFetchTool(webClient).WithAppInfo(types.SanitizeAppInfoJSON(config.AppInfo))
 			logger.Infof(ctx, "Registered web_fetch tool for session: %s, providerID: %s",
 				sessionID, config.WebSearchProviderID)
 

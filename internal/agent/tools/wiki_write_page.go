@@ -177,6 +177,10 @@ func (t *wikiWritePageTool) Execute(ctx context.Context, args json.RawMessage) (
 		}, nil
 	}
 
+	if existingPage != nil {
+		ctx = types.WithWikiPageWriteSnapshot(ctx, existingPage)
+	}
+
 	// Auto-repair dead [[slug]] references in the body before persisting.
 	// This rewrites LLM-mangled links (most importantly UUID-based summary
 	// slugs) back to their real target when a confident match exists, and
@@ -207,7 +211,9 @@ func (t *wikiWritePageTool) Execute(ctx context.Context, args json.RawMessage) (
 		action = "updated"
 	} else {
 		// Create
+		tenantID, _ := types.TenantIDFromContext(ctx)
 		newPage := &types.WikiPage{
+			TenantID:        tenantID,
 			KnowledgeBaseID: kbID,
 			Slug:            params.Slug,
 			Title:           params.Title,

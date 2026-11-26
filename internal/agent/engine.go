@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -164,7 +165,7 @@ func NewAgentEngine(
 		eventBus:             eventBus,
 		knowledgeBasesInfo:   knowledgeBasesInfo,
 		selectedDocs:         selectedDocs,
-		appInfo:              config.AppInfo,
+		appInfo:              types.SanitizeLiveAppInfoJSON(config.AppInfo),
 		sessionID:            sessionID,
 		systemPromptTemplate: systemPromptTemplate,
 		tokenEstimator:       tokenEst,
@@ -241,7 +242,7 @@ func (e *AgentEngine) systemPromptOptions(ctx context.Context) *BuildSystemPromp
 		opts.SkillsMetadata = e.skillsManager.GetAllMetadata()
 	}
 	if e.toolRegistry != nil {
-		opts.SelectedTools = e.toolRegistry.ListTools()
+		opts.SelectedTools = e.toolRegistry.ListModelTools()
 		if _, err := e.toolRegistry.GetTool("local_browser"); err == nil {
 			metadata := make([]*skills.SkillMetadata, 0, len(opts.SkillsMetadata))
 			for _, item := range opts.SkillsMetadata {
@@ -255,6 +256,24 @@ func (e *AgentEngine) systemPromptOptions(ctx context.Context) *BuildSystemPromp
 		opts.ShellExecEnabled = err == nil
 	}
 	return opts
+}
+
+func (e *AgentEngine) availableSkillsSignature() string {
+	if e.skillsManager == nil || !e.skillsManager.IsEnabled() {
+		return ""
+	}
+	meta := e.skillsManager.GetAllMetadata()
+	if len(meta) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(meta))
+	for _, item := range meta {
+		if item != nil && item.Name != "" {
+			names = append(names, item.Name)
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\x00")
 }
 
 func (e *AgentEngine) buildSystemPrompt(ctx context.Context) string {
@@ -511,6 +530,10 @@ func (e *AgentEngine) Execute(
 	e.recordRetrievalUserMessage()
 	if err := e.initializeRetrievalContinuation(ctx); err != nil {
 		return nil, err
+	}
+	if e.toolRegistry != nil {
+		e.toolRegistry.RememberMCPHistory(llmContext)
+		e.toolRegistry.RefreshMCPTools(ctx)
 	}
 	systemPrompt := e.buildSystemPrompt(ctx)
 	logger.Debugf(ctx, "[Agent] SystemPrompt: %d chars", len(systemPrompt))
@@ -933,6 +956,7 @@ func (e *AgentEngine) executeLoop(
 
 	guards := &loopGuards{}
 
+	lastSkillsSig := e.availableSkillsSignature()
 loop:
 	for e.withinIterationBudget(state.CurrentRound) || e.allowSteerOverrun {
 		e.allowSteerOverrun = false
@@ -954,6 +978,12 @@ loop:
 		if e.toolRegistry != nil {
 			e.toolRegistry.RefreshMCPTools(ctx)
 			tools = e.buildToolsForLLM()
+			if sig := e.availableSkillsSignature(); sig != lastSkillsSig {
+				lastSkillsSig = sig
+				if len(messages) > 0 && messages[0].Role == "system" {
+					messages[0].Content = e.buildSystemPrompt(ctx)
+				}
+			}
 		}
 
 		// Each iteration runs inside an "agent.round.<N>" Langfuse span.
@@ -1516,9 +1546,14 @@ func (e *AgentEngine) runReActIteration(
 					ReasoningSignature: response.ReasoningSignature,
 					ReasoningMetadata:  response.ReasoningMetadata,
 				})
-				injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
-				injected += e.injectBackground(ctx, state, messagesPtr, true)
-				if injected > 0 {
+				steerInjected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+				bgInjected := e.injectBackground(ctx, state, messagesPtr, true)
+				if steerInjected+bgInjected > 0 {
+					if bgInjected > 0 && verdict.answerID != "" && response.AnswerStreamed {
+						// Background continuation has no user_message_injected boundary;
+						// retract the optimistic draft so clients do not concatenate two answers.
+						e.retractAnswer(ctx, sessionID, verdict.answerID)
+					}
 					*messagesPtr = e.appendCollaborationDeliveryBoundary(*messagesPtr, verdict.finalAnswer)
 					verdict.step.IntermediateAnswer = true
 					state.RoundSteps = append(state.RoundSteps, verdict.step)
@@ -1531,6 +1566,7 @@ func (e *AgentEngine) runReActIteration(
 			}
 		}
 		if e.collaboration != nil && response.FinishReason != "content_filter" {
+			savedWait := false
 			if e.suspendable && e.collaboration.Child == nil {
 				checkpoint := RunSnapshot{
 					CollaborationDeliveries: e.progress.collaborationDeliveries,
@@ -1559,9 +1595,10 @@ func (e *AgentEngine) runReActIteration(
 				if err != nil {
 					return iterOutcomeBreak, err
 				}
-				if err = e.collaboration.SaveWait(ctx, data, time.Now().Add(time.Hour)); err != nil {
+				if err = e.collaboration.SaveWait(ctx, stripJSONNUL(data), time.Now().Add(time.Hour)); err != nil {
 					return iterOutcomeBreak, err
 				}
+				savedWait = true
 			}
 			events, err := e.collaboration.BeforeFinish(ctx)
 			inputReady := errors.Is(err, collaboration.ErrInput)
@@ -1586,6 +1623,11 @@ func (e *AgentEngine) runReActIteration(
 				verdict.step.IntermediateAnswer = true
 				state.RoundSteps = append(state.RoundSteps, verdict.step)
 				return iterOutcomeNext, nil
+			}
+			if savedWait {
+				if err := e.collaboration.ClearWait(context.WithoutCancel(ctx)); err != nil && !errors.Is(err, collaboration.ErrClosed) {
+					logger.Warnf(ctx, "[Agent] Failed to clear collaboration wait after finish: %v", err)
+				}
 			}
 		}
 		if e.holdCollaborationAnswer && response.FinishReason != "content_filter" {

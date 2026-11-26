@@ -18,6 +18,7 @@ type fakeSourceRefsWikiService struct {
 	interfaces.WikiPageService
 	existing *types.WikiPage
 	saved    *types.WikiPage
+	snapshot *types.WikiPage
 }
 
 func (f *fakeSourceRefsWikiService) GetPageBySlug(context.Context, string, string) (*types.WikiPage, error) {
@@ -25,7 +26,8 @@ func (f *fakeSourceRefsWikiService) GetPageBySlug(context.Context, string, strin
 	return &cp, nil
 }
 
-func (f *fakeSourceRefsWikiService) UpdatePage(_ context.Context, p *types.WikiPage) (*types.WikiPage, error) {
+func (f *fakeSourceRefsWikiService) UpdatePage(ctx context.Context, p *types.WikiPage) (*types.WikiPage, error) {
+	f.snapshot, _ = types.WikiPageWriteSnapshotFromContext(ctx)
 	f.saved = p
 	return p, nil
 }
@@ -73,7 +75,7 @@ func TestUpdatePageSourceRefs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			wiki := &fakeSourceRefsWikiService{existing: &types.WikiPage{
-				Slug: "concept/a", Title: "T", Version: 3, SourceRefs: existingRefs,
+				Slug: "concept/a", Title: "T", Version: 3, ParentSlug: "concept/parent", SourceRefs: existingRefs,
 			}}
 			know := &fakeSourceRefsKnowledgeService{rows: rows}
 			h := &WikiPageHandler{wikiService: wiki, kbService: fakeWikiPageTitlesKBService{}, knowledgeSvc: know}
@@ -96,6 +98,8 @@ func TestUpdatePageSourceRefs(t *testing.T) {
 				return
 			}
 			require.NotNil(t, wiki.saved)
+			require.NotNil(t, wiki.snapshot)
+			assert.Equal(t, "concept/parent", wiki.snapshot.ParentSlug)
 			assert.Equal(t, tt.wantRefs, wiki.saved.SourceRefs)
 			if strings.Contains(tt.body, "k1") {
 				assert.Equal(t, uint64(42), know.gotTenant)

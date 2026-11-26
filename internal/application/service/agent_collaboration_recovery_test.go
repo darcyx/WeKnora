@@ -786,3 +786,20 @@ func TestCollaborationPromptStateUsesBrokerDecisionOnly(t *testing.T) {
 	require.Empty(t, projection.Decision)
 	require.Empty(t, projection.Tool)
 }
+
+func TestResumeParentClassifiesInvalidCheckpointPermanently(t *testing.T) {
+	s, _, _, ctx := collaborationService(t)
+	b := &collaboration.Binding{}
+	require.ErrorIs(t, s.resumeParent(ctx, b, []byte(`{invalid`)), collaboration.ErrPermanentRecovery)
+	data, err := json.Marshal(agent.RunSnapshot{Version: agent.RunSnapshotVersion, Request: json.RawMessage(`{"agent_id":""}`)})
+	require.NoError(t, err)
+	require.ErrorIs(t, s.resumeParent(ctx, b, data), collaboration.ErrPermanentRecovery)
+}
+
+func TestInterruptedParentDefersCloseForInactiveIdentity(t *testing.T) {
+	s, _, _, ctx := collaborationService(t)
+	s.streams = &childTestStreams{}
+	s.users.(*collaborationUsers).active = false
+	err := s.finishInterruptedParent(ctx, &collaboration.Binding{Scope: collaboration.Scope{TenantID: 7, UserID: "u", SessionID: "parent", ID: "message"}})
+	require.ErrorIs(t, err, collaboration.ErrRecoveryIdentityUnavailable)
+}

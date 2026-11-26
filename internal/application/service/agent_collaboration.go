@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/hitl"
 	"github.com/Tencent/WeKnora/internal/agent/operations"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -379,25 +380,31 @@ func (s *AgentCollaboration) attach(
 
 func (s *AgentCollaboration) workerContext(ctx context.Context, scope collaboration.Scope) (context.Context, error) {
 	user, err := s.users.GetUserByID(ctx, scope.UserID)
+	if errors.Is(err, ErrUserNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if user == nil || !user.IsActive {
-		return nil, errors.New("delegating user is inactive")
+		return nil, fmt.Errorf("%w: %w: delegating user is inactive", collaboration.ErrPermanentRecovery, collaboration.ErrRecoveryIdentityUnavailable)
 	}
 	membership, err := s.members.GetMembership(ctx, scope.UserID, scope.TenantID)
 	if err != nil {
 		return nil, err
 	}
 	if membership == nil || membership.Status != types.TenantMemberStatusActive {
-		return nil, errors.New("workspace membership is no longer active")
+		return nil, fmt.Errorf("%w: %w: workspace membership is no longer active", collaboration.ErrPermanentRecovery, collaboration.ErrRecoveryIdentityUnavailable)
 	}
 	tenant, err := s.tenants.GetTenantByID(ctx, scope.TenantID)
+	if errors.Is(err, repository.ErrTenantNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("%w: %v", collaboration.ErrPermanentRecovery, err)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if tenant == nil {
-		return nil, errors.New("delegating workspace is unavailable")
+		return nil, fmt.Errorf("%w: delegating workspace is unavailable", collaboration.ErrPermanentRecovery)
 	}
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, scope.TenantID)
 	ctx = context.WithValue(ctx, types.UserIDContextKey, scope.UserID)

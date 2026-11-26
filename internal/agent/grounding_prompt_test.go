@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/stretchr/testify/require"
@@ -129,7 +131,14 @@ func TestGroundingUsesRegistryInsteadOfConfiguration(t *testing.T) {
 }
 
 func TestPinnedGenerationSkillKeepsResourceScopeWithoutTaskPolicy(t *testing.T) {
+	skillDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(skillDir, "pptx-generator"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "pptx-generator", "SKILL.md"), []byte("---\nname: pptx-generator\ndescription: PPT\n---\n"), 0o644))
+	mgr := skills.NewManager(&skills.ManagerConfig{Enabled: true, SkillDirs: []string{skillDir}}, nil)
+	require.NoError(t, mgr.Initialize(t.Context()))
+
 	engine := newTestEngine(t, &mockChat{})
+	engine.skillsManager = mgr
 	engine.knowledgeBasesInfo = []*KnowledgeBaseInfo{{ID: "kb", Name: "Server operations", Capabilities: []string{"chunks"}}}
 	engine.SetPinnedMentions(nil, []*PinnedSkillInfo{{Name: "pptx-generator"}})
 	prompt := engine.RenderUserTurnContent("session", "如何在 Windows Server 2008 上连接 WiFi 网络？制作相关 PPT")

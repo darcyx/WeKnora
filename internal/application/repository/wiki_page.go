@@ -219,7 +219,7 @@ func updateWikiPageRow(db *gorm.DB, page *types.WikiPage) error {
 
 	result := db.
 		Model(page).
-		Where("id = ? AND version = ?", page.ID, expectedVersion).
+		Where("id = ? AND slug = ? AND version = ?", page.ID, page.Slug, expectedVersion).
 		Updates(map[string]interface{}{
 			"title":            page.Title,
 			"content":          page.Content,
@@ -343,6 +343,82 @@ func (r *wikiPageRepository) DeleteRevisionsByPage(ctx context.Context, pageID s
 		Delete(&types.WikiPageRevision{}).Error
 }
 
+// RenamePage renames an existing wiki page's slug in place within a single
+// transaction so its UUID, version, and revision history stay intact, while
+// cascading child parent_slug references and wiki_page_issues.slug.
+func (r *wikiPageRepository) RenamePage(ctx context.Context, page *types.WikiPage, oldSlug string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		original := *page
+		original.Slug = oldSlug
+		if err := checkWikiPageWriteSnapshot(tx, &original); err != nil {
+			return err
+		}
+		// Read backlinks under the same row lock: other pages update them without a version bump.
+		var current types.WikiPage
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", page.ID).First(&current).Error; err != nil {
+			return err
+		}
+		page.InLinks = make(types.StringArray, 0, len(current.InLinks))
+		seen := make(map[string]bool, len(current.InLinks))
+		for _, src := range current.InLinks {
+			if src == oldSlug {
+				src = page.Slug
+			}
+			if src != "" && !seen[src] {
+				page.InLinks = append(page.InLinks, src)
+				seen[src] = true
+			}
+		}
+		var conflict int64
+		if err := tx.Model(&types.WikiPage{}).
+			Where("knowledge_base_id = ? AND slug = ? AND deleted_at IS NULL AND id <> ?",
+				page.KnowledgeBaseID, page.Slug, page.ID).
+			Count(&conflict).Error; err != nil {
+			return err
+		}
+		if conflict > 0 {
+			return fmt.Errorf("wiki page slug %q already exists", page.Slug)
+		}
+
+		res := tx.Model(&types.WikiPage{}).
+			Where("id = ? AND knowledge_base_id = ? AND slug = ? AND version = ? AND deleted_at IS NULL",
+				page.ID, page.KnowledgeBaseID, oldSlug, page.Version).
+			Updates(map[string]any{
+				"slug":             page.Slug,
+				"content":          page.Content,
+				"out_links":        page.OutLinks,
+				"in_links":         page.InLinks,
+				"category_path":    page.CategoryPath,
+				"wiki_path":        page.WikiPath,
+				"depth":            page.Depth,
+				"last_edit_source": page.LastEditSource,
+				"last_editor_id":   page.LastEditorID,
+				"updated_at":       page.UpdatedAt,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrWikiPageConflict
+		}
+
+		if err := tx.Model(&types.WikiPage{}).
+			Where("knowledge_base_id = ? AND parent_slug = ? AND deleted_at IS NULL",
+				page.KnowledgeBaseID, oldSlug).
+			Update("parent_slug", page.Slug).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&types.WikiPageIssue{}).
+			Where("knowledge_base_id = ? AND slug = ? AND deleted_at IS NULL",
+				page.KnowledgeBaseID, oldSlug).
+			Update("slug", page.Slug).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // UpdateAutoLinkedContent persists content changes produced by the automatic
 // link decorators (cross-link injection, dead-link cleanup) without bumping
 // `version`. These passes rewrite the same revision with wiki-link markup
@@ -350,9 +426,21 @@ func (r *wikiPageRepository) DeleteRevisionsByPage(ctx context.Context, pageID s
 // pages appear as v2 on first view and confuse users who expect `version` to
 // correspond to the number of intentional revisions.
 func (r *wikiPageRepository) UpdateAutoLinkedContent(ctx context.Context, page *types.WikiPage) error {
-	result := r.db.WithContext(ctx).
+	if _, guarded := types.WikiPageWriteSnapshotFromContext(ctx); guarded {
+		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := checkWikiPageWriteSnapshot(tx, page); err != nil {
+				return err
+			}
+			return updateAutoLinkedContent(tx, page)
+		})
+	}
+	return updateAutoLinkedContent(r.db.WithContext(ctx), page)
+}
+
+func updateAutoLinkedContent(db *gorm.DB, page *types.WikiPage) error {
+	result := db.
 		Model(page).
-		Where("id = ?", page.ID).
+		Where("id = ? AND slug = ? AND version = ?", page.ID, page.Slug, page.Version).
 		Updates(map[string]interface{}{
 			"content":    page.Content,
 			"out_links":  page.OutLinks,
@@ -377,7 +465,7 @@ func (r *wikiPageRepository) UpdateMeta(ctx context.Context, page *types.WikiPag
 			return updateWikiPageMeta(tx, page)
 		})
 	}
-	return updateWikiPageMeta(r.db.WithContext(ctx), page)
+	return updateWikiPageMeta(r.db.WithContext(ctx).Where("COALESCE(parent_slug, '') = ?", page.ParentSlug), page)
 }
 
 // updateWikiPageMeta 保留主线的窄字段写入；普通保存与快照保护的保存都不覆盖反链。
@@ -385,7 +473,7 @@ func updateWikiPageMeta(db *gorm.DB, page *types.WikiPage) error {
 	// 反链由专用原子操作维护，避免这份元数据快照覆盖并发添加的链接。
 	result := db.
 		Model(page).
-		Where("id = ?", page.ID).
+		Where("id = ? AND slug = ? AND version = ?", page.ID, page.Slug, page.Version).
 		Updates(map[string]interface{}{
 			"out_links":     page.OutLinks,
 			"aliases":       page.Aliases,

@@ -158,13 +158,22 @@ func extractSensitiveAppInfoTokens(appInfo string) (longTokens []string, shortTo
 		maps = append(maps, app)
 	}
 	for _, m := range maps {
-		for _, k := range []string{"app_secret", "appSecret"} {
+		for _, k := range []string{
+			"app_secret", "appSecret",
+			"token", "access_token", "accessToken", "auth_token", "authToken",
+			"api_key", "apiKey", "secret",
+			"pay_callback", "payCallback",
+			"refund_callback", "refundCallback",
+		} {
 			add(m[k], 4, false)
 		}
 		for _, k := range []string{"app_id", "appId", "appid"} {
 			add(m[k], 4, true)
 		}
-		for _, k := range []string{"app_name", "appName", "game_name", "gameName", "project_name", "projectName"} {
+		for _, k := range []string{
+			"app_name", "appName", "game_name", "gameName", "project_name", "projectName",
+			"subject_name", "subjectName", "studio_name", "studioName", "app_alias", "appAlias",
+		} {
 			add(m[k], 3, false)
 		}
 	}
@@ -226,27 +235,46 @@ func checkWebSearchPrivacy(query string, sensitiveTokens, shortSensitiveTokens [
 	return nil
 }
 
-// checkWebURLPrivacy inspects a target URL's path and query parameters (both raw
-// and percent-decoded) so direct web_fetch calls cannot leak credentials or
-// private project identifiers in query strings or path segments.
+// checkWebURLPrivacy inspects a target URL's host, userinfo, path, query
+// parameters, and fragment (both raw and percent-decoded) so direct web_fetch
+// calls cannot leak credentials or private project identifiers anywhere in a URL.
 func checkWebURLPrivacy(rawURL string, sensitiveTokens, shortSensitiveTokens []string) error {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	trimmed := strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(trimmed)
 	if err != nil {
+		if privacyErr := checkWebSearchPrivacy(trimmed, sensitiveTokens, shortSensitiveTokens); privacyErr != nil {
+			return fmt.Errorf("web_fetch URL blocked: URL contains private identifiers or credentials; strip private data before fetching public documentation")
+		}
 		return nil
 	}
-	candidates := []string{parsed.Path, parsed.RawQuery}
+	candidates := []string{parsed.Host, parsed.Hostname(), parsed.Path, parsed.RawPath, parsed.RawQuery, parsed.Fragment, parsed.RawFragment}
+	if parsed.User != nil {
+		if pass, hasPass := parsed.User.Password(); hasPass && strings.TrimSpace(pass) != "" {
+			return fmt.Errorf("web_fetch URL blocked: URL userinfo contains credentials; strip credentials before fetching public documentation")
+		}
+		candidates = append(candidates, parsed.User.String(), parsed.User.Username())
+		if decodedUser, err := url.PathUnescape(parsed.User.String()); err == nil && decodedUser != parsed.User.String() {
+			candidates = append(candidates, decodedUser)
+		}
+	}
 	if decodedPath, err := url.PathUnescape(parsed.Path); err == nil && decodedPath != parsed.Path {
 		candidates = append(candidates, decodedPath)
 	}
 	if decodedQuery, err := url.QueryUnescape(parsed.RawQuery); err == nil && decodedQuery != parsed.RawQuery {
 		candidates = append(candidates, decodedQuery)
 	}
+	if decodedFragment, err := url.PathUnescape(parsed.Fragment); err == nil && decodedFragment != parsed.Fragment {
+		candidates = append(candidates, decodedFragment)
+	}
+	if decodedFragmentQ, err := url.QueryUnescape(parsed.Fragment); err == nil && decodedFragmentQ != parsed.Fragment {
+		candidates = append(candidates, decodedFragmentQ)
+	}
 	for _, part := range candidates {
 		if strings.TrimSpace(part) == "" {
 			continue
 		}
 		if err := checkWebSearchPrivacy(part, sensitiveTokens, shortSensitiveTokens); err != nil {
-			return fmt.Errorf("web_fetch URL blocked: path or query parameters contain private identifiers or credentials; strip private query parameters before fetching public documentation")
+			return fmt.Errorf("web_fetch URL blocked: URL contains private identifiers or credentials; strip private parameters before fetching public documentation")
 		}
 	}
 	return nil

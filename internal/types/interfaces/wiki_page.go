@@ -64,6 +64,11 @@ type WikiPageService interface {
 	// DeletePage soft-deletes a wiki page and removes its chunk sync.
 	DeletePage(ctx context.Context, kbID string, slug string) error
 
+	// RenamePage renames a wiki page's slug in place, preserving its UUID,
+	// version, and revision history while updating self-links, child parent_slug
+	// references, and wiki page issues.
+	RenamePage(ctx context.Context, kbID, oldSlug, newSlug string) (*types.WikiPage, error)
+
 	// GetIndex returns the index page for a knowledge base.
 	// Creates a default one if it doesn't exist.
 	//
@@ -455,6 +460,11 @@ type WikiPageRepository interface {
 
 	// DeleteRevisionsByPage hard-deletes a page's entire snapshot history.
 	DeleteRevisionsByPage(ctx context.Context, pageID string) error
+
+	// RenamePage updates an existing wiki page's slug in place inside a single
+	// transaction, preserving its ID, version, and revisions while cascading
+	// child parent_slug values and wiki_page_issues.slug.
+	RenamePage(ctx context.Context, page *types.WikiPage, oldSlug string) error
 
 	// DeleteByKnowledgeBaseID soft-deletes all wiki pages for tenantID+kbID.
 	// Used by KB delete cleanup to batch-soft-delete every page without walking

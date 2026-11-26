@@ -193,13 +193,21 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args json.RawMessage) (*
 	}
 }
 
+func (t *ReadDocumentTool) effectiveSearchTargets(ctx context.Context) types.SearchTargets {
+	if execution, ok := ToolExecFromContext(ctx); ok && len(execution.RetrievalTargets) > 0 {
+		return execution.RetrievalTargets
+	}
+	return t.searchTargets
+}
+
 // resolveTarget accepts either a document id or a chunk id. Documents are
 // tried first because they are the common case; a chunk id falls through to
 // the chunk lookup. Scope violations are reported as such rather than being
 // masked as "not found".
 func (t *ReadDocumentTool) resolveTarget(ctx context.Context, id string) (*types.Knowledge, *types.Chunk, error) {
+	targets := t.effectiveSearchTargets(ctx)
 	if knowledge, err := t.knowledgeService.GetKnowledgeByIDOnly(ctx, id); err == nil && knowledge != nil {
-		authorized, authErr := authorizeLoadedKnowledge(ctx, t.searchTargets, knowledge, t.knowledgeService)
+		authorized, authErr := authorizeLoadedKnowledge(ctx, targets, knowledge, t.knowledgeService)
 		if authErr != nil {
 			return nil, nil, fmt.Errorf("document is not accessible: %w", authErr)
 		}
@@ -211,12 +219,12 @@ func (t *ReadDocumentTool) resolveTarget(ctx context.Context, id string) (*types
 			"id %s is neither a document (doc://N) nor a chunk (chunk://N) in the current scope", id)
 	}
 	authorizedChunk, authErr := authorizeChunkInSearchTargets(
-		ctx, t.searchTargets, id, t.chunkService, t.knowledgeService,
+		ctx, targets, id, t.chunkService, t.knowledgeService,
 	)
 	if authErr != nil {
 		return nil, nil, fmt.Errorf("chunk is not accessible: %w", authErr)
 	}
-	knowledge, err := authorizeKnowledgeInSearchTargets(ctx, t.searchTargets, authorizedChunk.KnowledgeID, t.knowledgeService)
+	knowledge, err := authorizeKnowledgeInSearchTargets(ctx, targets, authorizedChunk.KnowledgeID, t.knowledgeService)
 	if err != nil {
 		return nil, nil, fmt.Errorf("document is not accessible: %w", err)
 	}
@@ -226,11 +234,11 @@ func (t *ReadDocumentTool) resolveTarget(ctx context.Context, id string) (*types
 	return knowledge, authorizedChunk, nil
 }
 
-func (t *ReadDocumentTool) tenantFor(knowledge *types.Knowledge) uint64 {
+func (t *ReadDocumentTool) tenantFor(ctx context.Context, knowledge *types.Knowledge) uint64 {
 	if knowledge.TenantID != 0 {
 		return knowledge.TenantID
 	}
-	return t.searchTargets.GetTenantIDForKB(knowledge.KnowledgeBaseID)
+	return t.effectiveSearchTargets(ctx).GetTenantIDForKB(knowledge.KnowledgeBaseID)
 }
 
 // listChunks fetches one page of text/FAQ chunks in document order.
@@ -239,7 +247,7 @@ func (t *ReadDocumentTool) listChunks(
 ) ([]*types.Chunk, int64, error) {
 	enabled := true
 	chunks, total, err := t.chunkService.GetRepository().ListPagedChunksByKnowledgeID(
-		ctx, t.tenantFor(knowledge), knowledge.ID,
+		ctx, t.tenantFor(ctx, knowledge), knowledge.ID,
 		&types.Pagination{Page: page, PageSize: pageSize},
 		[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ},
 		nil, "", "", "", "", &enabled,
@@ -323,7 +331,7 @@ func (t *ReadDocumentTool) readPage(
 			},
 		}, nil
 	}
-	enrichChunkImageInfo(ctx, t.chunkService.GetRepository(), t.tenantFor(knowledge), chunks)
+	enrichChunkImageInfo(ctx, t.chunkService.GetRepository(), t.tenantFor(ctx, knowledge), chunks)
 	chunks = fitChunksToBudget(chunks, OutputBudget(ctx)*4/5)
 
 	rows := make([]readChunkRow, 0, len(chunks))
@@ -356,7 +364,7 @@ func (t *ReadDocumentTool) readAroundChunk(
 		// parent, summary and image chunks share the index sequence, so a
 		// position computed from ChunkIndex would drift away from the focus.
 		neighbours, err := t.chunkService.GetRepository().ListChunkNeighbors(
-			ctx, t.tenantFor(knowledge), knowledge.ID, focus.ChunkIndex, contextChunks, contextChunks,
+			ctx, t.tenantFor(ctx, knowledge), knowledge.ID, focus.ChunkIndex, contextChunks, contextChunks,
 			[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ},
 		)
 		if err != nil {
@@ -385,11 +393,16 @@ func (t *ReadDocumentTool) readAroundChunk(
 	for _, r := range rows {
 		chunks = append(chunks, r.chunk)
 	}
-	enrichChunkImageInfo(ctx, t.chunkService.GetRepository(), t.tenantFor(knowledge), chunks)
+	enrichChunkImageInfo(ctx, t.chunkService.GetRepository(), t.tenantFor(ctx, knowledge), chunks)
+	origLen := len(rows)
+	rows = fitRowsAroundFocusToBudget(rows, OutputBudget(ctx)*4/5)
 
 	data := t.buildData(knowledge, total, rows)
 	data["single_chunk"] = len(rows) == 1
 	data["focus_chunk_id"] = focus.ID
+	if len(rows) < origLen {
+		data["context_truncated"] = true
+	}
 	if q := faqStandardQuestion(focus); q != "" {
 		data["faq_id"] = focus.ID
 		data["faq_question"] = q
@@ -437,7 +450,7 @@ func (t *ReadDocumentTool) scanByQuery(
 	// preceding context, also when offset is the first chunk of a page.
 	page := max(offset-1, 0)/readDocumentScanPageSize + 1
 	nextOffset := -1
-	tenantID := t.tenantFor(knowledge)
+	tenantID := t.tenantFor(ctx, knowledge)
 	// Stop collecting before the registry's head/tail truncation would cut
 	// rows in the middle; the header and tags take the remaining share.
 	budget := OutputBudget(ctx) * 4 / 5
@@ -584,6 +597,56 @@ func fitChunksToBudget(chunks []*types.Chunk, budget int) []*types.Chunk {
 	return chunks
 }
 
+// fitRowsAroundFocusToBudget always keeps the focus chunk and adds nearest
+// neighbouring rows symmetrically while their rendered size fits in budget.
+func fitRowsAroundFocusToBudget(rows []readChunkRow, budget int) []readChunkRow {
+	if len(rows) <= 1 || budget <= 0 {
+		return rows
+	}
+	focusIdx := -1
+	for i, r := range rows {
+		if r.role == "focus" {
+			focusIdx = i
+			break
+		}
+	}
+	if focusIdx < 0 {
+		focusIdx = 0
+	}
+	kept := make([]bool, len(rows))
+	kept[focusIdx] = true
+	used := readDocumentRowCost(rows[focusIdx].chunk)
+	for dist := 1; focusIdx-dist >= 0 || focusIdx+dist < len(rows); dist++ {
+		addedAny := false
+		if left := focusIdx - dist; left >= 0 {
+			cost := readDocumentRowCost(rows[left].chunk)
+			if used+cost <= budget {
+				kept[left] = true
+				used += cost
+				addedAny = true
+			}
+		}
+		if right := focusIdx + dist; right < len(rows) {
+			cost := readDocumentRowCost(rows[right].chunk)
+			if used+cost <= budget {
+				kept[right] = true
+				used += cost
+				addedAny = true
+			}
+		}
+		if !addedAny {
+			break
+		}
+	}
+	out := make([]readChunkRow, 0, len(rows))
+	for i, r := range rows {
+		if kept[i] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func countMatches(matchers []*regexp.Regexp, s string) int {
 	n := 0
 	for _, m := range matchers {
@@ -726,7 +789,7 @@ func (t *ReadDocumentTool) buildOutput(
 					b.WriteString("; ")
 				}
 				first = false
-				fmt.Fprintf(&b, "%s: %v", xmlEscape(key), value)
+				fmt.Fprintf(&b, "%s: %s", xmlEscape(key), xmlEscape(fmt.Sprintf("%v", value)))
 			}
 			b.WriteString("</metadata>\n")
 		}

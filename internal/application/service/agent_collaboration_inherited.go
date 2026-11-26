@@ -189,6 +189,8 @@ func inheritedToolOwnsPolicy(name string) bool {
 	}
 	switch name {
 	case "send_message", "ask_user", tools.ToolCallMCPTool, tools.ToolDiscoverMCPTools,
+		tools.ToolThinking, tools.ToolTodoWrite, tools.ToolDataAnalysis, tools.ToolDatabaseQuery,
+		"request_secure_form", "browser_fill_secret",
 		"find_operations", "run_operation", "open_page", "view_page", "read_page", "fill_page", "select_tab",
 		tools.ToolSearchWeKnoraDocs, tools.ToolReadWeKnoraDoc:
 		return true

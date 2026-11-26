@@ -117,8 +117,8 @@ func (e *AgentEngine) retrievalAdmission(ctx context.Context, action string, inp
 		}
 	}
 	payload := map[string]any{"action": action, "input": input, "current_input": e.retrievalUserMessage.text, "prior_user_messages": e.retrievalHistory}
-	if e.appInfo != "" {
-		payload["app_info"] = e.appInfo
+	if sanitized := e.sanitizedAppInfo(); sanitized != "" {
+		payload["app_info"] = sanitized
 		payload["app_info_input_id"] = e.projectInputID()
 	}
 	raw, err := json.Marshal(payload)
@@ -318,7 +318,7 @@ func (e *AgentEngine) applyRetrievalReview(ctx context.Context, review retrieval
 		}
 	}
 	c.mu.Unlock()
-	if err := trial.applyReview(review); err != nil {
+	if err := trial.applyReviewWithOptions(review, false); err != nil {
 		return err
 	}
 	var observations []struct {
@@ -365,7 +365,7 @@ func (e *AgentEngine) applyRetrievalReview(ctx context.Context, review retrieval
 			return fmt.Errorf("user answers could not be verified because the boundary check is unavailable: %v", err)
 		}
 		logger.Warnf(ctx, "Retrieval boundary check unavailable for a review; applying it without a decision: %v", err)
-		return c.applyReview(review)
+		return c.applyReviewWithOptions(review, false)
 	}
 	if err != nil {
 		return err
@@ -392,7 +392,7 @@ func (e *AgentEngine) applyRetrievalReview(ctx context.Context, review retrieval
 		}
 		review.GapID, review.NewFact = verdict.GapID, nil
 	}
-	return c.applyReview(review)
+	return c.applyReviewWithOptions(review, false)
 }
 
 func recentClarificationEvidence(state retrievalState, gap retrievalGap) []map[string]string {

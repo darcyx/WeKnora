@@ -181,9 +181,16 @@ func (t *DatabaseQueryTool) Execute(ctx context.Context, args json.RawMessage) (
 		}, err
 	}
 
-	// Process results
+	// Bound retained rows; the database driver may buffer results before iteration.
+	const maxDatabaseQueryRows = 500
 	results := make([]map[string]interface{}, 0)
+	truncated := false
+	usedBytes := 0
 	for rows.Next() {
+		if len(results) >= maxDatabaseQueryRows {
+			truncated = true
+			break
+		}
 		// Create a slice of interface{} to hold each column value
 		columnValues := make([]interface{}, len(columns))
 		columnPointers := make([]interface{}, len(columns))
@@ -210,6 +217,15 @@ func (t *DatabaseQueryTool) Execute(ctx context.Context, args json.RawMessage) (
 				rowMap[colName] = val
 			}
 		}
+		encoded, err := json.Marshal(rowMap)
+		if err != nil {
+			return &types.ToolResult{Success: false, Error: err.Error()}, err
+		}
+		if usedBytes+len(encoded)+1 > OutputBudget(ctx) {
+			truncated = true
+			break
+		}
+		usedBytes += len(encoded) + 1
 		results = append(results, rowMap)
 	}
 
@@ -220,7 +236,7 @@ func (t *DatabaseQueryTool) Execute(ctx context.Context, args json.RawMessage) (
 		}, err
 	}
 
-	logger.Infof(ctx, "[Tool][DatabaseQuery] Retrieved %d rows with %d columns", len(results), len(columns))
+	logger.Infof(ctx, "[Tool][DatabaseQuery] Retrieved %d rows with %d columns (truncated=%v)", len(results), len(columns), truncated)
 	logger.Debugf(ctx, "[Tool][DatabaseQuery] Columns: %v", columns)
 
 	// Log first few rows for debugging
@@ -233,18 +249,23 @@ func (t *DatabaseQueryTool) Execute(ctx context.Context, args json.RawMessage) (
 
 	// Format output
 	logger.Debugf(ctx, "[Tool][DatabaseQuery] Formatting query results...")
-	output := t.formatQueryResults(columns, results)
+	output := t.formatQueryResults(columns, results, truncated)
 
 	logger.Infof(ctx, "[Tool][DatabaseQuery] Execute completed successfully: %d rows returned", len(results))
+	data := map[string]interface{}{
+		"columns":      columns,
+		"rows":         results,
+		"row_count":    len(results),
+		"truncated":    truncated,
+		"display_type": "database_query",
+	}
+	if truncated {
+		data["max_rows"] = maxDatabaseQueryRows
+	}
 	return &types.ToolResult{
 		Success: true,
 		Output:  output,
-		Data: map[string]interface{}{
-			"columns":      columns,
-			"rows":         results,
-			"row_count":    len(results),
-			"display_type": "database_query",
-		},
+		Data:    data,
 	}, nil
 }
 
@@ -302,12 +323,21 @@ func searchScopesFromTargets(searchTargets types.SearchTargets) []utils.SearchSc
 func (t *DatabaseQueryTool) formatQueryResults(
 	columns []string,
 	results []map[string]interface{},
+	truncated bool,
 ) string {
 	output := "=== Query Results ===\n\n"
-	output += fmt.Sprintf("Returned %d rows\n\n", len(results))
+	if truncated {
+		output += fmt.Sprintf("Returned %d rows (truncated by row or output size limit; narrow WHERE filters for specific rows)\n\n", len(results))
+	} else {
+		output += fmt.Sprintf("Returned %d rows\n\n", len(results))
+	}
 
 	if len(results) == 0 {
-		output += "No matching records found.\n"
+		if truncated {
+			output += "Result exceeds the preview size limit.\n"
+		} else {
+			output += "No matching records found.\n"
+		}
 		return output
 	}
 

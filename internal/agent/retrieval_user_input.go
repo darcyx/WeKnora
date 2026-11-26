@@ -53,8 +53,10 @@ func (e *AgentEngine) recordRetrievalUserMessage() {
 	if e.retrieval != nil && strings.TrimSpace(e.retrievalUserMessage.id) != "" {
 		e.retrieval.recordUserInput("message:"+e.retrievalUserMessage.id, e.retrievalUserMessage.text)
 	}
-	if e.retrieval != nil && e.appInfo != "" {
-		e.retrieval.recordUserInput(e.projectInputID(), e.appInfo)
+	if e.retrieval != nil {
+		if sanitized := e.sanitizedAppInfo(); sanitized != "" {
+			e.retrieval.recordUserInput(e.projectInputID(), sanitized)
+		}
 	}
 }
 

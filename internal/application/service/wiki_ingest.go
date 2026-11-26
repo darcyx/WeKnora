@@ -2268,6 +2268,7 @@ func (s *wikiIngestService) rebuildIndexPage(ctx context.Context, chatModel chat
 	// that's what the new index view returns; fall back to Summary for
 	// rows written before this refactor so the incremental-update prompt
 	// has something to work with.
+	ctx = types.WithWikiPageWriteSnapshot(ctx, indexPage)
 	existingIntro := strings.TrimSpace(indexPage.Content)
 	if existingIntro == "" {
 		existingIntro = strings.TrimSpace(indexPage.Summary)

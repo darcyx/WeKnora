@@ -188,9 +188,13 @@ type ResumableAgentRequest struct {
 	PageContext         *PageContext    `json:"page_context,omitempty"`
 	// AssistantAccess is the level the user asked for; the ceiling is
 	// applied again on resume, so lowering it in between takes effect.
-	AssistantAccess AssistantAccessLevel `json:"assistant_access,omitempty"`
-	UserMessageID   string               `json:"user_message_id,omitempty"`
-	Language        string               `json:"language,omitempty"`
+	AssistantAccess     AssistantAccessLevel `json:"assistant_access,omitempty"`
+	UserMessageID       string               `json:"user_message_id,omitempty"`
+	Language            string               `json:"language,omitempty"`
+	AppInfo             string               `json:"app_info,omitempty"`
+	LocalBrowserEnabled bool                 `json:"local_browser_enabled,omitempty"`
+	RunNote             string               `json:"run_note,omitempty"`
+	QuotedContext       string               `json:"quoted_context,omitempty"`
 }
 
 // ToolApprovalPromptRequest is the Request of an AgentPromptKindToolApproval.

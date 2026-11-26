@@ -136,6 +136,20 @@ func (r *ToolRegistry) ListTools() []string {
 	return names
 }
 
+// ListModelTools returns the sorted names of tools currently exposed to the
+// model (excluding deferred tools such as an inactive call_mcp_tool).
+func (r *ToolRegistry) ListModelTools() []string {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		if r.deferred[name] {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // GetFunctionDefinitions returns function definitions for all registered tools.
 // The slice is sorted by tool name so the serialized payload sent to the LLM
 // is byte-identical across requests. Providers that key prompt caching on a

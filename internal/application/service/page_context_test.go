@@ -59,15 +59,23 @@ func TestPageContextInTargets(t *testing.T) {
 	assert.Len(t, got.WikiIssueIDs, types.MaxPageContextIssues)
 }
 
-// A turn paused for approval resumes with the page the user had open.
+// A turn paused for approval resumes with the page and request context the user had open.
 func TestResumableAgentRequestKeepsPageContext(t *testing.T) {
 	page := &types.PageContext{KnowledgeBaseID: "kb-a", WikiIssueIDs: []string{"i-1"}}
 	resumable := resumableAgentRequest(context.Background(), &types.QARequest{
-		Session:     &types.Session{ID: "s", TenantID: 1},
-		CustomAgent: &types.CustomAgent{ID: types.BuiltinWeKnoraAssistantID},
-		PageContext: page,
+		Session:             &types.Session{ID: "s", TenantID: 1},
+		CustomAgent:         &types.CustomAgent{ID: types.BuiltinWeKnoraAssistantID},
+		PageContext:         page,
+		AppInfo:             `{"app_id":"10001","token":"secret-tok","passwd":"p"}`,
+		LocalBrowserEnabled: true,
+		RunNote:             "scheduled run",
+		QuotedContext:       "quoted text",
 	})
 	assert.Equal(t, page, resumable.PageContext)
+	assert.JSONEq(t, `{"app_id":"10001"}`, resumable.AppInfo)
+	assert.True(t, resumable.LocalBrowserEnabled)
+	assert.Equal(t, "scheduled run", resumable.RunNote)
+	assert.Equal(t, "quoted text", resumable.QuotedContext)
 }
 
 type pageContextWikiService struct {

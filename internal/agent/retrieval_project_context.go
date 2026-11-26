@@ -8,13 +8,19 @@ import (
 	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
+func (e *AgentEngine) sanitizedAppInfo() string {
+	return types.SanitizeAppInfoJSON(e.appInfo)
+}
+
 func (e *AgentEngine) projectInputID() string {
-	if e.appInfo == "" {
+	sanitized := e.sanitizedAppInfo()
+	if sanitized == "" {
 		return ""
 	}
-	return fmt.Sprintf("app_info:%x", sha256.Sum256([]byte(e.appInfo)))
+	return fmt.Sprintf("app_info:%x", sha256.Sum256([]byte(sanitized)))
 }
 
 // Preserve project provenance instead of presenting metadata as a user reply.
@@ -22,7 +28,7 @@ func (e *AgentEngine) resolveProjectConditions(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !e.retrievalGuard || e.retrieval == nil || e.appInfo == "" {
+	if e.retrieval == nil {
 		return nil
 	}
 	e.retrieval.mu.Lock()
@@ -30,6 +36,9 @@ func (e *AgentEngine) resolveProjectConditions(ctx context.Context) error {
 	e.retrieval.mu.Unlock()
 	if failed {
 		return errRetrievalStateSave
+	}
+	if !e.retrievalGuard || e.sanitizedAppInfo() == "" {
+		return nil
 	}
 	state := e.retrieval.snapshot()
 	var missing []retrievalGap
@@ -49,7 +58,7 @@ func (e *AgentEngine) resolveProjectConditions(ctx context.Context) error {
 		return nil
 	}
 	e.retrievalProjectReviewed = key
-	e.retrieval.recordUserInput(e.projectInputID(), e.appInfo)
+	e.retrieval.recordUserInput(e.projectInputID(), e.sanitizedAppInfo())
 	e.retrieval.mu.Lock()
 	failed = e.retrieval.persistenceFailed
 	e.retrieval.mu.Unlock()
@@ -99,8 +108,10 @@ func (e *AgentEngine) resolveProjectConditions(ctx context.Context) error {
 	if !applied {
 		return nil
 	}
+	prev := c.snapshotLocked()
 	c.state = next.state
 	if err := c.persistLocked(); err != nil {
+		c.state = prev
 		return err
 	}
 	// Cache the resulting blockers so later publication does not recheck the same metadata.
