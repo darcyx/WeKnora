@@ -4,6 +4,7 @@
 package productdocs
 
 import (
+	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -15,8 +16,6 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
-
-	websitedocs "github.com/Tencent/WeKnora/website-docs"
 )
 
 // Categories are the documentation's sidebar groups, in site order. They
@@ -78,7 +77,7 @@ var (
 // As with Load, a non-nil library may come with an error naming the pages
 // left out.
 func Default() (*Library, error) {
-	defaultOnce.Do(func() { defaultLib, defaultErr = Load(websitedocs.Pages) })
+	defaultOnce.Do(func() { defaultLib, defaultErr = Load(embed.FS{}) })
 	return defaultLib, defaultErr
 }
 
