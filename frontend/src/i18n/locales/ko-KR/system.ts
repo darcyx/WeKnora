@@ -1,4 +1,47 @@
 export default {
+  tokenQuotaSettings: {
+    title: "토큰 할당량",
+    description: "API 연동 외부 사용자의 토큰 사용량과 할당량을 관리합니다.",
+    identityHint: "할당량은 공간과 외부 사용자 ID별로 계산되며 기간은 UTC 기준입니다.",
+    tenantId: "공간 ID",
+    tenantIdPlaceholder: "공간 ID 입력",
+    tenantIdRequired: "공간 ID를 입력하세요",
+    tenantIdInvalid: "공간 ID는 숫자여야 합니다",
+    subjectId: "외부 사용자 ID",
+    subjectIdPlaceholder: "외부 사용자 ID 입력",
+    subjectIdRequired: "외부 사용자 ID를 입력하세요",
+    query: "조회",
+    listUsers: "사용자 목록",
+    usersTitle: "외부 사용자",
+    usersDescription: "사용자를 선택해 할당량을 확인하거나 조정하고, 목록에 없는 사용자도 조회할 수 있습니다.",
+    previousPage: "이전",
+    nextPage: "다음",
+    pageInfo: "{page}페이지, 전체 {total}명",
+    dailyUsage: "오늘 사용량",
+    monthlyUsage: "이번 달 사용량",
+    reservedTokens: "예약된 토큰",
+    reservedHint: "진행 중인 요청을 위해 예약된 토큰 수입니다.",
+    unlimited: "무제한",
+    limitValue: "한도: {value}",
+    overrideTitle: "사용자별 할당량",
+    overrideDescription: "개별 한도를 설정합니다. 비워 두면 플랫폼 기본값을 상속합니다.",
+    overridden: "개별 설정됨",
+    inheriting: "기본값 상속",
+    dailyLimit: "일일 한도",
+    monthlyLimit: "월간 한도",
+    inheritPlaceholder: "기본값 상속",
+    limitHint: "0은 무제한이며 비워 두면 기본값을 상속합니다.",
+    reset: "기본값 복원",
+    resetConfirm: "이 사용자의 개별 할당량을 삭제하고 플랫폼 기본값을 복원할까요?",
+    save: "저장",
+    noData: "공간 ID와 외부 사용자 ID를 입력하여 조회하세요.",
+    loadFailed: "할당량을 불러오지 못했습니다",
+    overrideRequired: "하나 이상의 개별 한도를 설정하세요",
+    saveSuccess: "할당량을 저장했습니다",
+    saveFailed: "할당량을 저장하지 못했습니다",
+    resetSuccess: "기본 할당량을 복원했습니다",
+    resetFailed: "할당량을 복원하지 못했습니다",
+  },
   documentProgress: {
     queueView: '큐 작업',
     title: '자료 및 Wiki 진행 상황',
@@ -325,6 +368,11 @@ export default {
         }
       },
       keyDescriptions: {
+        token_quota: {
+          default_daily_limit: "API 연동 외부 사용자의 기본 일일 토큰 한도(UTC 기준일)입니다. 0은 무제한이며 개별 설정이 우선합니다. 변경 사항은 즉시 적용됩니다.",
+          default_monthly_limit: "API 연동 외부 사용자의 기본 월간 토큰 한도(UTC 기준월)입니다. 0은 무제한이며 개별 설정이 우선합니다. 변경 사항은 즉시 적용됩니다.",
+          max_completion_tokens: "max_tokens가 지정되지 않았을 때 예약과 모델 호출에 사용할 최대 출력 토큰 수입니다. 양의 정수여야 하며, 값이 작으면 예약량과 답변 길이가 줄어듭니다.",
+        },
         model: {
           max_concurrency: '백그라운드 작업(문서 색인/보강)이 단일 모델에 대해 갖는 기본 동시 호출 상한이며, 모델 ID 기준으로 모든 복제본이 공유합니다. 매 호출마다 실시간으로 읽고 재시작 없이 즉시 적용됩니다. 0 또는 음수는 기본 상한을 해제합니다(각 모델은 모델 관리에서 설정한 자체 상한을 계속 준수함). 백그라운드 작업에만 영향을 주며 대화형 채팅에는 영향을 주지 않습니다.'
         },
@@ -357,6 +405,11 @@ export default {
         }
       },
       keyLabels: {
+        token_quota: {
+          default_daily_limit: "기본 일일 토큰 한도",
+          default_monthly_limit: "기본 월간 토큰 한도",
+          max_completion_tokens: "기본 최대 출력 토큰 수",
+        },
         model: {
           max_concurrency: '모델 기본 동시 처리 상한'
         },

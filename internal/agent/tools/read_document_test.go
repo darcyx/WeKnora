@@ -18,6 +18,7 @@ import (
 func TestReadDocumentCitationIdentitySurvivesClientAndHistoryCompaction(t *testing.T) {
 	knowledge := &types.Knowledge{
 		ID: "doc-1", KnowledgeBaseID: "kb-1", Title: "Proposal.pptx", FileName: "Proposal.pptx",
+		CustomMetadata: types.JSON(`{"id":"anydata-login","url":"https://docs.dobest.cn/docs-server/d9e9ba5e"}`),
 	}
 	rows := []readChunkRow{
 		{chunk: &types.Chunk{ID: "chunk-1", Content: "First body"}},
@@ -36,7 +37,7 @@ func TestReadDocumentCitationIdentitySurvivesClientAndHistoryCompaction(t *testi
 	} {
 		t.Run(name, func(t *testing.T) {
 			if compact["knowledge_id"] != "doc-1" || compact["knowledge_base_id"] != "kb-1" ||
-				compact["source_chunk_id"] != "chunk-2" {
+				compact["source_chunk_id"] != "chunk-2" || compact["source_url"] != "https://docs.dobest.cn/docs-server/d9e9ba5e" {
 				t.Fatalf("lost citation provenance: %#v", compact)
 			}
 			if !reflect.DeepEqual(compact["chunk_ids"], []string{"chunk-1", "chunk-2"}) {
@@ -571,6 +572,26 @@ func TestReadDocumentQueryMatchesEveryWordInAnyOrder(t *testing.T) {
 	rows := res.Data["chunks"].([]map[string]interface{})
 	if rows[1]["chunk_id"] != "chunk-1" || rows[1]["role"] != "match" {
 		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+func TestReadDocumentQueryFallsBackToChunksMatchingMostWords(t *testing.T) {
+	tool, repo := newReadDocumentFixture(5)
+	repo.ordered[1].Content = "支付回调地址需要加入白名单"
+	repo.ordered[3].Content = "请提供服务器出口IP"
+	res, err := tool.Execute(context.Background(), json.RawMessage(`{"id":"doc-1","query":"支付回调 白名单 出口IP"}`))
+	if err != nil || !res.Success {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if res.Data["match_count"] != 1 || res.Data["terms_matched"] != 2 || res.Data["query_terms"] != 3 {
+		t.Fatalf("no chunk holds every word, so the chunks holding the most words match: %+v", res.Data)
+	}
+	rows := res.Data["chunks"].([]map[string]interface{})
+	if rows[1]["chunk_id"] != "chunk-1" || rows[1]["role"] != "match" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if !strings.Contains(res.Output, "2 of 3") {
+		t.Fatalf("a partial match must say so: %s", res.Output)
 	}
 }
 

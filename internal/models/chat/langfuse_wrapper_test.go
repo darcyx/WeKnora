@@ -111,3 +111,23 @@ func TestTruncateLangfuseText(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestLangfuseTracksRequestedReasoningEffort(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts ChatOptions
+		want string
+	}{
+		{"inherit", ChatOptions{}, ""},
+		{"legacy thinking", ChatOptions{Thinking: new(true)}, "auto"},
+		{"off", ChatOptions{Thinking: new(false)}, "off"},
+		{"graded overrides legacy", ChatOptions{Thinking: new(false), ReasoningEffort: "minimal"}, "minimal"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, present := buildLangfuseModelParams(&tt.opts)["requested_reasoning_effort"]
+			if present != (tt.want != "") || present && got != tt.want {
+				t.Fatalf("requested_reasoning_effort = %v, present = %v; want %q", got, present, tt.want)
+			}
+		})
+	}
+}

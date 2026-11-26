@@ -258,8 +258,9 @@ func (r *ToolRegistry) execute(ctx context.Context, tool types.Tool, args json.R
 			"errors": errMsg,
 		})
 		return &types.ToolResult{
-			Success: false,
-			Error:   errMsg,
+			Success:          false,
+			Error:            errMsg,
+			InvalidArguments: true,
 		}, nil
 	}
 
@@ -335,6 +336,9 @@ func executeRecovered(
 			result = &types.ToolResult{Success: false, Error: err.Error()}
 		}
 	}()
+	if execution, ok := ToolExecFromContext(ctx); ok && execution.RetrievalRecovery != nil {
+		return execution.RetrievalRecovery(ctx)
+	}
 	return tool.Execute(ctx, args)
 }
 

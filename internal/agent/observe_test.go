@@ -231,7 +231,8 @@ func TestAppendToolResultsKeepsImageOutputPolicyInStableSystemPrefix(t *testing.
 	out := engine.appendToolResults(prior, step)
 	require.Len(t, out, 4)
 	assert.Equal(t, prior[0], out[0], "the system prefix stays stable after retrieval")
-	assert.Contains(t, out[0].Content, types.SourcedAnswerOutputPrompt)
+	assert.Contains(t, out[0].Content, "Copy supplied handles exactly")
+	assert.NotContains(t, out[0].Content, types.SourcedAnswerOutputPrompt)
 	assert.Equal(t, "tool", out[3].Role)
 	assert.Contains(t, out[3].Content, "![流程图](res://0001)")
 	out = engine.appendToolResults(out, step)
@@ -271,7 +272,9 @@ func TestBuildRuntimeContextBlock_QuestionOrigin(t *testing.T) {
 	block := buildRuntimeContextBlock("sess-1", nil, nil, origin, nil, "", "")
 	assert.Contains(t, block, `<question_origin knowledge_base_id="kb-1" name="TEST">`)
 	assert.Contains(t, block, `<document knowledge_id="kid-1" title="Corners &lt;SSAO&gt;" />`)
-	assert.Contains(t, block, "Search it before answering")
+	assert.Contains(t, block, "Use applicable evidence from this source for factual claims")
+	assert.Contains(t, block, "Necessary clarification does not require a search")
+	assert.NotContains(t, block, "Search it before answering")
 
 	baseOnly := buildRuntimeContextBlock("sess-1", nil, nil, &QuestionOriginInfo{KnowledgeBaseID: "kb-1"}, nil, "", "")
 	assert.Contains(t, baseOnly, `<question_origin knowledge_base_id="kb-1">`, "an unknown name is omitted, not empty")
@@ -397,6 +400,9 @@ func TestBuildMustUseBlock_MCPAndSkills(t *testing.T) {
 	assert.Contains(t, block, "@ChemDB")
 	assert.Contains(t, block, `Must call read_file(path="skill://data-analysis/SKILL.md")`)
 	assert.Contains(t, block, `@Skill "data-analysis"`)
+	assert.Contains(t, block, "task-scoped resource selections")
+	assert.NotContains(t, block, "Missing essential inputs pause dependent calls")
+	assert.NotContains(t, block, "Read the selected Skill first when needed to identify those inputs")
 }
 
 func TestBuildMustUseBlock_MCPToolPrefixOnly(t *testing.T) {

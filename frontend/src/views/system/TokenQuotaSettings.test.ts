@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url'
 
 import { SYSTEM_ADMIN_SETTINGS_SECTIONS } from '../../config/settingsAccess.ts'
 import enUS from '../../i18n/locales/en-US.ts'
+import jaJP from '../../i18n/locales/ja-JP.ts'
+import zhTW from '../../i18n/locales/zh-TW.ts'
 import koKR from '../../i18n/locales/ko-KR.ts'
 import ruRU from '../../i18n/locales/ru-RU.ts'
 import zhCN from '../../i18n/locales/zh-CN.ts'
@@ -62,7 +64,7 @@ test('translates every token quota control and permission in every supported loc
     'platformApiKeys.capabilityHints.tokenQuotaManage',
   ]
 
-  for (const locale of [zhCN, enUS, koKR, ruRU]) {
+  for (const locale of [zhCN, zhTW, jaJP, enUS, koKR, ruRU]) {
     const messages = locale as Record<string, any>
     for (const key of quotaKeys) {
       assert.equal(typeof messages.tokenQuotaSettings?.[key], 'string', key)

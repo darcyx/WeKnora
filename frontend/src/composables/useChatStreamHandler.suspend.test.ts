@@ -65,6 +65,17 @@ const awaitingRow = () => ({
 const cards = (m: Record<string, any>) =>
   (m.agentEventStream as Record<string, any>[]).filter((e) => e.type === 'tool_approval_required')
 
+test('FAQ clarification history shows the question without an internal tool call', async () => {
+  const { handler, messagesList } = setup()
+  await handler.handleMsgList([{
+    id: 'faq-a', role: 'assistant', content: '国内还是海外？', is_completed: true,
+    agent_steps: [{ iteration: 0, tool_calls: [{ id: 'ragpipe-faq-clarification', name: 'faq_clarification', args: {} }] }],
+  }])
+  const events = messagesList[0].agentEventStream as Record<string, any>[]
+  assert.ok(events.some((e) => e.type === 'answer' && e.content === '国内还是海外？'))
+  assert.ok(!events.some((e) => e.type === 'tool_call' && e.tool_name === 'faq_clarification'))
+})
+
 test('history renders a suspended message as settled with its pending card', async () => {
   const { handler, messagesList } = setup()
   await handler.handleMsgList([awaitingRow()])
@@ -478,4 +489,27 @@ test('approval resume keeps updates that arrived while approval was pending', as
   handler.processStreamChunk({ response_type: 'agent_query', id: 'r1', assistant_message_id: 'a1',
     data: { resume_pending_id: 'p1', resume_tool_call_id: 'call-1' } })
   assert.equal(m.agentEventStream.filter((e: any) => e.content === 'another child finished').length, 1)
+})
+
+
+test('non-blocking ask_user history stays a plain question without a waiting card', async () => {
+  const { handler, messagesList } = setup()
+  const row = {
+    id: 'a1', request_id: 'r1', role: 'assistant', content: '请提供订单号。', is_completed: true,
+    isAgentMode: true, run_state: '',
+    agent_steps: [{ iteration: 0, thought: '', tool_calls: [{
+      id: 'ask', name: 'ask_user', args: { question: '请提供订单号。' },
+      result: { success: true, output: '请提供订单号。', data: {
+        display_type: 'user_question', question: { question: '请提供订单号。' }, answered: false,
+      } },
+    }] }],
+  }
+  await handler.handleMsgList([row as any])
+  const m = messagesList[0]
+  assert.equal(prompts(m).length, 0)
+  assert.equal(m.run_state, '')
+  assert.equal(m.is_completed, true)
+  assert.ok((m.agentEventStream as Record<string, any>[]).some(e => e.type === 'answer' && e.content === '请提供订单号。'))
+  handler.prepareForNewOutgoingMessage()
+  assert.equal(prompts(m).length, 0)
 })

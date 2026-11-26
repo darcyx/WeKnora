@@ -59,6 +59,7 @@ export default {
     }
   },
   settings: {
+    tokenQuotas: "Token quotas",
     modelManagement: 'Model Management',
     webSearchConfig: 'Web Search',
     autoCheckUpdate: 'Auto Download Updates',

@@ -41,6 +41,11 @@ var errSearchPanicked = errors.New("knowledge base search failed with an interna
 var searchKnowledgeTool = BaseTool{
 	name: ToolSearchKnowledge,
 	description: "Search the knowledge bases in scope and return the most relevant chunks with their content.\n" +
+		"Use original interface text to verify parameter names, types, values, required fields, defaults, signatures " +
+		"and code. For entity dependencies, calls or relations, use query_knowledge_graph first when that tool and a " +
+		"relevant graph-enabled base are available. For mixed questions under those conditions, query relationships " +
+		"there first and wait for its result before retrieving the parameter details here or with read_document. " +
+		"If graph evidence is missing, use original text to verify the relationship.\n" +
 		"mode \"hybrid\" (default) combines semantic and keyword retrieval. \"semantic\" ranks by meaning and " +
 		"tolerates paraphrase. \"keyword\" matches the literal terms and is the right choice for identifiers, " +
 		"error codes, product names and exact phrases. A base without the requested index is searched with the " +
@@ -49,9 +54,17 @@ var searchKnowledgeTool = BaseTool{
 		"names the subject and what you want to know (\"Why does Echo use open-weight models to cut cost?\"), " +
 		"not a keyword list (\"Echo open-weight cost\"): results are ranked by a relevance model that scores " +
 		"meaning. In keyword mode write the exact terms. Pass knowledge_base_ids to focus on the bases whose " +
-		"profile fits the question. When nothing passes the relevance check, rephrase with terms the documents " +
-		"would use; repeating the same query in another mode usually does not help. For identifiers, error " +
-		"codes or exact names retry with mode=keyword.\n" +
+		"profile fits the question. Start with the user's question, resolving only necessary references or " +
+		"omissions. Preserve its subjects, comparison dimensions and constraints; do not introduce new goals " +
+		"or broaden the task to related topics. Each follow-up search must address a specific evidence gap " +
+		"needed to answer the original question; it may focus on a comparison subject whose evidence is missing. " +
+		"Rephrase only using terms or aliases supported by the user or retrieved evidence. An empty result alone " +
+		"does not justify speculative rephrasing. For identifiers, error codes or exact names, a targeted retry " +
+		"with mode=keyword may help. Stop searching when the evidence is sufficient, or when no concrete lead " +
+		"remains; answer from the evidence and state any unresolved gaps.\n" +
+		"When the question names a value that documents carry in their <metadata> (a region, product, version, " +
+		"department), pass it as metadata={\"key\": \"value\"} to search only those documents; use only keys " +
+		"you have seen in earlier results.\n" +
 		"Every chunk carries a chunk://N handle and belongs to a doc://N " +
 		"document. Use read_document(id=chunk://N, context=k) to " +
 		"read the text around a chunk, and read_document(id=doc://N) to read a " +
@@ -63,7 +76,7 @@ var searchKnowledgeTool = BaseTool{
   "properties": {
     "query": {
       "type": "string",
-      "description": "A complete natural-language question, not a keyword list; exact terms when mode is keyword",
+      "description": "A complete natural-language question preserving the user's intent and constraints, or a targeted evidence gap within that scope; exact terms when mode is keyword",
       "minLength": 1
     },
     "mode": {
@@ -76,6 +89,12 @@ var searchKnowledgeTool = BaseTool{
       "description": "Optional kb://N knowledge-base handles from the runtime context to restrict the search",
       "items": { "type": "string" },
       "maxItems": 10
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional document metadata filter: only documents whose metadata has every key with an equal value (case-insensitive) are searched",
+      "additionalProperties": { "type": "string" },
+      "maxProperties": 5
     },
     "limit": {
       "type": "integer",
@@ -90,10 +109,11 @@ var searchKnowledgeTool = BaseTool{
 
 // SearchKnowledgeInput defines the input parameters for search_knowledge.
 type SearchKnowledgeInput struct {
-	Query            string   `json:"query"`
-	Mode             string   `json:"mode,omitempty"`
-	KnowledgeBaseIDs []string `json:"knowledge_base_ids,omitempty"`
-	Limit            int      `json:"limit,omitempty"`
+	Query            string            `json:"query"`
+	Mode             string            `json:"mode,omitempty"`
+	KnowledgeBaseIDs []string          `json:"knowledge_base_ids,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	Limit            int               `json:"limit,omitempty"`
 }
 
 // searchResultWithMeta wraps search result with metadata about which query matched it
@@ -118,10 +138,18 @@ type SearchKnowledgeTool struct {
 	// patternFilter, when set, keeps only results whose text matches it.
 	// It is not exposed to the model; the MCP grep_chunks endpoint uses it
 	// to keep grep semantics on top of index-backed retrieval.
-	patternFilter *regexp.Regexp
+	patternFilter      *regexp.Regexp
+	preflightQuestions []string
 	// contextImages attaches the images of results found by an image's own
 	// vector, for a model that can see them; see WithContextImages.
 	contextImages bool
+	embeddingTopK int
+}
+
+// WithEmbeddingTopK overrides the global candidate count for this agent only.
+func (t *SearchKnowledgeTool) WithEmbeddingTopK(topK int) *SearchKnowledgeTool {
+	t.embeddingTopK = topK
+	return t
 }
 
 // WithContextImages attaches to the result the images of the results that
@@ -131,6 +159,11 @@ type SearchKnowledgeTool struct {
 // carry captions.
 func (t *SearchKnowledgeTool) WithContextImages(enabled bool) *SearchKnowledgeTool {
 	t.contextImages = enabled
+	return t
+}
+
+func (t *SearchKnowledgeTool) WithFAQPreflightQuestions(questions []string) *SearchKnowledgeTool {
+	t.preflightQuestions = questions
 	return t
 }
 
@@ -204,8 +237,12 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 
 	// Optional KB filter: reject hallucinated or out-of-scope handles.
 	searchTargets := t.searchTargets
+	execution, _ := ToolExecFromContext(ctx)
+	if execution != nil && len(execution.RetrievalTargets) > 0 {
+		searchTargets = execution.RetrievalTargets
+	}
 	if len(input.KnowledgeBaseIDs) > 0 {
-		if err := validateKnowledgeBaseIDsInSearchTargets(t.searchTargets, input.KnowledgeBaseIDs); err != nil {
+		if err := validateKnowledgeBaseIDsInSearchTargets(searchTargets, input.KnowledgeBaseIDs); err != nil {
 			return &types.ToolResult{Success: false, Error: err.Error()}, err
 		}
 		wanted := make(map[string]bool, len(input.KnowledgeBaseIDs))
@@ -213,12 +250,27 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 			wanted[kbID] = true
 		}
 		var filtered types.SearchTargets
-		for _, target := range t.searchTargets {
+		for _, target := range searchTargets {
 			if target != nil && wanted[target.KnowledgeBaseID] {
 				filtered = append(filtered, target)
 			}
 		}
 		searchTargets = filtered
+	}
+	if len(input.Metadata) > 0 && len(searchTargets) > 0 {
+		narrowed, err := t.narrowTargetsByMetadata(ctx, searchTargets, input.Metadata)
+		if err != nil {
+			logger.Warnf(ctx, "[Tool][SearchKnowledge] Metadata filter failed: %v", err)
+			return &types.ToolResult{Success: false, Error: "metadata filter is unavailable, retry without metadata"}, err
+		}
+		if len(narrowed) == 0 {
+			return &types.ToolResult{
+				Success: true,
+				Output: fmt.Sprintf("No document in scope carries metadata %v. Retry without metadata, "+
+					"or use a key and value seen in a <metadata> block of earlier results.", input.Metadata),
+			}, nil
+		}
+		searchTargets = narrowed
 	}
 	if len(searchTargets) == 0 {
 		return &types.ToolResult{
@@ -242,6 +294,11 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 			kbTypeMap[kb.ID] = kb.Type
 		}
 	}
+	if mode == SearchModeHybrid && t.patternFilter == nil && len(kbIDs) == 1 && kbTypeMap[kbIDs[0]] == types.KnowledgeBaseTypeFAQ {
+		if hit := t.preflightQuestionResult(ctx, searchTargets, query); hit != nil {
+			return hit, nil
+		}
+	}
 
 	retrievalLimit := limit
 	if t.patternFilter != nil {
@@ -252,8 +309,21 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 		"[Tool][SearchKnowledge] query=%q mode=%s limit=%d top_k=%d targets=%d kbs=%d",
 		query, mode, limit, topK, len(searchTargets), len(kbIDs))
 
-	allResults, searchFailures, searchCalls, embedFallbacks := t.concurrentSearchByTargets(ctx, query, mode,
+	allResults, searchFailures, searchCalls, embedFallbacks, completed := t.concurrentSearchByTargets(ctx, query, mode,
 		kbModes, searchTargets, kbList, topK, vectorThreshold, keywordThreshold, kbTypeMap)
+	completedIDs := completed.GetAllKnowledgeBaseIDs()
+	var skipped []map[string]interface{}
+	for _, kb := range kbList {
+		if kb != nil {
+			if _, searchable := kbModes[kb.ID]; !searchable {
+				skipped = append(skipped, map[string]interface{}{"knowledge_base_id": kb.ID, "reason": "no chunk index; use a wiki or graph tool"})
+			}
+		}
+	}
+	failureMessages := make([]string, 0, len(searchFailures))
+	for _, failure := range searchFailures {
+		failureMessages = append(failureMessages, fmt.Sprintf("%v: %v", failure.KnowledgeBaseIDs, failure.Cause))
+	}
 	// A hybrid search that ran keyword-only is reported like any other mode
 	// fallback, so an empty result is not read as "no semantic match".
 	for kbID, reason := range embedFallbacks {
@@ -263,18 +333,26 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 	// when the vector store timed out or the embedding call failed made the
 	// model conclude the knowledge base has no answer.
 	if searchCalls > 0 && len(searchFailures) >= searchCalls {
-		msg := "Knowledge search failed: " + strings.Join(searchFailures, "; ") +
+		msg := "Knowledge search failed: " + strings.Join(failureMessages, "; ") +
 			". The knowledge bases were not searched, so this is not evidence that they lack the answer."
-		return &types.ToolResult{Success: false, Output: msg, Error: msg}, nil
+		if len(skipped) > 0 {
+			msg += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
+		}
+		return &types.ToolResult{Success: false, Output: msg, Error: msg,
+			Data: map[string]interface{}{"skipped_knowledge_bases": skipped}, RetrievalFailures: searchFailures}, nil
 	}
 
 	deduplicated := t.deduplicateResultsForRerank(allResults)
 
 	ranked := deduplicated
 	rerankRejected := 0
+	var rerankOutcome types.RerankOutcome
+	var rerankFailure error
 	if t.rerankModel != nil && len(deduplicated) > 0 {
-		reranked, err := t.rerankResults(ctx, query, deduplicated, mode == SearchModeKeyword)
+		reranked, outcome, err := t.rerankResultsWithPolicy(ctx, query, deduplicated, mode == SearchModeKeyword, false)
+		rerankOutcome = outcome
 		if err != nil {
+			rerankFailure = err
 			logger.Warnf(ctx, "[Tool][SearchKnowledge] Rerank failed, using retrieval order: %v", err)
 		} else {
 			ranked = reranked
@@ -329,20 +407,54 @@ func (t *SearchKnowledgeTool) Execute(ctx context.Context, args json.RawMessage)
 		}
 	}
 
-	result, omitted := t.formatWithinBudget(ctx, final, kbIDs, query, mode)
+	result, omitted := t.formatWithinBudget(ctx, final, completedIDs, query, mode)
+	if len(skipped) > 0 {
+		result.Data["skipped_knowledge_bases"] = skipped
+	}
 	if omitted > 0 {
 		result.Data["omitted_for_budget"] = omitted
 	}
 	t.attachContextImages(ctx, result, final[:len(final)-omitted])
 	if len(searchFailures) > 0 {
-		result.Data["partial_failures"] = searchFailures
+		result.Data["partial_failures"] = failureMessages
+		result.RetrievalFailures = searchFailures
 	}
 	annotateModeFallback(result.Data, mode, kbModes)
 	if rerankRejected > 0 {
 		result.Data["rerank_rejected"] = rerankRejected
 	}
+	if rerankOutcome != "" && rerankOutcome != types.RerankOutcomeOK {
+		result.Data["rerank_outcome"] = string(rerankOutcome)
+	}
+	if rerankFailure != nil {
+		failure := newRetrievalFailure(searchTargets, "rerank", rerankFailure)
+		failure.Retry = func(ctx context.Context) (*types.ToolResult, error) {
+			rows, _, err := t.rerankResultsWithPolicy(ctx, query, deduplicated, mode == SearchModeKeyword, false)
+			if err != nil {
+				return &types.ToolResult{Output: "Reranking the retained candidates failed", Error: err.Error()}, err
+			}
+			if t.patternFilter != nil {
+				rows = t.matchingPattern(ctx, rows)
+			}
+			if len(rows) > limit {
+				rows = rows[:limit]
+			}
+			recovered, omitted := t.formatWithinBudget(ctx, rows, completedIDs, query, mode)
+			if len(skipped) > 0 {
+				recovered.Data["skipped_knowledge_bases"] = skipped
+				recovered.Output += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
+			}
+			t.attachContextImages(ctx, recovered, rows[:len(rows)-omitted])
+			return recovered, nil
+		}
+		result.RetrievalFailures = append(result.RetrievalFailures, failure)
+	}
+	t.attachSearchRecovery(result, query, mode, limit)
 	if len(final) == 0 {
-		result.Output = emptySearchStatement(query, result.Data, len(kbIDs))
+		result.Output = emptySearchStatement(query, result.Data, len(completedIDs))
+	}
+	if len(skipped) > 0 {
+		result.Output += " Some selected knowledge bases were not searched because they lack a chunk index; use wiki or graph tools."
 	}
 	return result, nil
 }
@@ -418,14 +530,42 @@ func (t *SearchKnowledgeTool) formatWithinBudget(
 	if len(results) <= 1 || utf8.RuneCountInString(result.Output) <= budget {
 		return result, 0
 	}
-
-	// Each added row increases the rendered size. Search for the longest
-	// ranked prefix that fits, keeping the first row even if it is oversized.
+	// Reserve a small bounded index of omitted documents within the same budget.
+	build := func(shown int) *types.ToolResult {
+		out := t.formatOutput(ctx, results[:shown], kbIDs, query, mode)
+		var candidates []map[string]interface{}
+		seen := map[string]bool{}
+		var index strings.Builder
+		for _, row := range results[shown:] {
+			if len(candidates) == 3 {
+				break
+			}
+			if row.KnowledgeID == "" || row.KnowledgeBaseType == types.KnowledgeBaseTypeFAQ || seen[row.KnowledgeID] {
+				continue
+			}
+			title := []rune(row.KnowledgeTitle)
+			if len(title) > 80 {
+				title = title[:80]
+			}
+			line := fmt.Sprintf("<candidate knowledge_id=\"%s\" knowledge_base_id=\"%s\" title=\"%s\"/>\n", xmlEscape(row.KnowledgeID), xmlEscape(row.KnowledgeBaseID), xmlEscape(string(title)))
+			if utf8.RuneCountInString(out.Output)+index.Len()+utf8.RuneCountInString(line)+80 > budget {
+				break
+			}
+			seen[row.KnowledgeID] = true
+			index.WriteString(line)
+			candidates = append(candidates, map[string]interface{}{"knowledge_id": row.KnowledgeID, "knowledge_base_id": row.KnowledgeBaseID, "title": string(title)})
+		}
+		if len(candidates) > 0 {
+			out.Output += "\n<omitted_candidates>\n" + index.String() + "</omitted_candidates>"
+			out.Data["omitted_candidates"] = candidates
+		}
+		return out
+	}
 	best := 1
-	result = t.formatOutput(ctx, results[:best], kbIDs, query, mode)
+	result = build(best)
 	for low, high := 2, len(results)-1; low <= high; {
 		mid := low + (high-low)/2
-		candidate := t.formatOutput(ctx, results[:mid], kbIDs, query, mode)
+		candidate := build(mid)
 		if utf8.RuneCountInString(candidate.Output) <= budget {
 			best, result = mid, candidate
 			low = mid + 1
@@ -555,12 +695,15 @@ func annotateModeFallback(data map[string]interface{}, requested string, kbModes
 }
 
 // retrievalParams resolves the candidate pool size and recall thresholds from
-// the global configuration, with hard-coded fallbacks.
+// the agent override, then global configuration, with hard-coded fallbacks.
 func (t *SearchKnowledgeTool) retrievalParams(limit int) (topK int, vectorThreshold, keywordThreshold float64) {
 	if t.config != nil && t.config.Conversation != nil {
 		topK = t.config.Conversation.EmbeddingTopK
 		vectorThreshold = t.config.Conversation.VectorThreshold
 		keywordThreshold = t.config.Conversation.KeywordThreshold
+	}
+	if t.embeddingTopK > 0 {
+		topK = t.embeddingTopK
 	}
 	if topK <= 0 {
 		topK = searchKnowledgeMaxLimit
@@ -591,7 +734,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 	topK int,
 	vectorThreshold, keywordThreshold float64,
 	kbTypeMap map[string]string,
-) (_ []*searchResultWithMeta, failures []string, calls int, embedFallbacks map[string]string) {
+) (_ []*searchResultWithMeta, failures []types.RetrievalFailure, calls int, embedFallbacks map[string]string, completed types.SearchTargets) {
 	// Filter out non-searchable KBs (wiki-only / graph-only). Feeding a
 	// wiki-only KB into HybridSearch causes spurious "model ID cannot be
 	// empty" errors because such KBs have no EmbeddingModelID configured.
@@ -623,7 +766,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 			st.KnowledgeBaseID)
 	}
 	if len(filteredTargets) == 0 {
-		return nil, nil, 0, nil
+		return nil, nil, 0, nil, nil
 	}
 	searchTargets = filteredTargets
 
@@ -642,10 +785,10 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 	allResults := make([]*searchResultWithMeta, 0)
 	// fail records one search that returned an error, or a search that
 	// could not run; calls counts every search attempted.
-	fail := func(kbIDs []string, err error) {
+	fail := func(targets types.SearchTargets, stage string, err error) {
 		mu.Lock()
 		defer mu.Unlock()
-		failures = append(failures, fmt.Sprintf("%v: %v", kbIDs, err))
+		failures = append(failures, newRetrievalFailure(targets, stage, err))
 	}
 	attempt := func() {
 		mu.Lock()
@@ -662,7 +805,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 		}
 		embedFallbacks[kbID] = fmt.Sprintf("query embedding failed, semantic search skipped: %v", err)
 	}
-	collect := func(rows []*types.SearchResult, usedMode string) {
+	collect := func(rows []*types.SearchResult, usedMode string, targets types.SearchTargets) {
 		mu.Lock()
 		defer mu.Unlock()
 		for _, r := range rows {
@@ -674,6 +817,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 				KnowledgeBaseType: kbTypeMap[r.KnowledgeBaseID],
 			})
 		}
+		completed = append(completed, targets.Clone()...)
 	}
 
 	for modelKey, targets := range groups {
@@ -684,13 +828,8 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 			// panic from it is contained and every target still pending in the
 			// group is reported as failed instead of ending the process.
 			defer RecoverGoroutine(ctx, "search knowledge embedding group", func() {
-				// Embedding can panic before any retrieval attempt is counted.
 				attempt()
-				ids := make([]string, 0, len(targets))
-				for _, st := range targets {
-					ids = append(ids, st.KnowledgeBaseID)
-				}
-				fail(ids, errSearchPanicked)
+				fail(targets, "embedding", errSearchPanicked)
 			})
 
 			needsEmbedding := false
@@ -728,7 +867,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 			for _, st := range targets {
 				if m, _ := groupModeFor(st.KnowledgeBaseID); embedErr != nil && m == SearchModeSemantic {
 					attempt()
-					fail([]string{st.KnowledgeBaseID}, fmt.Errorf("query embedding failed: %w", embedErr))
+					fail(types.SearchTargets{st}, "embedding", fmt.Errorf("query embedding failed: %w", embedErr))
 					continue
 				}
 				if m, _ := modeFor(st.KnowledgeBaseID); embedErr != nil && m == SearchModeHybrid {
@@ -740,26 +879,27 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 
 			// Separate full-KB targets (combinable per retrieval mode) from
 			// specific-knowledge targets.
-			fullKBIDsByMode := make(map[string][]string)
+			fullTargetsByMode := make(map[string]types.SearchTargets)
 			var knowledgeTargets []*types.SearchTarget
 			for _, st := range targets {
 				if st.Type == types.SearchTargetTypeKnowledgeBase && len(st.TagIDs) == 0 {
 					m, _ := groupModeFor(st.KnowledgeBaseID)
-					fullKBIDsByMode[m] = append(fullKBIDsByMode[m], st.KnowledgeBaseID)
+					fullTargetsByMode[m] = append(fullTargetsByMode[m], st)
 				} else {
 					knowledgeTargets = append(knowledgeTargets, st)
 				}
 			}
 
 			var innerWg sync.WaitGroup
-			for usedMode, fullKBIDs := range fullKBIDsByMode {
+			for usedMode, fullTargets := range fullTargetsByMode {
 				innerWg.Add(1)
-				go func(usedMode string, fullKBIDs []string) {
+				go func(usedMode string, fullTargets types.SearchTargets) {
 					defer innerWg.Done()
 					defer RecoverGoroutine(ctx, "search knowledge combined retrieval", func() {
-						fail(fullKBIDs, errSearchPanicked)
+						fail(fullTargets, "search", errSearchPanicked)
 					})
 					attempt()
+					fullKBIDs := fullTargets.GetAllKnowledgeBaseIDs()
 					kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, fullKBIDs[0], types.SearchParams{
 						QueryText:            query,
 						QueryEmbedding:       queryEmbedding,
@@ -778,11 +918,11 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 					if err != nil {
 						logger.Warnf(ctx, "[Tool][SearchKnowledge] Combined search failed for KBs %v: %v",
 							fullKBIDs, err)
-						fail(fullKBIDs, err)
+						fail(fullTargets, "search", err)
 						return
 					}
-					collect(kbResults, usedMode)
-				}(usedMode, fullKBIDs)
+					collect(kbResults, usedMode, fullTargets)
+				}(usedMode, fullTargets)
 			}
 
 			for _, target := range knowledgeTargets {
@@ -791,7 +931,7 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 				go func() {
 					defer innerWg.Done()
 					defer RecoverGoroutine(ctx, "search knowledge retrieval", func() {
-						fail([]string{st.KnowledgeBaseID}, errSearchPanicked)
+						fail(types.SearchTargets{st}, "search", errSearchPanicked)
 					})
 					attempt()
 					usedMode, _ := groupModeFor(st.KnowledgeBaseID)
@@ -815,17 +955,21 @@ func (t *SearchKnowledgeTool) concurrentSearchByTargets(
 					})
 					if err != nil {
 						logger.Warnf(ctx, "[Tool][SearchKnowledge] Failed to search KB %s: %v", st.KnowledgeBaseID, err)
-						fail([]string{st.KnowledgeBaseID}, err)
+						fail(types.SearchTargets{st}, "search", err)
 						return
 					}
-					collect(kbResults, usedMode)
+					collect(kbResults, usedMode, types.SearchTargets{st})
 				}()
 			}
 			innerWg.Wait()
 		}(modelKey, targets)
 	}
 	wg.Wait()
-	return allResults, failures, calls, embedFallbacks
+	return allResults, failures, calls, embedFallbacks, completed
+}
+
+func newRetrievalFailure(targets types.SearchTargets, stage string, cause error) types.RetrievalFailure {
+	return types.RetrievalFailure{KnowledgeBaseIDs: targets.GetAllKnowledgeBaseIDs(), Targets: targets.Clone(), Stage: stage, Cause: cause}
 }
 
 // rerankResults scores all search results (including FAQ entries) with the
@@ -846,8 +990,23 @@ func (t *SearchKnowledgeTool) rerankResults(
 	results []*searchResultWithMeta,
 	orderOnly bool,
 ) ([]*searchResultWithMeta, error) {
-	if len(results) == 0 || t.rerankModel == nil {
+	results, outcome, err := t.rerankResultsWithPolicy(ctx, query, results, orderOnly, false)
+	if outcome == types.RerankOutcomeModelError {
 		return results, nil
+	}
+	return results, err
+}
+
+// rerankResultsWithPolicy can reject degraded reranking for automatic answers.
+func (t *SearchKnowledgeTool) rerankResultsWithPolicy(
+	ctx context.Context,
+	query string,
+	results []*searchResultWithMeta,
+	orderOnly bool,
+	requireThreshold bool,
+) ([]*searchResultWithMeta, types.RerankOutcome, error) {
+	if len(results) == 0 || t.rerankModel == nil {
+		return results, "", nil
 	}
 
 	rows := make([]*types.SearchResult, len(results))
@@ -877,10 +1036,16 @@ func (t *SearchKnowledgeTool) rerankResults(
 		}
 	}
 	res := reranking.Rerank(ctx, t.rerankModel, query, rows, opts)
+	if requireThreshold && res.Diagnostics.Outcome != types.RerankOutcomeOK {
+		if res.Cause != nil {
+			return nil, res.Diagnostics.Outcome, res.Cause
+		}
+		return nil, res.Diagnostics.Outcome, fmt.Errorf("FAQ reranking did not meet the configured threshold: %s", res.Diagnostics.Outcome)
+	}
 	if res.Diagnostics.Outcome == types.RerankOutcomeModelError {
 		logger.Warnf(ctx, "[Tool][SearchKnowledge] Rerank model failed, using raw retrieval results: %s",
 			res.Diagnostics.Error)
-		return results, nil
+		return results, res.Diagnostics.Outcome, res.Cause
 	}
 
 	reranked := make([]*searchResultWithMeta, 0, len(res.Results))
@@ -891,7 +1056,7 @@ func (t *SearchKnowledgeTool) rerankResults(
 	}
 	logger.Infof(ctx, "[Tool][SearchKnowledge] Reranked %d/%d results above threshold %.2f (%s)",
 		len(reranked), len(results), threshold, res.Diagnostics.Outcome)
-	return reranked, nil
+	return reranked, res.Diagnostics.Outcome, nil
 }
 
 // faqMetadataFromResult parses FAQ metadata carried on the search result.
@@ -904,6 +1069,15 @@ func faqMetadataFromResult(result *types.SearchResult) (*types.FAQChunkMetadata,
 		return nil, nil
 	}
 	return (&types.Chunk{Metadata: result.ChunkMetadata}).FAQMetadata()
+}
+
+// DirectAnswerFloor is the score a semantic FAQ hit needs before it may answer
+// without the agent. Rerank scores are model-dependent, so the floor sits
+// halfway between the configured candidate threshold and a perfect score.
+// ponytail: uncalibrated midpoint; tune against logged faq_scope scores, or make
+// it a per-model config value once real traffic shows where wrong hits cluster.
+func (t *SearchKnowledgeTool) DirectAnswerFloor() float64 {
+	return (t.rerankThreshold() + 1) / 2
 }
 
 func (t *SearchKnowledgeTool) rerankThreshold() float64 {
@@ -1011,7 +1185,12 @@ func writeKnowledgeMetadataHeader(ob *strings.Builder, results []*searchResultWi
 			xmlEscape(result.KnowledgeBaseID),
 			xmlEscape(result.KnowledgeTitle),
 		)
-		fmt.Fprintf(&documents, "<metadata>%s</metadata>\n", xmlEscape(result.KnowledgeCustomMetadata))
+		metadata := []rune(result.KnowledgeCustomMetadata)
+		if len(metadata) > 1024 {
+			fmt.Fprintf(&documents, "<metadata truncated=\"true\">%s</metadata>\n", xmlEscape(string(metadata[:1024])))
+		} else {
+			fmt.Fprintf(&documents, "<metadata>%s</metadata>\n", xmlEscape(result.KnowledgeCustomMetadata))
+		}
 		documents.WriteString("</document>\n")
 	}
 	if !hasMetadata {
@@ -1124,6 +1303,7 @@ func (t *SearchKnowledgeTool) formatOutput(
 			"knowledge_id":        result.KnowledgeID,
 			"knowledge_base_id":   result.KnowledgeBaseID,
 			"knowledge_title":     result.KnowledgeTitle,
+			"source_url":          types.DocumentReferenceURL(result.Metadata, result.KnowledgeCustomMetadataRaw, result.KnowledgeSource),
 			"knowledge_metadata":  result.KnowledgeCustomMetadata,
 			"match_type":          result.MatchType,
 			"match_snippet":       snippet,

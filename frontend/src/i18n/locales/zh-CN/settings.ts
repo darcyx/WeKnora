@@ -581,6 +581,7 @@ export default {
     }
   },
   settings: {
+    tokenQuotas: "Token 配额",
     modelManagement: '模型管理',
     webSearchConfig: '网络搜索',
     autoCheckUpdate: '自动下载更新',

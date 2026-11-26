@@ -1,0 +1,220 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/types"
+)
+
+const questionSearchGrace = 3
+
+func questionSearchGuidance() string {
+	return fmt.Sprintf("The first %d searches per user message may omit retrieval metadata and reviews. Answer as soon as the requested facts are supported. For a missing fact, read the returned source that addresses it. After a targeted search across relevant accessible sources returns no relevant evidence or grounded next lead, stop searching; answer supported parts and follow the configured rules for unresolved parts. Unrelated hits and placeholders are not progress or proof of absence. After ordinary searches are spent, follow the review, supplement and recovery rules; changing query, fact or library does not reset them. Finishing needs no review. Respect user-information and permission blockers; a tool failure is not evidence of absence.", questionSearchGrace)
+}
+
+func isBudgetedSearchTool(name string) bool {
+	return name == "search_knowledge" || name == "wiki_search" || name == "query_knowledge_graph"
+}
+
+const wikiParallelSearchError = "search_knowledge was not run: it was issued in the same turn as wiki_search without knowledge_base_ids or metadata. " +
+	"Use the wiki_search results first (read the matching Wiki page). Search the whole library in a later turn only if the Wiki leaves the fact unsupported, " +
+	"or restrict this search with knowledge_base_ids. No search allowance was used."
+
+// wikiShadowsSearch reports whether a call is an unscoped library search that
+// must not run alongside wiki_search in the same turn. A search restricted by
+// knowledge base or metadata is a deliberate source choice and stays allowed.
+func wikiShadowsSearch(name string, args map[string]any) bool {
+	if name != agenttools.ToolSearchKnowledge && name != agenttools.LegacyToolKnowledgeSearch {
+		return false
+	}
+	kbs, _ := args["knowledge_base_ids"].([]any)
+	metadata, _ := args["metadata"].(map[string]any)
+	return len(kbs) == 0 && len(metadata) == 0
+}
+
+// Accepted user messages and ask_user answers have stable IDs across a resume.
+func (s retrievalState) questionID() string {
+	for i := len(s.UserInputIDs) - 1; i >= 0; i-- {
+		if id := s.UserInputIDs[i]; !strings.HasPrefix(id, "app_info:") {
+			return id
+		}
+	}
+	return ""
+}
+
+func (c *retrievalControl) countSearches(g *retrievalGap, questionID, callRef string) int {
+	// Legacy attempts carry the assistant turn in their call reference.
+	turn, _, scoped := strings.Cut(callRef, ".")
+	scoped = scoped && strings.HasPrefix(turn, retrievalCallPrefix)
+	count := 0
+	for _, attempt := range c.state.Attempts {
+		if attempt.FAQOnly {
+			continue
+		}
+		if attempt.Action == retrievalRecovery && len(attempt.RecoveryStages) > 0 {
+			if original := c.attempt(attempt.RecoveryCallID); original != nil && original.FAQOnly {
+				continue
+			}
+		}
+		if !isBudgetedSearchTool(attempt.Tool) || attempt.Outcome == retrievalInput {
+			continue
+		}
+		switch {
+		case questionID != "" && attempt.QuestionID == questionID:
+			count++
+		case attempt.QuestionID == "" && scoped:
+			if strings.HasPrefix(attempt.ID, turn+".") {
+				count++
+			}
+		case questionID == "":
+			// Replay pre-message snapshots using their original per-fact rules.
+			other := c.gap(attempt.GapID)
+			if other != nil && (other.ID == g.ID || sameRetrievalFact(other, g.Fact, g.Conditions)) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// Search identity comes from actual user input, not model-supplied gap metadata.
+func (e *AgentEngine) prepareBudgetedSearch(ctx context.Context, tc types.LLMToolCall, args map[string]any) (string, error) {
+	c := e.retrieval
+	var hint retrievalDecision
+	if raw, ok := args["retrieval"]; ok {
+		encoded, _ := json.Marshal(raw)
+		_ = json.Unmarshal(encoded, &hint)
+	}
+	c.mu.Lock()
+	// A blocked question may have independent work. Route its explicit fact through
+	// normal admission instead of binding it back to the blocked whole-message gap.
+	independent := len(c.missingUserFields()) > 0 && (hint.GapID != "" || hint.Fact != "") && (hint.Review == nil || hint.Review.Status != retrievalUserConditions)
+	g := c.gap(hint.GapID)
+	prerequisite := g != nil && g.Derived && c.factNeeded(g, make(map[string]bool))
+	terminalReview := g != nil && hint.Review != nil && (hint.Review.Status == retrievalNeedsUser ||
+		hint.Review.Status == retrievalSatisfied || hint.Review.Status == retrievalExhausted)
+	c.mu.Unlock()
+	// Explicit state changes retain atomic validation before any question binding.
+	if independent || hint.Action == retrievalSupplement && hint.GapID != "" || hint.ScopeFrom != "" || hint.Source != nil || len(hint.DependsOn) > 0 || prerequisite || terminalReview {
+		arguments, err := e.prepareStructuredRetrievalCall(ctx, tc, args)
+		if err == nil && hint.ScopeFrom != "" {
+			e.retrievalSearchGapID = ""
+		}
+		return arguments, err
+	}
+	gapID, quote, err := e.bindCurrentRetrievalFact(ctx)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	g = c.gap(gapID)
+	if g == nil {
+		c.mu.Unlock()
+		return "", fmt.Errorf("current question has no registered retrieval state")
+	}
+	g.SearchGrace, c.state.Version = questionSearchGrace, 4
+	if c.countSearches(g, c.state.questionID(), e.retrievalCallReference(tc.ID)) >= questionSearchGrace {
+		unsearched := g.LastCallID == ""
+		c.mu.Unlock()
+		if unsearched || hint.Action == retrievalInitial || hint.GapID != "" && hint.GapID != gapID {
+			return "", fmt.Errorf("gap %s has already been searched; use its existing review or recovery rules", gapID)
+		}
+		return e.prepareStructuredRetrievalCall(ctx, tc, args)
+	}
+	action := retrievalInitial
+	previous := c.attempt(g.LastCallID)
+	if previous != nil {
+		action = retrievalSearch
+		if previous.Outcome != retrievalSuccess {
+			action = retrievalRecovery
+		}
+	}
+	c.mu.Unlock()
+	// Keep explicit partial-stage recovery compatible with existing callers.
+	if review := hint.Review; review != nil {
+		if review.NewFact != nil {
+			return "", fmt.Errorf("inline review cannot register another fact")
+		}
+		if review.Status == retrievalNeedsUser || review.Status == retrievalSatisfied ||
+			review.Status == retrievalExhausted || review.Status == retrievalUserConditions {
+			reviewGapID := gapID
+			if review.Status == retrievalUserConditions && hint.GapID != "" {
+				// A supplied branch may first resolve the preceding fact's clarification.
+				reviewGapID = hint.GapID
+			}
+			if review.GapID != "" && review.GapID != reviewGapID {
+				return "", fmt.Errorf("review must refer to the current gap")
+			}
+			decisionReview := *review
+			decisionReview.GapID = reviewGapID
+			e.scopeRetrievalReview(&decisionReview)
+			if err := e.applyRetrievalReview(ctx, decisionReview); err != nil {
+				return "", err
+			}
+		}
+	}
+	recoveryCallID := ""
+	if hint.Action == retrievalRecovery {
+		c.mu.Lock()
+		target := previous
+		if hint.RecoveryCallID != "" {
+			target = c.attempt(e.resolveRetrievalReference(hint.RecoveryCallID))
+		}
+		if target != nil && target.GapID == gapID && len(target.Failures) > 0 {
+			action = retrievalRecovery
+			recoveryCallID = e.resolveRetrievalReference(hint.RecoveryCallID)
+		}
+		c.mu.Unlock()
+	}
+	executionArgs := retrievalToolArgs(args)
+	encoded, err := json.Marshal(executionArgs)
+	if err != nil {
+		return "", err
+	}
+	lead := quote
+	if action == retrievalRecovery && hint.Lead != "" {
+		lead = hint.Lead
+	}
+	if err := c.acquire(gapID, e.retrievalCallReference(tc.ID), action, lead, tc.Function.Name, string(encoded), recoveryCallID); err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+// Continuing a goal can introduce a new fact when the user supplies a condition.
+func (e *AgentEngine) bindCurrentRetrievalFact(ctx context.Context) (string, string, error) {
+	e.recordRetrievalUserMessage()
+	c := e.retrieval
+	c.mu.Lock()
+	goal := c.state.Goal
+	uncertain := c.state.UncertainInputID != "" && c.state.UncertainInputID == "message:"+e.retrievalUserMessage.id
+	quote, inputID := goal, ""
+	for i := len(c.state.UserInputIDs) - 1; i >= 0; i-- {
+		id := c.state.UserInputIDs[i]
+		if !strings.HasPrefix(id, "app_info:") && strings.TrimSpace(c.userInputs[id]) != "" {
+			inputID, quote = id, strings.TrimSpace(c.userInputs[id])
+			break
+		}
+	}
+	c.mu.Unlock()
+	if e.retrievalSearchGapID == "" || e.retrievalSearchInputID != inputID {
+		proposal := retrievalFactProposal{GoalQuote: quote, GoalInputID: inputID, Fact: goal}
+		if quote != goal && uncertain {
+			proposal.Fact = quote
+		} else if quote != goal {
+			proposal.Fact = goal + "\n" + quote
+			proposal.Conditions, proposal.ConditionQuote, proposal.ConditionInputID = quote, quote, inputID
+		}
+		id, err := e.admitRetrievalFact(ctx, proposal)
+		if err != nil {
+			return "", "", err
+		}
+		e.retrievalSearchGapID = id
+		e.retrievalSearchInputID = inputID
+	}
+	return e.retrievalSearchGapID, quote, nil
+}

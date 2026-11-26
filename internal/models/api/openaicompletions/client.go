@@ -48,6 +48,7 @@ func (c *Client) send(
 	if err != nil {
 		return nil, nil, err
 	}
+	logger.Infof(ctx, "[LLM Request] model=%s effective_thinking_params=%v", c.cfg.Endpoint.Model, effectiveThinkingParams(body))
 	url := c.url()
 	req, data, err := c.cfg.Endpoint.NewRequest(ctx, url, body, stream)
 	if err != nil {
@@ -66,6 +67,31 @@ func (c *Client) send(
 		return nil, data, err
 	}
 	return resp, data, nil
+}
+
+func effectiveThinkingParams(body map[string]any) map[string]interface{} {
+	thinkingParams := map[string]interface{}{}
+	if enabled, ok := body["enable_thinking"].(bool); ok {
+		thinkingParams["enable_thinking"] = enabled
+	}
+	if kwargs, ok := body["chat_template_kwargs"].(map[string]any); ok {
+		if enabled, ok := kwargs["enable_thinking"].(bool); ok {
+			thinkingParams["chat_template_kwargs.enable_thinking"] = enabled
+		}
+	}
+	switch v := body["thinking_budget"].(type) {
+	case int:
+		thinkingParams["thinking_budget"] = v
+	case float64:
+		thinkingParams["thinking_budget"] = v
+	}
+	if effort, ok := body["reasoning_effort"].(string); ok {
+		switch effort {
+		case "none", "minimal", "low", "medium", "high", "xhigh", "max", "min":
+			thinkingParams["reasoning_effort"] = effort
+		}
+	}
+	return thinkingParams
 }
 
 // Chat performs a non-streaming completion.

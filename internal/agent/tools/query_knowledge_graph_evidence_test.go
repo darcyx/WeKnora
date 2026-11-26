@@ -503,3 +503,23 @@ func TestQueryKnowledgeGraph_RejectsRelationsWhenTagValidationFails(t *testing.T
 	assert.NotEmpty(t, result.Data["errors"])
 	assert.Contains(t, result.Output, "failed to validate graph result scope")
 }
+
+func TestDocumentReferenceGraphKeepsOriginalLink(t *testing.T) {
+	chunks := &stubGraphChunkRepo{chunks: map[string]*types.Chunk{"c1": {ID: "c1", KnowledgeID: "doc", KnowledgeBaseID: "kb-1", IsEnabled: true, Content: "证据"}}}
+	documents := liveGraphEvidenceDocuments()
+	documents.documents["doc"].Metadata = types.JSON(`{"source_url":"https://docs.example/graph"}`)
+	tool := graphEvidenceTool(graphEvidenceGraph([]string{"c1"}, []string{"c1"}), chunks, documents, nil)
+	result := executeGraphEvidenceTool(t, tool)
+	rows := result.Data["results"].([]map[string]interface{})
+	require.NotEmpty(t, rows)
+	require.Equal(t, "https://docs.example/graph", rows[0]["source_url"])
+	require.Equal(t, "Evidence", rows[0]["knowledge_title"])
+
+	documents.documents["doc"].Metadata = nil
+	documents.documents["doc"].CustomMetadata = types.JSON(`{"id":"anydata-login","url":"https://docs.dobest.cn/docs-server/d9e9ba5e"}`)
+	result = executeGraphEvidenceTool(t, tool)
+	rows = result.Data["results"].([]map[string]interface{})
+	require.NotEmpty(t, rows)
+	require.Equal(t, "doc", rows[0]["knowledge_id"])
+	require.Equal(t, "https://docs.dobest.cn/docs-server/d9e9ba5e", rows[0]["source_url"])
+}

@@ -1,4 +1,47 @@
 export default {
+  tokenQuotaSettings: {
+    title: "Token 配額",
+    description: "檢視及管理 API 整合外部使用者的 Token 用量與配額。",
+    identityHint: "配額依空間及外部使用者 ID 分別計算，週期採 UTC 時間。",
+    tenantId: "空間 ID",
+    tenantIdPlaceholder: "請輸入空間 ID",
+    tenantIdRequired: "請輸入空間 ID",
+    tenantIdInvalid: "空間 ID 必須為數字",
+    subjectId: "外部使用者 ID",
+    subjectIdPlaceholder: "請輸入外部使用者 ID",
+    subjectIdRequired: "請輸入外部使用者 ID",
+    query: "查詢",
+    listUsers: "列出使用者",
+    usersTitle: "外部使用者",
+    usersDescription: "選擇使用者檢視或調整配額，也可直接查詢尚未出現的使用者。",
+    previousPage: "上一頁",
+    nextPage: "下一頁",
+    pageInfo: "第 {page} 頁，共 {total} 位使用者",
+    dailyUsage: "今日用量",
+    monthlyUsage: "本月用量",
+    reservedTokens: "預留 Token",
+    reservedHint: "進行中請求預留的 Token 數。",
+    unlimited: "不限制",
+    limitValue: "上限：{value}",
+    overrideTitle: "使用者個別配額",
+    overrideDescription: "為此使用者設定上限，留空則繼承平台預設值。",
+    overridden: "已覆寫",
+    inheriting: "繼承預設值",
+    dailyLimit: "每日上限",
+    monthlyLimit: "每月上限",
+    inheritPlaceholder: "繼承預設值",
+    limitHint: "0 表示不限制；留空表示繼承預設值。",
+    reset: "還原預設",
+    resetConfirm: "確定刪除此使用者的個別配額並還原平台預設值嗎？",
+    save: "儲存",
+    noData: "輸入空間 ID 與外部使用者 ID 後查詢配額。",
+    loadFailed: "載入配額失敗",
+    overrideRequired: "請至少設定一項個別上限",
+    saveSuccess: "配額已儲存",
+    saveFailed: "儲存配額失敗",
+    resetSuccess: "已還原預設配額",
+    resetFailed: "還原預設配額失敗",
+  },
   documentProgress: {
     queueView: '佇列任務',
     title: '資料與 Wiki 進度',
@@ -325,6 +368,11 @@ export default {
         }
       },
       keyDescriptions: {
+        token_quota: {
+          default_daily_limit: "API 整合外部使用者的預設每日 Token 上限（UTC 自然日）。0 表示不限制；使用者個別設定優先，修改立即生效。",
+          default_monthly_limit: "API 整合外部使用者的預設每月 Token 上限（UTC 自然月）。0 表示不限制；使用者個別設定優先，修改立即生效。",
+          max_completion_tokens: "未指定 max_tokens 時，用於額度預留及模型呼叫的最大輸出 Token 數。必須為正整數；較小值減少預留，但也會限制回答長度。",
+        },
         model: {
           max_concurrency: '後台任務（文件入庫/富化）對單個模型的預設併發上限，按模型 ID 全副本共享。每次呼叫實時讀取，修改後立即生效、無需重啟。0 或負數表示關閉預設限制（各模型仍會尊重自身在模型管理裡設定的上限）。僅影響後台任務，不影響交互式對話。'
         },
@@ -357,6 +405,11 @@ export default {
         }
       },
       keyLabels: {
+        token_quota: {
+          default_daily_limit: "預設每日 Token 上限",
+          default_monthly_limit: "預設每月 Token 上限",
+          max_completion_tokens: "預設最大輸出 Token 數",
+        },
         model: {
           max_concurrency: '模型預設併發上限'
         },

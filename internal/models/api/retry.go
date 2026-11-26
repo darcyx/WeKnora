@@ -20,6 +20,14 @@ type RetryPolicy struct {
 	MaxDelay time.Duration
 }
 
+type callerManagedRetryKey struct{}
+
+// WithoutTransportRetries lets an outer execution budget own recovery without
+// multiplying its attempts by the adapter's retry policy.
+func WithoutTransportRetries(ctx context.Context) context.Context {
+	return context.WithValue(ctx, callerManagedRetryKey{}, true)
+}
+
 // DefaultRetryPolicy is three retries with 1s, 2s, 4s backoff, which is what
 // every embedding client used before this helper existed.
 func DefaultRetryPolicy() RetryPolicy {
@@ -66,6 +74,13 @@ func (e Endpoint) PostJSONWithRetry(
 // TransportError, or the budget runs out. The last error lives in the
 // enclosing scope and the loop cannot fall through without it.
 func withRetry(ctx context.Context, policy RetryPolicy, label string, send func() error) error {
+	if managed, _ := ctx.Value(callerManagedRetryKey{}).(bool); managed {
+		policy.MaxRetries = 0
+	}
+	attempts := 0
+	defer func() {
+		logger.Debugf(ctx, "[%s] transport attempts=%d retries=%d", label, attempts, max(0, attempts-1))
+	}()
 	var lastErr error
 	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -78,6 +93,7 @@ func withRetry(ctx context.Context, policy RetryPolicy, label string, send func(
 				return ctx.Err()
 			}
 		}
+		attempts++
 		err := send()
 		if err == nil {
 			return nil

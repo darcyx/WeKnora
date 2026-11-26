@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/sandbox"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -43,6 +44,7 @@ type AgentStreamHandler struct {
 	assistantMessage   *types.Message
 	streamManager      interfaces.StreamManager
 	completionEvent    *interfaces.StreamEvent // Published only after the final message is persisted.
+	executionError     *interfaces.StreamEvent // Agent failures share the same persistence boundary.
 	// suspension is set when the run ended waiting on a user prompt. The
 	// message then stays incomplete and the run is resumed later.
 	suspension *types.PromptSuspension
@@ -682,15 +684,21 @@ func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Ev
 		h.eventStartTimes[evt.ID] = time.Now()
 	}
 
-	// Emit a one-shot TTFB log the first time *any* answer chunk reaches
-	// the stream handler. This lets us compare the backend's "request in →
-	// first token out" timing against the frontend-observed TTFB and pin
-	// down where latency lives (network vs server vs LLM).
-	if !h.ttfbLogged && !h.receivedAt.IsZero() {
+	// Emit a one-shot TTFB log the first time a non-empty answer chunk
+	// reaches the stream handler. This lets us compare the backend's
+	// "request in → first token out" timing against the frontend-observed
+	// TTFB and pin down where latency lives (network vs server vs LLM).
+	// The same value lands on the Langfuse trace as first_answer_ms: the
+	// generation's completion_start_time fires on the first *reasoning*
+	// token, so it cannot tell how long the user stared at a blank answer.
+	if !h.ttfbLogged && !h.receivedAt.IsZero() && data.Content != "" {
 		h.ttfbLogged = true
 		ttfb := time.Since(h.receivedAt)
 		logger.GetLogger(h.ctx).Infof("TTFB:first_answer_chunk request_id=%s, session_id=%s, ttfb_ms=%d",
 			h.requestID, h.sessionID, ttfb.Milliseconds())
+		if tr, ok := langfuse.TraceFromContext(h.ctx); ok {
+			tr.Annotate("first_answer_ms", ttfb.Milliseconds())
+		}
 	}
 
 	// Accumulate final answer locally for assistant message (database). Track
@@ -787,22 +795,28 @@ func (h *AgentStreamHandler) handleError(ctx context.Context, evt event.Event) e
 		return nil
 	}
 
-	// Build error metadata
-	metadata := map[string]interface{}{
-		"stage": data.Stage,
-		"error": data.Error,
+	frame := interfaces.StreamEvent{
+		ID: evt.ID, Type: types.ResponseTypeError, Content: data.Error, Done: true, Timestamp: time.Now(),
+		Data: map[string]interface{}{"stage": data.Stage, "error": data.Error},
 	}
-
-	// Append error event to stream
-	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
-		ID:        evt.ID,
-		Type:      types.ResponseTypeError,
-		Content:   data.Error,
-		Done:      true,
-		Timestamp: time.Now(),
-		Data:      metadata,
-	}); err != nil {
-		logger.GetLogger(h.ctx).Error("Append error event to stream failed", "error", err)
+	if data.Stage == "agent_execution" {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.executionError = &frame
+		h.assistantMessage.IsFallback = true
+		if h.assistantMessage.Content == "" {
+			h.assistantMessage.Content = h.finalAnswer
+		}
+		if h.assistantMessage.Content == "" {
+			h.assistantMessage.Content = strings.TrimSpace(data.Error)
+			if h.assistantMessage.Content == "" {
+				h.assistantMessage.Content = qaFailureContent
+			}
+		}
+		return nil
+	}
+	if err := h.streamManager.AppendEvent(context.WithoutCancel(ctx), h.sessionID, h.assistantMessageID, frame); err != nil {
+		logger.GetLogger(ctx).Error("Append error event to stream failed", "error", err)
 	}
 
 	return nil
@@ -1112,6 +1126,12 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 func (h *AgentStreamHandler) publishCompletion(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.executionError != nil {
+		if err := h.streamManager.AppendEvent(ctx, h.sessionID, h.assistantMessageID, *h.executionError); err != nil {
+			return err
+		}
+		h.executionError = nil
+	}
 	if h.completionEvent == nil {
 		return nil
 	}
@@ -1129,6 +1149,7 @@ func (h *AgentStreamHandler) publishCompletion(ctx context.Context) error {
 			return err
 		}
 	}
+	h.completionEvent.Data["final_content"] = h.assistantMessage.Content
 	if err := h.streamManager.AppendEvent(ctx, h.sessionID, h.assistantMessageID, *h.completionEvent); err != nil {
 		return err
 	}

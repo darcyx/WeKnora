@@ -581,6 +581,7 @@ export default {
     }
   },
   settings: {
+    tokenQuotas: "Квоты токенов",
     modelManagement: 'Управление моделями',
     webSearchConfig: 'Сетевой поиск',
     autoCheckUpdate: 'Автоматическая загрузка обновлений',

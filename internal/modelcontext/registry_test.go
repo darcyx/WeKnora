@@ -2,6 +2,7 @@ package modelcontext
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -405,6 +406,11 @@ func TestRegistryDecodesCanonicalArgumentsForEveryBuiltInReferenceTool(t *testin
 			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
 		},
 		{
+			"knowledge graph with double-encoded KB handles", "query_knowledge_graph",
+			`{"knowledge_base_ids":"[\"kb://1\"]","query":"topic"}`,
+			`{"knowledge_base_ids":["kb-real"],"query":"topic"}`,
+		},
+		{
 			"data analysis SQL", "data_analysis",
 			`{"knowledge_id":"doc://1","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'doc://1'"}`,
 			`{"knowledge_id":"doc-real","sql":"SELECT COUNT(*) FROM dataset WHERE label = 'weknora://doc/doc-real'"}`,
@@ -554,14 +560,23 @@ func TestMCPBridgeKeepsExternalSchemasAndArgumentsOpaque(t *testing.T) {
 	}
 }
 
-func TestCitationPolicyDoesNotSuppressRequestedResourcesOrBreakOutputFormat(t *testing.T) {
-	disabled := NewRegistry(false).ProtocolPrompt()
-	require.Contains(t, disabled, "Source citations are disabled")
-	require.Contains(t, disabled, "a URL explicitly requested by the user")
-	require.Contains(t, disabled, "downloadable deliverables")
-	require.NotContains(t, disabled, "Do not output <ref>, <kb>, <web>, raw source URLs")
-	enabled := NewRegistry(true).ProtocolPrompt()
-	require.Contains(t, enabled, "do not break a required schema")
+func TestReferencePresentationBelongsToPrompt(t *testing.T) {
+	require.Equal(t, NewRegistry(true).ProtocolPrompt(), NewRegistry(false).ProtocolPrompt())
+	for _, enabled := range []bool{true, false} {
+		registry := NewRegistry(enabled)
+		prompt := registry.ProtocolPrompt()
+		require.NotContains(t, prompt, "Source citations are")
+		require.NotContains(t, prompt, "参考来源")
+		require.NotContains(t, prompt, "These rules supersede")
+		rawURL := "https://example.com/document"
+		handle := registry.RegisterWeb(rawURL, "文档")
+		answer := `参考来源
+- <a href="` + handle + `" target="_blank">文档</a>`
+		want := `参考来源
+- <a href="` + rawURL + `" target="_blank">文档</a>`
+		require.Equal(t, want, registry.DecodeOutputText(answer))
+		require.Equal(t, want, registry.DecodeOutputText(want))
+	}
 }
 
 func TestRegistryDecodesReadDocumentIDAgainstBothHandleTables(t *testing.T) {
@@ -649,6 +664,16 @@ func TestModelOutputRendersReadDocumentHeaderAndNavigation(t *testing.T) {
 	require.Contains(t, paged, `<chunk id="chunk://1" index="4" view="full">`)
 	require.Contains(t, paged, `<pagination next_offset="6" remaining="6" />`)
 	require.NotContains(t, paged, "doc-real")
+
+	large := strings.Repeat("文", 40000)
+	largeOutput := registry.ModelToolResultForTool("read_document", &types.ToolResult{Success: true, Data: map[string]any{
+		"display_type": "knowledge_chunks_list", "knowledge_id": "doc-real", "knowledge_title": "Engine Manual",
+		"document": map[string]interface{}{"knowledge_id": "doc-real", "description": large, "metadata": map[string]interface{}{"description": large}},
+		"chunks":   []map[string]interface{}{{"chunk_id": "chunk-4", "content": "evidence"}},
+	}})
+	require.Contains(t, largeOutput, `<description truncated="true">`+strings.Repeat("文", 1024)+`</description>`)
+	require.Contains(t, largeOutput, `<metadata truncated="true">description: `+strings.Repeat("文", 1011)+`</metadata>`)
+	require.Contains(t, largeOutput, `<content>evidence</content>`)
 
 	matched := registry.ModelToolResultForTool("read_document", &types.ToolResult{Success: true, Data: map[string]any{
 		"display_type":    "knowledge_chunks_list",

@@ -31,6 +31,8 @@ export default {
     loadFailed: 'Не удалось загрузить ключи',
     createFailed: 'Не удалось создать ключ',
     capabilityHints: {
+      tokenQuotaRead: "Просмотр квот и расхода токенов внешних пользователей.",
+      tokenQuotaManage: "Установка и удаление индивидуальных квот токенов внешних пользователей.",
       tenantsRead: 'Список, поиск и просмотр всех пространств.',
       tenantsManage: 'Создание, изменение и удаление пространств.',
       settingsRead: 'Чтение настроек платформы.',
@@ -40,6 +42,8 @@ export default {
       auditRead: 'Чтение системного журнала аудита.'
     },
     capabilities: {
+      tokenQuotaRead: "Просмотр квот токенов",
+      tokenQuotaManage: "Управление квотами токенов",
       tenantsRead: 'Просмотр пространств',
       tenantsManage: 'Управление пространствами',
       settingsRead: 'Просмотр системных настроек',

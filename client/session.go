@@ -280,6 +280,7 @@ type FunctionCall struct {
 type ResponseType string
 
 const (
+	ResponseTypeStop         ResponseType = "stop"
 	ResponseTypeAnswer       ResponseType = "answer"
 	ResponseTypeReferences   ResponseType = "references"
 	ResponseTypeThinking     ResponseType = "thinking"
@@ -376,7 +377,10 @@ func (c *Client) KnowledgeQAStream(
 					debugLogger.Debug("sse_callback_failed", "error", err)
 					return err
 				}
-				if streamResponse.ResponseType == ResponseTypeError && streamResponse.Done {
+				if streamResponse.ResponseType == ResponseTypeStop {
+					return nil
+				}
+				if streamResponse.ResponseType == ResponseTypeError && IsTerminalErrorFrame(streamResponse.Done, streamResponse.Data) {
 					return NewSSEStreamError(streamResponse.Content)
 				}
 			}
@@ -461,7 +465,10 @@ func (c *Client) ContinueStream(
 				if err := callback(&streamResponse); err != nil {
 					return err
 				}
-				if streamResponse.ResponseType == ResponseTypeError && streamResponse.Done {
+				if streamResponse.ResponseType == ResponseTypeStop {
+					return nil
+				}
+				if streamResponse.ResponseType == ResponseTypeError && IsTerminalErrorFrame(streamResponse.Done, streamResponse.Data) {
 					return NewSSEStreamError(streamResponse.Content)
 				}
 			}

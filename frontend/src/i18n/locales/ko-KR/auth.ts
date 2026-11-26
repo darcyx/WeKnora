@@ -31,6 +31,8 @@ export default {
     loadFailed: '플랫폼 API 키를 불러오지 못했습니다',
     createFailed: '플랫폼 API 키를 만들지 못했습니다',
     capabilityHints: {
+      tokenQuotaRead: "외부 사용자의 토큰 할당량과 사용량을 봅니다.",
+      tokenQuotaManage: "외부 사용자의 개별 토큰 할당량을 설정하거나 삭제합니다.",
       tenantsRead: '모든 워크스페이스를 조회하고 검색합니다.',
       tenantsManage: '워크스페이스를 생성, 수정, 삭제합니다.',
       settingsRead: '플랫폼 설정을 조회합니다.',
@@ -40,6 +42,8 @@ export default {
       auditRead: '플랫폼 감사 로그를 조회합니다.'
     },
     capabilities: {
+      tokenQuotaRead: "토큰 할당량 보기",
+      tokenQuotaManage: "토큰 할당량 관리",
       tenantsRead: '워크스페이스 조회',
       tenantsManage: '워크스페이스 관리',
       settingsRead: '시스템 설정 조회',

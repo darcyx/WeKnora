@@ -186,6 +186,8 @@ type CustomAgentConfig struct {
 	// Smart-reasoning ReAct rounds send this value as-is (zero becomes
 	// DefaultMaxCompletionTokens at call time: 24576 for smart reasoning).
 	MaxCompletionTokens int `yaml:"max_completion_tokens" json:"max_completion_tokens"`
+	// Zero inherits the registry default; tools preserve their paging/recovery hints.
+	MaxToolOutputChars int `yaml:"max_tool_output_chars" json:"max_tool_output_chars,omitempty"`
 	// Whether to enable thinking mode (for models that support extended thinking)
 	Thinking *bool `yaml:"thinking" json:"thinking"`
 	// ReasoningEffort selects the thinking intensity (off | auto | minimal |
@@ -201,6 +203,10 @@ type CustomAgentConfig struct {
 	// default). A negative value is unlimited: the loop runs until the model
 	// stops, the user cancels, or another guard fires.
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
+	// PlanningEnabled turns on the engine-driven plan-and-execute decomposition
+	// that runs before the ReAct loop. Defaults to false (off): the loop runs
+	// as before. When true, a planner decides whether to decompose the task.
+	PlanningEnabled bool `yaml:"planning_enabled" json:"planning_enabled" extensions:"x-agent,x-agent-detail"`
 	// Timeout for a single LLM call in seconds (0 = use global default)
 	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
 	// Allowed tools (only for agent type)

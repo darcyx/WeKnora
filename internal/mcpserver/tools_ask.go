@@ -326,9 +326,11 @@ func (s *Server) runQA(
 
 	var (
 		mu       sync.Mutex
-		answer   strings.Builder
+		answer   event.AnswerText
 		final    string
 		refs     []*types.SearchResult
+		faqSteps []types.AgentStep
+		usage    *types.TokenUsage
 		qaErr    error
 		done     = make(chan struct{})
 		complete = make(chan struct{})
@@ -345,7 +347,7 @@ func (s *Server) runQA(
 			return nil
 		}
 		mu.Lock()
-		answer.WriteString(data.Content)
+		answer.Apply(evt.ID, data)
 		mu.Unlock()
 		if data.Done {
 			closeDone()
@@ -378,8 +380,21 @@ func (s *Server) runQA(
 				refs = completeRefs
 			}
 		}
+		if steps, ok := data.AgentSteps.([]types.AgentStep); ok {
+			for _, step := range steps {
+				for _, call := range step.ToolCalls {
+					if call.ID == types.FAQClarificationToolCallID {
+						faqSteps = append(faqSteps, step)
+						break
+					}
+				}
+			}
+		}
+		if turnUsage, ok := data.Usage.(*types.TokenUsage); ok {
+			usage = turnUsage
+		}
 		mu.Unlock()
-		closeComplete()
+		// AgentQA may still publish an execution error before returning.
 		return nil
 	})
 	bus.On(event.EventError, func(_ context.Context, evt event.Event) error {
@@ -438,7 +453,7 @@ func (s *Server) runQA(
 			case <-complete:
 			case <-ctx.Done():
 			case <-timer.C:
-				logger.Warnf(ctx, "[mcpserver] ask timed out waiting for agent completion: session=%s", session.ID)
+				logger.Warnf(ctx, "[mcpserver] ask timed out waiting for AgentQA to return: session=%s", session.ID)
 			}
 			timer.Stop()
 		}
@@ -453,10 +468,12 @@ func (s *Server) runQA(
 
 	mu.Lock()
 	text := answer.String()
-	if strings.TrimSpace(text) == "" && final != "" {
+	if strings.TrimSpace(final) != "" {
 		text = final
 	}
 	collected := append([]*types.SearchResult(nil), refs...)
+	storedFAQSteps := append([]types.AgentStep(nil), faqSteps...)
+	storedUsage := usage
 	runErr := qaErr
 	mu.Unlock()
 
@@ -473,6 +490,8 @@ func (s *Server) runQA(
 	}
 	assistantMsg.Content = text
 	assistantMsg.IsCompleted = true
+	assistantMsg.AgentSteps = storedFAQSteps
+	assistantMsg.Usage = storedUsage
 	if len(collected) > 0 {
 		assistantMsg.KnowledgeReferences = types.References(collected)
 	}

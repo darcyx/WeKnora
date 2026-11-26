@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/searchutil"
@@ -90,6 +91,9 @@ func (s *messageSuggestionService) EnsureFollowUps(
 	if regenerate && (config == nil || !config.FollowUps.Enabled || !config.FollowUps.AllowRegenerate) {
 		return nil, errors.New("suggestion regeneration is not allowed")
 	}
+	if blocked := missingInputFollowUps(message); blocked != nil {
+		return blocked, nil
+	}
 	candidate := &types.MessageSuggestionSet{
 		TenantID:           tenantID,
 		SessionID:          sessionID,
@@ -134,7 +138,6 @@ func (s *messageSuggestionService) EnsureFollowUps(
 	set.LatencyMs = time.Since(startedAt).Milliseconds()
 	set.PromptTokens = usage.PromptTokens
 	set.CompletionTokens = usage.CompletionTokens
-	set.LeaseUntil = nil
 	generatedAt := time.Now()
 	set.GeneratedAt = &generatedAt
 
@@ -175,6 +178,9 @@ func (s *messageSuggestionService) GetFollowUps(
 	if err != nil {
 		return nil, err
 	}
+	if blocked := missingInputFollowUps(message); blocked != nil {
+		return blocked, nil
+	}
 	tenantID := types.MustTenantIDFromContext(ctx)
 	locale := types.ResolveLanguage(ctx, message.ExecutionContext.Locale)
 	configHash := message.ExecutionContext.AgentConfigHash
@@ -189,6 +195,19 @@ func (s *messageSuggestionService) GetFollowUps(
 		configHash,
 		locale,
 	)
+}
+
+func missingInputFollowUps(message *types.Message) *types.MessageSuggestionSet {
+	var record agentRetrievalRecord
+	if json.Unmarshal(message.ExecutionContext.RetrievalState, &record) != nil || len(agent.RetrievalMissingUserFields(record.State)) == 0 {
+		return nil
+	}
+	// Check before both generation and cache reads; old ready sets must not leak.
+	return &types.MessageSuggestionSet{
+		SessionID: message.SessionID, AssistantMessageID: message.ID,
+		Placement: types.SuggestionPlacementAfterAnswer, Status: types.SuggestionStatusSuppressed,
+		SuppressionReason: "needs_user", Questions: types.SuggestionItems{},
+	}
 }
 
 func (s *messageSuggestionService) RecordEvent(
@@ -206,6 +225,9 @@ func (s *messageSuggestionService) RecordEvent(
 	tenantID := types.MustTenantIDFromContext(ctx)
 	set, err := s.repo.GetByID(ctx, tenantID, sessionID, setID)
 	if err != nil {
+		return err
+	}
+	if _, err := s.messageService.GetMessage(ctx, set.SessionID, set.AssistantMessageID); err != nil {
 		return err
 	}
 	if questionID != "" && !containsSuggestionID(set.Questions, questionID) {
@@ -816,7 +838,6 @@ func (s *messageSuggestionService) suppress(
 	set.Status = types.SuggestionStatusSuppressed
 	set.SuppressionReason = reason
 	set.Questions = types.SuggestionItems{}
-	set.LeaseUntil = nil
 	now := time.Now()
 	set.GeneratedAt = &now
 	if err := s.repo.Save(ctx, set); err != nil {

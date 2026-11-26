@@ -110,6 +110,9 @@ type Message struct {
 	// providers reject unknown message fields on some endpoints, and this one
 	// means nothing to them anyway.
 	Kind MessageKind `json:"-"`
+	// OriginalUserText excludes replay wrappers, attachment descriptions and synthetic notices.
+	// Nil means Content already contains the original text.
+	OriginalUserText *string `json:"-"`
 	// TurnID is the stored assistant message whose turn this history message
 	// was replayed from. It is empty for the live turn and for messages the
 	// engine synthesized. Compaction uses it to tell whether a summary ends

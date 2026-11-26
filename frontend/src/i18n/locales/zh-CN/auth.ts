@@ -31,6 +31,8 @@ export default {
     loadFailed: '加载平台 API Key 失败',
     createFailed: '创建平台 API Key 失败',
     capabilityHints: {
+      tokenQuotaRead: "查看外部用户的 Token 配额和使用量。",
+      tokenQuotaManage: "设置或删除外部用户的 Token 配额。",
       tenantsRead: '列出、搜索和查看所有空间。',
       tenantsManage: '创建、更新、删除空间及应用全局空间配置。',
       settingsRead: '读取平台级运行设置。',
@@ -40,6 +42,8 @@ export default {
       auditRead: '读取平台级审计日志。'
     },
     capabilities: {
+      tokenQuotaRead: "查看 Token 配额",
+      tokenQuotaManage: "管理 Token 配额",
       tenantsRead: '查看空间',
       tenantsManage: '管理空间',
       settingsRead: '查看系统设置',

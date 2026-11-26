@@ -62,7 +62,8 @@ func (r *messageSuggestionRepository) AcquireGeneration(
 	regenerate bool,
 ) (*types.MessageSuggestionSet, bool, error) {
 	now := time.Now()
-	leaseUntil := now.Add(3 * time.Minute)
+	// The MySQL schema stores whole seconds; fence with the persisted precision.
+	leaseUntil := now.Add(3 * time.Minute).Truncate(time.Second)
 	candidate.Status = types.SuggestionStatusGenerating
 	candidate.LeaseUntil = &leaseUntil
 	candidate.Questions = types.SuggestionItems{}
@@ -139,7 +140,22 @@ func (r *messageSuggestionRepository) Save(ctx context.Context, set *types.Messa
 	if set == nil {
 		return errors.New("message suggestion set is nil")
 	}
-	return r.db.WithContext(ctx).Save(set).Error
+	if set.LeaseUntil == nil {
+		return errors.New("message suggestion generation lease is missing")
+	}
+	completed := *set
+	completed.LeaseUntil = nil
+	result := r.db.WithContext(ctx).Model(&types.MessageSuggestionSet{}).
+		Where("id = ? AND tenant_id = ? AND status = ? AND lease_until = ?", set.ID, set.TenantID, types.SuggestionStatusGenerating, set.LeaseUntil).
+		Select("*").Omit("id", "created_at").Updates(&completed)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("message suggestion generation lease was superseded or deleted")
+	}
+	*set = completed
+	return nil
 }
 
 func (r *messageSuggestionRepository) CreateEvent(

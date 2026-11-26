@@ -758,6 +758,8 @@ export default {
     never: '未使用',
     systemCapabilityGroup: 'プラットフォームコントロールプレーン',
     capabilities: {
+      tokenQuotaRead: "トークン割り当てを表示",
+      tokenQuotaManage: "トークン割り当てを管理",
       tenantsRead: 'ワークスペースの読み取り',
       tenantsManage: 'ワークスペースの管理',
       settingsRead: 'システム設定の読み取り',
@@ -767,6 +769,8 @@ export default {
       auditRead: 'システム監査の読み取り'
     },
     capabilityHints: {
+      tokenQuotaRead: "外部ユーザーのトークン割り当てと使用量を表示します。",
+      tokenQuotaManage: "外部ユーザーの個別割り当てを設定または削除します。",
       tenantsRead: 'すべてのワークスペースの一覧表示、検索、詳細確認を行います。',
       tenantsManage: 'ワークスペースの作成、更新、削除と、グローバルなワークスペース設定の適用を行います。',
       settingsRead: 'プラットフォームのランタイム設定を読み取ります。',

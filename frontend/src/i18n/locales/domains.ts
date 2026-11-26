@@ -123,6 +123,7 @@ export const DOMAIN_BY_NAMESPACE: Readonly<Record<string, LocaleDomain>> = {
   graphSettings: 'settings',
 
   // system administration, queues & document progress
+  tokenQuotaSettings: 'system',
   system: 'system',
   documentProgress: 'system',
 }

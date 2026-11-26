@@ -34,7 +34,9 @@ type AgentToolEvent struct {
 // mutation. References and ToolEvents stay exported as plain slices since
 // they carry no such invariant.
 type AgentAccumulator struct {
-	answer     strings.Builder
+	answerIDs  []string
+	answers    map[string]*strings.Builder
+	final      string
 	thinking   strings.Builder
 	References []*sdk.SearchResult
 	ToolEvents []AgentToolEvent
@@ -42,7 +44,16 @@ type AgentAccumulator struct {
 }
 
 // Answer returns the accumulated `answer`-event content.
-func (a *AgentAccumulator) Answer() string { return a.answer.String() }
+func (a *AgentAccumulator) Answer() string {
+	if a.final != "" {
+		return a.final
+	}
+	var result strings.Builder
+	for _, id := range a.answerIDs {
+		result.WriteString(a.answers[id].String())
+	}
+	return result.String()
+}
 
 // Thinking returns the accumulated `thinking` / `reflection` content
 // surfaced by the agent during its reasoning pass.
@@ -57,16 +68,38 @@ func (a *AgentAccumulator) Append(r *sdk.AgentStreamResponse) {
 	if r == nil || a.done {
 		return
 	}
+	id, _ := r.Data["event_id"].(string)
 	switch r.ResponseType {
 	case sdk.AgentResponseTypeAnswer:
-		if r.Content != "" {
-			a.answer.WriteString(r.Content)
+		part := a.answers[id]
+		if part == nil && r.Content != "" {
+			if a.answers == nil {
+				a.answers = make(map[string]*strings.Builder)
+			}
+			part = &strings.Builder{}
+			a.answers[id] = part
+			a.answerIDs = append(a.answerIDs, id)
 		}
+		if part != nil {
+			if replace, _ := r.Data["replace"].(bool); replace {
+				part.Reset()
+			}
+			part.WriteString(r.Content)
+		}
+	case "progress":
+		if part := a.answers[id]; id != "" && part != nil {
+			part.Reset()
+		}
+	case sdk.AgentResponseTypeComplete:
+		a.final, _ = r.Data["final_content"].(string)
 	case sdk.AgentResponseTypeThinking, sdk.AgentResponseTypeReflection:
 		if r.Content != "" {
 			a.thinking.WriteString(r.Content)
 		}
 	case sdk.AgentResponseTypeToolCall, sdk.AgentResponseTypeToolResult:
+		if name, _ := r.Data["tool_name"].(string); r.ResponseType == sdk.AgentResponseTypeToolCall && name != "" && name != "open_page" && name != "final_answer" {
+			a.answers, a.answerIDs = nil, nil
+		}
 		a.ToolEvents = append(a.ToolEvents, AgentToolEvent{
 			ID:     r.ID,
 			Kind:   r.ResponseType,
@@ -84,7 +117,8 @@ func (a *AgentAccumulator) Append(r *sdk.AgentStreamResponse) {
 	// Thinking / reflection / answer streams each emit their own Done=true
 	// marker before later events arrive. Only the explicit complete frame is
 	// terminal for the whole agent run.
-	if r.ResponseType == sdk.AgentResponseTypeComplete {
+	if r.ResponseType == sdk.AgentResponseTypeComplete || r.ResponseType == sdk.AgentResponseTypeStop ||
+		(r.ResponseType == sdk.AgentResponseTypeError && sdk.IsTerminalErrorFrame(r.Done, r.Data)) {
 		a.done = true
 	}
 }

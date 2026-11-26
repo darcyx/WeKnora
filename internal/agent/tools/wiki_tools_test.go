@@ -174,8 +174,8 @@ func TestWikiReadPageSchemaUsesAutomaticKBRouting(t *testing.T) {
 		&fakeWikiPageService{}, nil,
 		NewWikiScopesFromKBIDs([]string{"kb-1"}), NewWikiRouteResolver(),
 	)
-	if strings.Contains(string(tool.Parameters()), "knowledge_base_id") {
-		t.Fatalf("wiki_read_page schema must not ask the model to choose a knowledge base: %s", tool.Parameters())
+	if !strings.Contains(string(tool.Parameters()), "knowledge_base_ids") {
+		t.Fatalf("wiki_read_page schema must allow optional scope narrowing: %s", tool.Parameters())
 	}
 }
 
@@ -508,5 +508,53 @@ func TestWikiSearchAcceptsLegacyArrayAndSingleKBArguments(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "[[concept/legacy|concept/legacy]]") {
 		t.Fatalf("output = %s", res.Output)
+	}
+}
+
+func TestWikiReadPageKnowledgeBaseIDs(t *testing.T) {
+	const kbTag1, kbTag2 = "<knowledge_base_id>kb-1</knowledge_base_id>", "<knowledge_base_id>kb-2</knowledge_base_id>"
+	tests := []struct {
+		name        string
+		pageKBs     []string
+		args        string
+		wantSuccess bool
+		want        []string
+		notWant     []string
+	}{
+		{"no ids renders every match", []string{"kb-1", "kb-2"}, `{"slugs":["p"]}`, true,
+			[]string{kbTag1, kbTag2}, []string{"Ambiguous slug"}},
+		{"single id unique slug", []string{"kb-2"}, `{"slugs":["p"],"knowledge_base_ids":["kb-2","forbidden"]}`, true,
+			[]string{kbTag2}, []string{kbTag1, "Ambiguous slug"}},
+		{"single id duplicate slug surfaces hint", []string{"kb-1", "kb-2"}, `{"slugs":["p"],"knowledge_base_ids":["kb-2"]}`, true,
+			[]string{kbTag2, "Ambiguous slug: 'p' also exists in allowed KB [kb-1]"}, []string{kbTag1}},
+		{"slug only outside requested ids", []string{"kb-1"}, `{"slugs":["p"],"knowledge_base_ids":["kb-2"]}`, false,
+			[]string{"exists in allowed KB [kb-1]"}, nil},
+		{"id outside allowed scope", []string{"kb-1"}, `{"slugs":["p"],"knowledge_base_ids":["forbidden"]}`, false,
+			[]string{"No requested knowledge bases are in the allowed wiki scope"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pages := map[string]*types.WikiPage{}
+			for _, kb := range tt.pageKBs {
+				pages[wikiPageKey(kb, "p")] = newTestWikiPage(kb, "p")
+			}
+			svc := &fakeWikiPageService{pages: pages}
+			tool := NewWikiReadPageTool(svc, nil, NewWikiScopesFromKBIDs([]string{"kb-1", "kb-2"}), NewWikiRouteResolver())
+			result, err := tool.Execute(context.Background(), json.RawMessage(tt.args))
+			if err != nil || result.Success != tt.wantSuccess {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			text := result.Output + result.Error
+			for _, s := range tt.want {
+				if !strings.Contains(text, s) {
+					t.Errorf("missing %q in %s", s, text)
+				}
+			}
+			for _, s := range tt.notWant {
+				if strings.Contains(text, s) {
+					t.Errorf("unexpected %q in %s", s, text)
+				}
+			}
+		})
 	}
 }

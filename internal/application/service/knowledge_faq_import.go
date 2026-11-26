@@ -1437,12 +1437,16 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 			for _, chunk := range chunksToDelete {
 				chunkIDsToDelete = append(chunkIDsToDelete, chunk.ID)
 			}
+			// Keep old rows retryable if deleting their indexes fails.
+			deletedSize, err := s.deleteFAQChunkVectors(ctx, kb, chunksToDelete)
+			if err != nil {
+				return fmt.Errorf("failed to delete chunk vectors: %w", err)
+			}
 			if err := s.chunkRepo.DeleteChunks(ctx, tenantID, chunkIDsToDelete); err != nil {
 				return fmt.Errorf("failed to delete chunks: %w", err)
 			}
-			// 删除索引
-			if err := s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, chunksToDelete); err != nil {
-				return fmt.Errorf("failed to delete chunk vectors: %w", err)
+			if err := s.deductFAQStorage(ctx, faqKnowledge, deletedSize); err != nil {
+				return err
 			}
 			logger.Infof(ctx, "FAQ import task %s: deleted %d chunks (including updates)", taskID, len(chunksToDelete))
 		}
@@ -2129,20 +2133,20 @@ func (s *knowledgeService) indexFAQChunks(ctx context.Context,
 }
 
 func (s *knowledgeService) deleteFAQChunkVectors(ctx context.Context,
-	kb *types.KnowledgeBase, knowledge *types.Knowledge, chunks []*types.Chunk,
-) error {
+	kb *types.KnowledgeBase, chunks []*types.Chunk,
+) (int64, error) {
 	if len(chunks) == 0 {
-		return nil
+		return 0, nil
 	}
 	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
 		ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	indexInfo := make([]*types.IndexInfo, 0)
@@ -2150,7 +2154,7 @@ func (s *knowledgeService) deleteFAQChunkVectors(ctx context.Context,
 	for _, chunk := range chunks {
 		infoList, err := s.buildFAQIndexInfoList(ctx, kb, chunk)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		indexInfo = append(indexInfo, infoList...)
 		chunkIDs = append(chunkIDs, chunk.ID)
@@ -2158,8 +2162,14 @@ func (s *knowledgeService) deleteFAQChunkVectors(ctx context.Context,
 
 	size := retrieveEngine.EstimateStorageSize(ctx, embeddingModel, indexInfo)
 	if err := retrieveEngine.DeleteByChunkIDList(ctx, chunkIDs, embeddingModel.GetDimensions(), types.KnowledgeTypeFAQ); err != nil {
-		return err
+		return 0, err
 	}
+	return size, nil
+}
+
+// Deduct only after business rows are deleted, so index/row failures remain retryable.
+func (s *knowledgeService) deductFAQStorage(ctx context.Context, knowledge *types.Knowledge, size int64) error {
+	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 	if size > 0 {
 		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, -size); err == nil {
 			tenantInfo.StorageUsed -= size

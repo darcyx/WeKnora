@@ -132,10 +132,13 @@ func TestPrepareMessagesWithModelContextSuppressesCitationsWhenDisabled(t *testi
 	}
 
 	messages, refs := prepareMessagesWithModelContext(context.Background(), manage)
-	require.Contains(t, messages[0].Content, "Source citations are disabled")
+	require.Contains(t, messages[0].Content, "custom system prompt")
+	require.NotContains(t, messages[0].Content, "Source citations are")
 	require.Contains(t, messages[1].Content, `<chunk id="chunk://1"`)
 	require.NotContains(t, messages[1].Content, "chunk-1")
 	require.Equal(t, "answer ", refs.DecodeOutputText(`answer <ref id="chunk://1"/>`))
+	const reference = `<a href="https://example.com/doc" target="_blank">Doc</a>`
+	require.Equal(t, reference, refs.DecodeOutputText(reference))
 }
 
 // A truncated ranked list must reach the model context view: this is the text

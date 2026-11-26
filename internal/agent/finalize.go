@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,7 +24,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	state *types.AgentState,
 	sessionID string,
 	conversation []chat.Message,
-) error {
+) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -40,6 +42,10 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// messages. Tool output must retain its role and call ID; never promote it
 	// into user instructions during error recovery or iteration-limit synthesis.
 	messages := append([]chat.Message(nil), conversation...)
+	if state.Plan != nil {
+		messages = append(messages, planFinalInstruction(state.Plan))
+	}
+	holdAnswer := state.Plan != nil || e.holdRetrievalAnswer()
 	runtimeNotice := "<runtime_event>{\"source\":\"runtime\",\"type\":\"final_synthesis\",\"message\":\"Tool " +
 		"execution has ended for this run. Respond to the current task, including the " +
 		"latest user corrections and source restrictions in the conversation. Base " +
@@ -55,7 +61,17 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// Generate a single ID for this entire final answer stream
 	answerID := generateEventID("answer")
 	logger.Debugf(ctx, "[Agent][FinalAnswer] AnswerID: %s", answerID)
-	answerStreamed := false
+	var published strings.Builder
+	defer func() {
+		if retErr == nil || published.Len() == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			state.FinalAnswer = published.String()
+		} else {
+			e.retractAnswer(ctx, sessionID, answerID)
+		}
+	}()
 	providerDone := false
 	terminalContent := ""
 	splitter := agenttools.NewThinkStreamSplitter()
@@ -87,18 +103,13 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			},
 			func(chunk *types.StreamResponse, _ string) {
 				// Defensive filter: only emit answer content, skip thinking chunks
-				if chunk.ResponseType == types.ResponseTypeThinking {
+				if holdAnswer || chunk.ResponseType == types.ResponseTypeThinking {
 					return
 				}
 				_, answerContent := splitter.Feed(chunk.Content)
 				if splitter.TakeAnswerReset() {
-					_ = e.eventBus.Emit(
-						ctx,
-						event.Event{
-							ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-							Data: event.AgentFinalAnswerData{Replace: true},
-						},
-					)
+					e.retractAnswer(ctx, sessionID, answerID)
+					published.Reset()
 				}
 				if chunk.Done {
 					_, tail := splitter.Flush()
@@ -121,7 +132,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 							Content: answerContent,
 						},
 					})
-					answerStreamed = true
+					published.WriteString(answerContent)
 				}
 			},
 		)
@@ -130,6 +141,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		// measured attempt even when its answer is replaced by recovery.
 		overflow := compaction.IsOverflowError(err)
 		if llmResult != nil && llmResult.Usage != nil {
+			state.AddUsage(*llmResult.Usage)
 			state.TurnUsage.Accumulate(*llmResult.Usage)
 			if err == nil && e.responseHitContextLimit(&types.ChatResponse{
 				FinishReason: llmResult.FinishReason, Usage: *llmResult.Usage,
@@ -155,13 +167,11 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			break // Sending the same rejected context again cannot recover.
 		}
 		messages = compacted
-		if answerStreamed {
-			_ = e.eventBus.Emit(ctx, event.Event{
-				ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-				Data: event.AgentFinalAnswerData{Replace: true},
-			})
+		if published.Len() > 0 {
+			e.retractAnswer(ctx, sessionID, answerID)
 		}
-		answerStreamed, providerDone, terminalContent = false, false, ""
+		published.Reset()
+		providerDone, terminalContent = false, ""
 		splitter = agenttools.NewThinkStreamSplitter()
 	}
 	if err != nil {
@@ -172,16 +182,44 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		})
 		return err
 	}
-	// Validate the visible answer before publishing a successful terminal event.
-	fullAnswer := agenttools.StripThinkBlocks(llmResult.Content)
-	if strings.TrimSpace(fullAnswer) == "" {
-		return fmt.Errorf("final answer synthesis returned no visible content")
-	}
 	_, tail := splitter.Flush()
+	// Safety net: strip any residual <think> blocks that may have leaked through
+	fullAnswer := agenttools.StripThinkBlocks(llmResult.Content)
+	// Streamed text stays unless post-processing changed it; then replace it whole.
+	public, err := e.publicAnswer(ctx, fullAnswer, messages)
+	if err != nil {
+		return err
+	}
+	if holdAnswer {
+		// An interrupted step can still produce its private report despite the final instruction.
+		if state.Plan != nil && isPrivatePlanReport(public) {
+			public = e.fallbackAnswer()
+		}
+		terminalContent = fullAnswer
+	}
+	if public != fullAnswer {
+		if published.Len() > 0 {
+			e.retractAnswer(ctx, sessionID, answerID)
+		}
+		fullAnswer, terminalContent, tail = public, "", public
+	}
+	// With tools disabled some models still reply with only a tool call;
+	// never finish the turn with a blank answer.
+	if strings.TrimSpace(fullAnswer) == "" {
+		if len(llmResult.ToolCalls) == 0 {
+			return fmt.Errorf("final answer synthesis returned no visible answer")
+		}
+		logger.Warnf(ctx, "[Agent][FinalAnswer] Empty synthesis (tool_calls=%d) - using fallback",
+			len(llmResult.ToolCalls))
+		fullAnswer = e.fallbackAnswer()
+		terminalContent, tail = "", fullAnswer
+	}
 	truncated := isLengthFinishReason(llmResult.FinishReason)
 	_ = e.eventBus.Emit(ctx, event.Event{
 		ID: answerID, Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-		Data: event.AgentFinalAnswerData{Content: terminalContent + tail, Done: true, Truncated: truncated},
+		Data: event.AgentFinalAnswerData{
+			Content: terminalContent + tail, Done: true, IsFallback: e.isRuntimeFallbackAnswer(fullAnswer), Truncated: truncated,
+		},
 	})
 
 	logger.Infof(ctx, "[Agent][FinalAnswer] Final answer generated: %d characters", len(fullAnswer))
@@ -189,8 +227,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		"session_id": sessionID,
 		"answer_len": len(fullAnswer),
 	})
-	// History is rebuilt from steps, not live answer events. Record a partial
-	// synthesis for every run so reloads and delegated callers retain the cap.
+	// History and delegated callers both read truncation from the persisted steps.
 	if truncated {
 		state.RoundSteps = append(state.RoundSteps, types.AgentStep{
 			Iteration: state.CurrentRound,
@@ -264,6 +301,9 @@ func (e *AgentEngine) handleMaxIterations(
 
 	// Stream final answer generation through EventBus
 	if err := e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, messages); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		logger.Errorf(ctx, "Failed to synthesize final answer: %v", err)
 		common.PipelineError(ctx, "Agent", "final_answer_failed", map[string]interface{}{
 			"error": err.Error(),
@@ -276,6 +316,42 @@ func (e *AgentEngine) handleMaxIterations(
 	return nil
 }
 
+// deadlineSynthesisGrace bounds the detached final-answer call made after the
+// run's total deadline expired.
+const deadlineSynthesisGrace = 20 * time.Second
+
+// deadlineExpired reports whether ctx ended because its deadline passed, as
+// opposed to a user stop (context.Canceled), which must stay silent.
+func deadlineExpired(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// synthesizeAfterDeadline turns evidence gathered before the total deadline
+// into a degraded answer, using a detached context that keeps trace values.
+// It reports false when there is nothing to synthesize from or synthesis
+// failed; the caller then surfaces the original deadline error.
+func (e *AgentEngine) synthesizeAfterDeadline(
+	ctx context.Context, query string, state *types.AgentState, sessionID string, messages []chat.Message,
+) bool {
+	if state.IsComplete || state.Suspended != nil || state.FinalAnswer != "" ||
+		countTotalToolCalls(state.RoundSteps) == 0 {
+		return false
+	}
+	logger.Warnf(ctx, "[Agent] Total deadline reached after %d rounds; synthesizing partial answer", state.CurrentRound)
+	synthCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deadlineSynthesisGrace)
+	defer cancel()
+	messages = append(slices.Clone(messages), chat.Message{Role: "user", Content: "Runtime instruction: " +
+		"The time limit for this request was reached before the research finished. Answer from the evidence " +
+		"already gathered, and state briefly at the start that the answer may be incomplete because of the time limit."})
+	if err := e.streamFinalAnswerToEventBus(synthCtx, query, state, sessionID, messages); err != nil {
+		logger.Errorf(synthCtx, "[Agent] Partial answer synthesis after deadline failed: %v", err)
+		state.FinalAnswer = ""
+		return false
+	}
+	state.IsComplete = true
+	return true
+}
+
 // emitCompletionEvent emits the EventAgentComplete event with execution summary.
 func (e *AgentEngine) emitCompletionEvent(
 	ctx context.Context, state *types.AgentState, sessionID, messageID string, startTime time.Time,
@@ -283,6 +359,14 @@ func (e *AgentEngine) emitCompletionEvent(
 	steps := state.RoundSteps
 	if state.SuspendedStep != nil {
 		steps = append(append([]types.AgentStep(nil), steps...), *state.SuspendedStep)
+	}
+	if state.Plan != nil {
+		steps = slices.Clone(steps)
+		for i := range steps {
+			if steps[i].PlanReport || isPrivatePlanReport(steps[i].Thought) {
+				steps[i].Thought = ""
+			}
+		}
 	}
 	seen := e.takeBackgroundSeen()
 	if len(state.PendingSteerMessages) > 0 || len(state.PendingBackground) > 0 || len(seen) > 0 {

@@ -47,6 +47,7 @@ func (s *scriptedAskSvc) AgentQAStreamWithRequest(_ context.Context, sessionID s
 func answerEvent(content string) *sdk.AgentStreamResponse {
 	return &sdk.AgentStreamResponse{ResponseType: sdk.AgentResponseTypeAnswer, Content: content}
 }
+
 // doneEvent is the stream's terminal frame. The real server ends an agent
 // stream with a `complete` event (it also sets Done=true on intermediate
 // frames), so the terminal is modeled as complete, not a bare answer+done.
@@ -457,6 +458,23 @@ func TestSessionAsk_Cancellation_MapsToOperationCancelled(t *testing.T) {
 	var typed *cmdutil.Error
 	if !errors.As(err, &typed) || typed.Code != cmdutil.CodeOperationCancelled {
 		t.Errorf("expected operation.cancelled, got %v", err)
+	}
+}
+
+func TestSessionAskTextShowsRevisedAnswerOnStop(t *testing.T) {
+	out, _ := iostreams.SetForTest(t)
+	svc := &scriptedAskSvc{events: []*sdk.AgentStreamResponse{
+		{ResponseType: "answer", Content: "kept ", Data: map[string]any{"event_id": "a"}},
+		{ResponseType: "answer", Content: "draft", Data: map[string]any{"event_id": "b"}},
+		{ResponseType: "error", Done: true, Data: map[string]any{"tool_call_id": "call"}},
+		{ResponseType: "answer", Content: "final", Data: map[string]any{"event_id": "b", "replace": true}},
+		{ResponseType: "answer", Content: "withdrawn", Data: map[string]any{"event_id": "c"}},
+		{ResponseType: "progress", Data: map[string]any{"event_id": "c"}},
+		{ResponseType: "stop", Done: true},
+	}}
+	err := runAsk(context.Background(), &AskOptions{AgentID: "ag", Query: "question"}, textOpts(), svc)
+	if err != nil || strings.TrimSpace(out.String()) != "kept final" {
+		t.Fatalf("answer=%q err=%v", out.String(), err)
 	}
 }
 

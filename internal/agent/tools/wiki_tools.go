@@ -23,7 +23,7 @@ import (
 // to get a sense of the wiki's shape; any deeper exploration should go
 // through wiki_search. Keeping the cap small bounds the content envelope
 // served to the LLM, which is the main reason this synthesis exists.
-const wikiIndexAgentTopK = 20
+const wikiIndexAgentTopK = 5
 
 // renderIndexOverviewForAgent formats a WikiIndexResponse as a compact
 // markdown block suitable for embedding inside the <content> tag that
@@ -324,8 +324,12 @@ const (
 	// link section, and wikiLinkSummaryMaxRunes bounds each one. A hub page can
 	// carry dozens of links, and inlining every full summary used to spend more
 	// of the output budget than the page bodies the caller asked for.
-	wikiMaxLinkSummaries    = 20
+	wikiMaxLinkSummaries    = 3
 	wikiLinkSummaryMaxRunes = 150
+	// wikiMaxLinkSlugs bounds how many entries a link section lists at all. Hub
+	// pages carry 80+ links, and listing every bare slug cost thousands of
+	// tokens per read; the rest are summarised by a single omission note.
+	wikiMaxLinkSlugs = 15
 
 	// wikiMinPageBody is the smallest body slice worth rendering. When the
 	// budget cannot give every resolved page at least this much, trailing pages
@@ -471,6 +475,40 @@ func renderWikiPagesWithinBudget(pages []pendingWikiPage, budget, reserve int) (
 	}
 	if total <= usable {
 		return strings.Join(rendered, separator), nil, nil
+	}
+
+	// Relationships can be much larger than the page itself. Reserve space for
+	// actual evidence before treating auxiliary links as fixed overhead. Work on
+	// copies so another rendering does not lose the original metadata.
+	pages = append([]pendingWikiPage(nil), pages...)
+	perPage := (budget - wikiBudgetReserve) / len(pages)
+	for i := range pages {
+		p := &pages[i]
+		bodyFloor := min(wikiMinPageBody, utf8.RuneCountInString(p.body))
+		maxOverhead := perPage - bodyFloor
+		overhead := func() int { return utf8.RuneCountInString(p.render("")) }
+		if overhead() > maxOverhead {
+			p.outLinks = []string{"(relationships omitted for output budget)"}
+			p.inLinks = []string{"(relationships omitted for output budget)"}
+		}
+		if overhead() > maxOverhead {
+			if len(p.sources) > 1 {
+				p.sources = []string{p.sources[0], "(additional sources omitted for output budget)"}
+			}
+		}
+		if overhead() > maxOverhead {
+			page := *p.page
+			page.Summary = truncateRunes(page.Summary, 150)
+			if len(page.Aliases) > 3 {
+				page.Aliases = page.Aliases[:3]
+			}
+			p.page = &page
+		}
+	}
+
+	for i, p := range pages {
+		rendered[i] = p.render(p.body)
+		overheads[i] = utf8.RuneCountInString(rendered[i]) - bodySizes[i]
 	}
 
 	fixedCost := func(keep int) int {
@@ -799,16 +837,17 @@ func NewWikiReadPageTool(
 		BaseTool: NewBaseTool(
 			ToolWikiReadPage,
 			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, and links.
-Use this to read specific wiki pages when you know their slug (e.g. "entity/acme-corp", "concept/rag").
-Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned.`,
+Use the exact slug from the wiki directory or the target of a returned [[slug|title]] link.
+Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned. If the intended knowledge base is known, pass knowledge_base_ids to return only pages from those allowed knowledge bases; duplicates of the slug in other allowed knowledge bases are still reported as a note.`,
 			json.RawMessage(`{
   "type": "object",
   "properties": {
     "slugs": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "List of wiki page slugs to read (e.g. ['entity/acme-corp', 'index'])"
-    }
+      "description": "Wiki page slugs, preserving their original paths; use 'index' for the index overview"
+    },
+    "knowledge_base_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional known knowledge bases within the allowed scope"}
   },
   "required": ["slugs"]
 }`),
@@ -829,8 +868,9 @@ func seenLinkKey(kbID, slug string) string {
 
 func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	var params struct {
-		Slug  any `json:"slug"`
-		Slugs any `json:"slugs"`
+		Slug             any      `json:"slug"`
+		Slugs            any      `json:"slugs"`
+		KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return &types.ToolResult{Success: false, Error: "Invalid parameters: " + err.Error()}, nil
@@ -847,17 +887,44 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		return &types.ToolResult{Success: false, Error: "Missing 'slugs' parameter"}, nil
 	}
 
+	// knowledge_base_ids only narrows which pages are rendered. Lookups still
+	// cover every legal scope so a duplicate slug elsewhere is reported, not hidden.
+	scopes := t.scopes
+	var requested map[string]bool
+	if len(params.KnowledgeBaseIDs) > 0 {
+		requested = make(map[string]bool, len(params.KnowledgeBaseIDs))
+		for _, id := range params.KnowledgeBaseIDs {
+			requested[id] = true
+		}
+		inScope := false
+		for _, scope := range t.scopes {
+			inScope = inScope || requested[scope.KnowledgeBaseID]
+		}
+		if !inScope {
+			return &types.ToolResult{Success: false, Error: "No requested knowledge bases are in the allowed wiki scope"}, nil
+		}
+	}
+	// slug -> allowed KBs (outside knowledge_base_ids) that also hold the slug.
+	alsoIn := make(map[string][]string)
+
 	var pending []pendingWikiPage
 	var errs []string
 	// Per-slug list of KB IDs where the slug was found. A slug may exist in
 	// multiple KBs when the agent has several wiki KBs in scope.
 	foundKBs := make(map[string][]string)
 
-	formatLinks := func(slugs []string, kbID string) []string {
+	type visibleSummary struct{ kbID, owner, key, fragment string }
+	var summaries []visibleSummary
+	formatLinks := func(slugs []string, kbID, owner string) []string {
 		var descs []string
 		inlined := 0
+		omitted := 0
 		for _, s := range slugs {
 			if s == "" {
+				continue
+			}
+			if len(descs) >= wikiMaxLinkSlugs {
+				omitted++
 				continue
 			}
 			// Past the cap the slug alone is enough: the model can always read
@@ -883,11 +950,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				descs = append(descs, fmt.Sprintf("[[%s]]", s))
 				continue
 			}
-			descs = append(descs, fmt.Sprintf("[[%s]] (%s)", s, truncateRunes(linkPage.Summary, wikiLinkSummaryMaxRunes)))
+			fragment := fmt.Sprintf("[[%s]] (%s)", s, truncateRunes(linkPage.Summary, wikiLinkSummaryMaxRunes))
+			descs = append(descs, fragment)
+			summaries = append(summaries, visibleSummary{kbID, owner, key, fragment})
 			inlined++
-			t.mu.Lock()
-			t.seenLinks[key] = true
-			t.mu.Unlock()
+		}
+		if omitted > 0 {
+			descs = append(descs, fmt.Sprintf("(+%d more links omitted; use wiki_search or read a neighbour page to explore)", omitted))
 		}
 		if len(descs) == 0 {
 			return []string{"(none)"}
@@ -902,9 +971,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		resolved := pendingWikiPage{
 			page:     page,
 			kbID:     kbID,
-			outLinks: formatLinks(page.OutLinks, kbID),
-			inLinks:  formatLinks(page.InLinks, kbID),
+			outLinks: formatLinks(page.OutLinks, kbID, page.Slug),
+			inLinks:  formatLinks(page.InLinks, kbID, page.Slug),
 			body:     page.Content,
+		}
+
+		if page.Summary != "" {
+			summaries = append(summaries, visibleSummary{kbID, page.Slug, seenLinkKey(kbID, page.Slug), "<summary>\n" + page.Summary + "\n</summary>"})
 		}
 
 		for _, ref := range page.SourceRefs {
@@ -954,13 +1027,13 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 			page *types.WikiPage
 			kbID string
 		}
-		cachedScopes := t.routes.scopesForSlug(slug, t.scopes)
+		cachedScopes := t.routes.scopesForSlug(slug, scopes)
 		// Provenance is an ordering hint, never an authority boundary. Always
 		// inspect every legal scope so a cached hit cannot hide a duplicate slug
 		// in another Wiki KB and make the model act on an apparently unique page.
 		effectiveScopes := append(
 			append([]WikiScope(nil), cachedScopes...),
-			scopesOutsideKBs(t.scopes, cachedScopes)...,
+			scopesOutsideKBs(scopes, cachedScopes)...,
 		)
 
 		lookupScopes := func(scopes []WikiScope) {
@@ -1001,6 +1074,10 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 					filteredOut[slug] = append(filteredOut[slug], actualKBID)
 					continue
 				}
+				if requested != nil && !requested[actualKBID] {
+					alsoIn[slug] = append(alsoIn[slug], actualKBID)
+					continue
+				}
 
 				hits = append(hits, struct {
 					page *types.WikiPage
@@ -1012,9 +1089,6 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				// echoes a link like `[[summary/xyz]]` from this page's body,
 				// the frontend can resolve it to the same KB without guessing.
 				registerLinkedSlugs(foundKBs, page, actualKBID)
-				t.mu.Lock()
-				t.seenLinks[seenLinkKey(actualKBID, slug)] = true
-				t.mu.Unlock()
 			}
 		}
 
@@ -1025,6 +1099,10 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 				errs = append(errs, fmt.Sprintf(
 					"Wiki page '%s' exists in %v but none of its source documents are within the scope pinned by the user",
 					slug, kbs,
+				))
+			} else if kbs := alsoIn[slug]; len(kbs) > 0 {
+				errs = append(errs, fmt.Sprintf(
+					"Wiki page '%s' not found in requested knowledge_base_ids; it exists in allowed KB %v", slug, kbs,
 				))
 			} else if !lookupFailed[slug] {
 				errs = append(errs, fmt.Sprintf("Wiki page '%s' not found", slug))
@@ -1043,8 +1121,51 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 		return &types.ToolResult{Success: false, Error: strings.Join(errs, "; ")}, nil
 	}
 
-	budget := OutputBudget(ctx)
-	finalOutput, truncatedSlugs, omittedSlugs := renderWikiReadPageOutput(ctx, pending, errs, budget)
+	finalOutput, truncatedSlugs, omittedSlugs := renderWikiPagesWithinBudget(pending, OutputBudget(ctx))
+	if len(omittedSlugs) > 0 {
+		hint := "Read the needed page again with knowledge_base_ids limited to its known allowed knowledge base."
+		if len(slugsToFetch) > 1 {
+			hint = "Call wiki_read_page again with fewer slugs, or limit knowledge_base_ids to the known allowed knowledge base."
+		}
+		finalOutput += fmt.Sprintf(
+			"\n\n<omitted_pages reason=\"output budget exceeded\">\n%s\n</omitted_pages>"+
+				"\n<hint>These pages were resolved but not rendered. "+
+				"%s</hint>",
+			strings.Join(omittedSlugs, "\n"), hint,
+		)
+	}
+	if len(errs) > 0 {
+		finalOutput += fmt.Sprintf("\n\n<errors>\n%s\n</errors>", strings.Join(errs, "\n"))
+	}
+	for _, slug := range slugsToFetch {
+		if kbs := alsoIn[slug]; len(kbs) > 0 && len(foundKBs[slug]) > 0 {
+			finalOutput += fmt.Sprintf(
+				"\n<note>Ambiguous slug: '%s' also exists in allowed KB %v, not rendered because of knowledge_base_ids.</note>",
+				slug, kbs,
+			)
+		}
+	}
+
+	// Only mark summaries that survive both page-budget rendering and the
+	// registry's final output cap. Omitted pages and omitted relationship
+	// sections must remain eligible to show their summaries on a later read.
+	// Registry head/tail truncation can join unrelated page fragments. In that
+	// case conservatively leave all summaries eligible for a future read.
+	if utf8.RuneCountInString(finalOutput) <= OutputBudget(ctx) {
+		for _, pageBlock := range strings.Split(finalOutput, "<wiki_page>") {
+			if !strings.Contains(pageBlock, "</wiki_page>") {
+				continue
+			}
+			for _, summary := range summaries {
+				if strings.Contains(pageBlock, "<knowledge_base_id>"+summary.kbID+"</knowledge_base_id>") &&
+					strings.Contains(pageBlock, "<link>[["+summary.owner+"|") && strings.Contains(pageBlock, summary.fragment) {
+					t.mu.Lock()
+					t.seenLinks[summary.key] = true
+					t.mu.Unlock()
+				}
+			}
+		}
+	}
 
 	// Surface ambiguous slugs so the caller (and logs) can see when a slug
 	// resolved to more than one KB.
@@ -1063,6 +1184,7 @@ func (t *wikiReadPageTool) Execute(ctx context.Context, args json.RawMessage) (*
 			"ambiguous_slugs": ambiguous,
 			"truncated_slugs": truncatedSlugs,
 			"omitted_slugs":   omittedSlugs,
+			"unrequested_kbs": alsoIn,
 		},
 	}, nil
 }
@@ -1115,7 +1237,7 @@ func NewWikiSearchTool(
     },
     "limit": {
       "type": "integer",
-      "description": "Maximum pages to return per knowledge base (default 10, max 50)",
+      "description": "Maximum pages to return across all selected knowledge bases per query (default 10, max 50)",
       "minimum": 1,
       "maximum": 50
     }
@@ -1262,14 +1384,8 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 					))
 					continue
 				}
-				actualKBID := kbID
 				kept++
-				allHits = append(allHits, searchHit{page: p, kbID: actualKBID})
-				t.routes.rememberPage(p, actualKBID)
-				foundKBs[p.Slug] = append(foundKBs[p.Slug], actualKBID)
-				// Register neighbour slugs so links surfaced from this
-				// page's body can be routed to the same KB by the frontend.
-				registerLinkedSlugs(foundKBs, p, actualKBID)
+				allHits = append(allHits, searchHit{page: p, kbID: kbID})
 			}
 		}
 		if len(allHits) == 0 {
@@ -1285,10 +1401,21 @@ func (t *wikiSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 			continue
 		}
 
+		sort.SliceStable(allHits, func(i, j int) bool {
+			a, b := allHits[i].page, allHits[j].page
+			if a.MatchRank != b.MatchRank {
+				return a.MatchRank > b.MatchRank
+			}
+			return a.UpdatedAt.After(b.UpdatedAt)
+		})
+		allHits = allHits[:min(params.Limit, len(allHits))]
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "<search_results count=\"%d\" query=\"%s\">\n", len(allHits), query)
 		for _, h := range allHits {
 			p := h.page
+			t.routes.rememberPage(p, h.kbID)
+			foundKBs[p.Slug] = append(foundKBs[p.Slug], h.kbID)
+			registerLinkedSlugs(foundKBs, p, h.kbID)
 			key := seenLinkKey(h.kbID, p.Slug)
 			t.mu.Lock()
 			seen := t.seenSlugs[key]

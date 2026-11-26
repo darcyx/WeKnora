@@ -26,6 +26,7 @@ type WikiPageHandler struct {
 	lintService   *service.WikiLintService
 	auditService  interfaces.AuditLogService
 	memoryService interfaces.MemoryService
+	knowledgeSvc  interfaces.KnowledgeService
 }
 
 // NewWikiPageHandler creates a new wiki page handler
@@ -35,6 +36,7 @@ func NewWikiPageHandler(
 	lintService *service.WikiLintService,
 	auditService interfaces.AuditLogService,
 	memoryService interfaces.MemoryService,
+	knowledgeSvc interfaces.KnowledgeService,
 ) *WikiPageHandler {
 	return &WikiPageHandler{
 		wikiService:   wikiService,
@@ -42,7 +44,57 @@ func NewWikiPageHandler(
 		lintService:   lintService,
 		auditService:  auditService,
 		memoryService: memoryService,
+		knowledgeSvc:  knowledgeSvc,
 	}
+}
+
+// errUnknownWikiSourceRef marks a source_refs entry naming a knowledge ID
+// that does not exist in the caller's tenant (mapped to 400).
+var errUnknownWikiSourceRef = stderrors.New("unknown source_refs knowledge id")
+
+// resolveSourceRefs parses client-supplied source_refs (bare ID or
+// "uuid|title"), drops empty/duplicate IDs, verifies each ID exists in the
+// tenant, and rebuilds every entry with the title from the knowledge record.
+// An empty input yields an empty (non-nil) array so the stored refs clear.
+func (h *WikiPageHandler) resolveSourceRefs(
+	ctx context.Context, tenantID uint64, refs []string,
+) (types.StringArray, error) {
+	ids := make([]string, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		id, _ := types.ParseWikiSourceRef(ref)
+		if _, dup := seen[id]; id == "" || dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	out := make(types.StringArray, 0, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := h.knowledgeSvc.GetKnowledgeBatch(ctx, tenantID, ids)
+	if err != nil {
+		return nil, fmt.Errorf("look up source_refs: %w", err)
+	}
+	byID := make(map[string]*types.Knowledge, len(rows))
+	for _, k := range rows {
+		if k != nil {
+			byID[k.ID] = k
+		}
+	}
+	for _, id := range ids {
+		k, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", errUnknownWikiSourceRef, id)
+		}
+		title := strings.TrimSpace(k.Title)
+		if title == "" {
+			title = strings.TrimSpace(k.FileName)
+		}
+		out = append(out, types.FormatWikiSourceRef(k.ID, title))
+	}
+	return out, nil
 }
 
 // validateWikiKB validates that the KB exists and is a wiki type
@@ -499,7 +551,7 @@ func (h *WikiPageHandler) GetPage(c *gin.Context) {
 // @Security     Bearer
 // @Router       /knowledgebase/{kb_id}/wiki/pages/{slug} [put]
 func (h *WikiPageHandler) UpdatePage(c *gin.Context) {
-	kbID, _, err := h.validateWikiKB(c)
+	kbID, tenantID, err := h.validateWikiKB(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -565,6 +617,18 @@ func (h *WikiPageHandler) UpdatePage(c *gin.Context) {
 	}
 	if req.Aliases != nil {
 		page.Aliases = *req.Aliases
+	}
+	if req.SourceRefs != nil {
+		refs, err := h.resolveSourceRefs(ctx, tenantID, *req.SourceRefs)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if stderrors.Is(err, errUnknownWikiSourceRef) {
+				status = http.StatusBadRequest
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
+			return
+		}
+		page.SourceRefs = refs
 	}
 
 	updated, err := h.wikiService.UpdatePage(ctx, &page)

@@ -313,6 +313,31 @@ func TestTrace_FinishMetadataMerged(t *testing.T) {
 	t.Fatal("root span not exported")
 }
 
+func TestTrace_AnnotateMergedOnFinish(t *testing.T) {
+	m, exp := newTestManager(t)
+
+	_, tr := m.StartTrace(context.Background(), TraceOptions{
+		Name:     "root",
+		Metadata: map[string]interface{}{"request_id": "req-1"},
+	})
+	tr.Annotate("first_answer_ms", 1234)
+	tr.Finish("done", map[string]interface{}{"status": 200})
+
+	for _, s := range exp.GetSpans() {
+		if s.Name != "root" {
+			continue
+		}
+		meta := spanAttr(s.Attributes, attrTraceMetadata)
+		for _, want := range []string{`"request_id":"req-1"`, `"first_answer_ms":1234`, `"status":200`} {
+			if !strings.Contains(meta, want) {
+				t.Errorf("trace metadata %q missing %s", meta, want)
+			}
+		}
+		return
+	}
+	t.Fatal("root span not exported")
+}
+
 // TestStartGeneration_AutoRootExported guards the regression where a
 // generation started with no active trace auto-opened a root span that was
 // never ended and therefore never exported — leaving the generation's parent

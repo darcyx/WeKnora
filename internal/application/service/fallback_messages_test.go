@@ -112,7 +112,10 @@ func TestPrepareFallbackMessagesSuppressesCitationsWhenDisabled(t *testing.T) {
 	}}
 
 	messages, refs := prepareFallbackMessages(cm, "legacy fallback prompt")
-	require.Contains(t, messages[0].Content, "Source citations are disabled")
+	require.Contains(t, messages[0].Content, "legacy fallback prompt")
+	require.NotContains(t, messages[0].Content, "Source citations are")
 	require.Equal(t, `Previous <ref id="chunk://1"/>`, messages[2].Content)
 	require.Equal(t, "answer ", refs.DecodeOutputText(`answer <ref id="chunk://1"/>`))
+	const reference = `<a href="https://example.com/doc" target="_blank">Doc</a>`
+	require.Equal(t, reference, refs.DecodeOutputText(reference))
 }

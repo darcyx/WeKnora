@@ -435,6 +435,7 @@ func buildTurnBodyMessages(assistant *types.Message, midRunUsers []*types.Messag
 	}
 	appendUser := func(user *types.Message) {
 		msg := buildUserHistoryMessage(user)
+		msg.OriginalUserText = new(user.Content)
 		msg.Content = types.SteerMessageContent(msg.Content)
 		out = append(out, msg)
 		delete(usersByID, user.ID)
@@ -474,7 +475,9 @@ func (r *historyReplay) openingUserMessage(m *types.Message) chat.Message {
 	if strings.TrimSpace(m.Content) == "" && (len(m.Images) > 0 || len(m.Attachments) > 0) {
 		asked := *m
 		asked.Content = types.UploadOnlyQuestion(r.locale)
-		return buildUserHistoryMessage(&asked)
+		msg := buildUserHistoryMessage(&asked)
+		msg.OriginalUserText = new(m.Content)
+		return msg
 	}
 	return buildUserHistoryMessage(m)
 }
@@ -495,7 +498,11 @@ func buildUserHistoryMessage(m *types.Message) chat.Message {
 	if len(m.Attachments) > 0 {
 		content += m.Attachments.BuildAgentPrompt()
 	}
-	return chat.Message{Role: "user", Content: content}
+	msg := chat.Message{Role: "user", Content: content}
+	if content != m.Content {
+		msg.OriginalUserText = new(m.Content)
+	}
+	return msg
 }
 
 // buildAssistantHistoryMessages reconstructs the assistant side of one
@@ -526,7 +533,7 @@ func backgroundInjectionMessages(step types.AgentStep) []chat.Message {
 		if strings.TrimSpace(injection.Content) == "" {
 			continue
 		}
-		out = append(out, chat.Message{Role: "user", Content: injection.Content})
+		out = append(out, chat.Message{Role: "user", Content: injection.Content, OriginalUserText: new(string)})
 	}
 	return out
 }

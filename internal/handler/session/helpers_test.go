@@ -148,18 +148,27 @@ func TestCreateAgentQueryEventOmitsZeroTimestamps(t *testing.T) {
 }
 
 func TestQueryEventMarksApprovalResumeGeneration(t *testing.T) {
+	ctx := context.WithValue(t.Context(), types.LanguageContextKey, "zh-CN")
 	resumes := []*types.AgentResume{nil, {Prompt: &types.AgentPrompt{ID: "approval", ToolCallID: "blocked"}}}
 	for _, resume := range resumes {
 		recorder := &completionEventRecorder{}
 		h := &Handler{streamManager: recorder}
 		h.writeAgentQueryEvent(
-			context.Background(), "session", "user", time.Time{}, &types.Message{ID: "answer"}, resume,
+			ctx, "session", "user", time.Time{}, &types.Message{ID: "answer"}, resume,
 		)
-		require.Len(t, recorder.events, 1)
+		require.NotEmpty(t, recorder.events)
+		require.Equal(t, types.ResponseTypeAgentQuery, recorder.events[0].Type)
 		data := recorder.events[0].Data
 		if resume == nil {
 			require.NotContains(t, data, "resume_pending_id")
+			require.Len(t, recorder.events, 2)
+			status := recorder.events[1]
+			require.Equal(t, types.ResponseTypeThinking, status.Type)
+			require.Equal(t, "思考中…", status.Content)
+			require.True(t, status.Done)
+			require.Equal(t, "answer-thinking-start", status.ID)
 		} else {
+			require.Len(t, recorder.events, 1)
 			require.Equal(t, "approval", data["resume_pending_id"])
 			require.Equal(t, "blocked", data["resume_tool_call_id"])
 		}
