@@ -25,6 +25,7 @@ type faqJoinEngine struct {
 	cleanups   int
 	onCleanup  func()
 	memory     string
+	usage      *types.TokenUsage
 	questions  []string
 	rejections map[string]types.FAQPreflightRejection
 	broadQuery string
@@ -37,12 +38,11 @@ func (e *faqJoinEngine) Cleanup(context.Context) {
 		e.onCleanup()
 	}
 }
-func (e *faqJoinEngine) SetFAQBroadDocumentSearch(query string)      { e.broadQuery = query }
-func (e *faqJoinEngine) SetSteerSink(types.SteerSink)                {}
-func (e *faqJoinEngine) SetMemoryPrompt(prompt string)               { e.memory = prompt }
-func (e *faqJoinEngine) SetFAQPreflightQuestions(questions []string) { e.questions = questions }
-func (e *faqJoinEngine) ApplyFAQPreflight(_ *types.TokenUsage, _ []string, rejections map[string]types.FAQPreflightRejection) {
-	e.rejections = rejections
+func (e *faqJoinEngine) SetFAQBroadDocumentSearch(query string) { e.broadQuery = query }
+func (e *faqJoinEngine) SetSteerSink(types.SteerSink)           {}
+func (e *faqJoinEngine) SetMemoryPrompt(prompt string)          { e.memory = prompt }
+func (e *faqJoinEngine) ApplyFAQPreflight(usage *types.TokenUsage, questions []string, rejections map[string]types.FAQPreflightRejection) {
+	e.usage, e.questions, e.rejections = usage, questions, rejections
 }
 
 type faqJoinService struct {
@@ -192,10 +192,9 @@ func TestAgentQAJoinsParallelFAQPreflight(t *testing.T) {
 			require.False(t, engine.cleaned)
 			require.Equal(t, 1, memories)
 			require.Equal(t, "remembered", engine.memory)
-			require.NotNil(t, svc.config.FAQPreflightUsage)
-			require.Equal(t, 7, svc.config.FAQPreflightUsage.TotalTokens)
-			require.Equal(t, []string{"支付问题"}, svc.config.FAQPreflightQuestions)
-			require.Equal(t, svc.config.FAQPreflightQuestions, engine.questions)
+			require.NotNil(t, engine.usage)
+			require.Equal(t, 7, engine.usage.TotalTokens)
+			require.Equal(t, []string{"支付问题"}, engine.questions)
 			if tc.live {
 				require.Equal(t, "支付问题", engine.rejections["faq"].Question)
 				require.Contains(t, engine.rejections["faq"].Reason, "requires live data")

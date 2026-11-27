@@ -2,51 +2,28 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"html"
 	"regexp"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/agent/tools"
-	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 )
 
-// Buffer drafts only when retrieval admission or a known missing field can change the answer.
+// holdRetrievalAnswer returns false under deterministic RuntimeRetrieval so
+// first-round streaming never stalls waiting for a synchronous LLM judge.
 func (e *AgentEngine) holdRetrievalAnswer() bool {
-	if e.retrieval == nil {
-		return false
-	}
-	c := e.retrieval
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return e.retrievalGuard && len(c.state.Gaps) == 0 || len(c.missingUserFields()) > 0
+	return false
 }
 
-// publicAnswer degrades optional guard failures to the cleaned original answer.
+// publicAnswer applies deterministic post-processing (fixed response expansion,
+// reference URL whitelist sanitization, and extension hooks).
 // Cancellation and persistence failures remain fatal.
-func (e *AgentEngine) publicAnswer(ctx context.Context, content string, messages []chat.Message) (string, error) {
-	answer, err := e.publicAnswerChecked(ctx, content, messages)
-	if err != nil && ctx.Err() == nil && !errors.Is(err, errRetrievalStateSave) {
-		logger.Warnf(ctx, "[Agent][PublicAnswer] degraded to original answer: %v", err)
-		clean := tools.StripThinkBlocks(content)
-		if strings.TrimSpace(clean) == "" {
-			clean = e.fallbackAnswer()
-		}
-		answer, err = e.enforceMissingConditions(ctx, clean), nil
+func (e *AgentEngine) publicAnswer(ctx context.Context, content string, _ []chat.Message) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	if err != nil {
-		return answer, err
-	}
-	if expanded, ok := expandFixedResponse(answer, e.config.FixedResponses); ok {
-		return expanded, nil
-	}
-	answer = e.sanitizeReferenceSection(answer)
-	return e.sanitizeFollowUpButtons(answer), nil
-}
-
-func (e *AgentEngine) publicAnswerChecked(ctx context.Context, content string, messages []chat.Message) (answer string, err error) {
 	if e.retrieval != nil {
 		e.retrieval.mu.Lock()
 		failed := e.retrieval.persistenceFailed
@@ -55,96 +32,12 @@ func (e *AgentEngine) publicAnswerChecked(ctx context.Context, content string, m
 			return "", errRetrievalStateSave
 		}
 	}
-	defer func() {
-		if err == nil {
-			if ctx.Err() != nil {
-				answer, err = "", ctx.Err()
-				return
-			}
-			answer = e.enforceMissingConditions(ctx, answer)
-			if ctx.Err() != nil {
-				answer, err = "", ctx.Err()
-			}
-		}
-	}()
-	e.retrievalGateMu.Lock()
-	err = e.resolveProjectConditions(ctx)
-	e.retrievalGateMu.Unlock()
-	if err != nil {
-		return "", err
+	answer := tools.StripThinkBlocks(content)
+	if expanded, ok := expandFixedResponseWithStripper(answer, e.config.FixedResponses, e.extHooks().StripFollowUpButtons); ok {
+		return expanded, nil
 	}
-	// A turn that registered no retrieval fact still gets one admission check:
-	// business rules may require user fields before any answer is usable, and
-	// that decision must not wait for a search the model never ran. Only a
-	// confirmed needs_user acts on it. Any other verdict — including an
-	// unconfirmed stop — leaves the answer untouched: replacing a usable answer
-	// with the stalled fallback turned a guard opinion into a lost turn.
-	if e.retrievalGuard && e.retrieval != nil && len(e.retrieval.snapshot().Gaps) == 0 {
-		verdict, err := e.retrievalAdmission(ctx, "fact", map[string]any{"current_input": e.retrievalUserMessage.text, "goal": e.retrieval.snapshot().Goal})
-		switch {
-		case errors.Is(err, errRetrievalGuardUnavailable):
-			logger.Warnf(ctx, "Retrieval boundary check unavailable for a direct answer; publishing it unchanged: %v", err)
-		case err != nil:
-			return "", err
-		case verdict.Decision == "needs_user":
-			if _, err := clarificationFields(verdict.MissingUserFields); err != nil {
-				return "", err
-			}
-			goal := e.retrieval.snapshot().Goal
-			if err := e.retrieval.applyReview(retrievalReview{NewFact: &retrievalFactProposal{GoalQuote: goal, Fact: goal}, Status: retrievalNeedsUser, MissingUserFields: verdict.MissingUserFields, independentRequests: verdict.IndependentRequests}); err != nil {
-				return "", err
-			}
-		case verdict.Decision != "allow":
-			logger.Infof(ctx, "Direct answer kept: the boundary check returned %q without confirming required user fields", verdict.Decision)
-		}
-	}
-	clean := tools.StripThinkBlocks(content)
-	if strings.TrimSpace(clean) != "" {
-		return clean, nil
-	}
-	if e.retrieval != nil {
-		var fields []string
-		for _, g := range e.retrieval.snapshot().Gaps {
-			if g.Status == retrievalNeedsUser {
-				fields = append(fields, g.MissingUserFields...)
-			}
-		}
-		if len(fields) > 0 {
-			return missingConditionsQuestion(fields), nil
-		}
-	}
-	// Nothing publishable arrived. The loop's empty-content guard retries an
-	// empty round, so no repair call is spent here. The repair used to exist to
-	// rescue a draft made entirely of process narration — a heuristic that
-	// deleted whole sentences from otherwise good answers, and is gone.
-	return "", nil
-}
-
-// Hold a clarification-only draft while another requested fact can still be handled.
-func (e *AgentEngine) clarificationLeavesIndependentWork(answer string) bool {
-	if !e.retrievalGuard || e.retrieval == nil {
-		return false
-	}
-	c := e.retrieval
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	fields := c.missingUserFields()
-	if len(fields) == 0 {
-		return false
-	}
-	for _, g := range c.state.Gaps {
-		if g.Derived || !retrievalScopeCovers(c.state.Scope, g.Scope) || c.checkDependencies(&g) != nil {
-			continue
-		}
-		if g.Status == retrievalPending || (answer == missingConditionsQuestion(fields) && c.evidenceAvailable(&g)) {
-			return true
-		}
-	}
-	return false
-}
-
-func missingConditionsQuestion(fields []string) string {
-	return "方便提供一下" + strings.Join(fields, "、") + "吗？"
+	answer = e.sanitizeReferenceSection(answer)
+	return e.extHooks().PostProcessAnswer(e, answer), nil
 }
 
 func (e *AgentEngine) isRuntimeFallbackAnswer(content string) bool {
@@ -152,54 +45,7 @@ func (e *AgentEngine) isRuntimeFallbackAnswer(content string) bool {
 		content != "" && content == e.configuredFallback()
 }
 
-// Every publication path, including repaired drafts, inherits the live blockers.
-func (e *AgentEngine) enforceMissingConditions(ctx context.Context, content string) string {
-	if e.retrieval == nil {
-		return content
-	}
-	c := &retrievalControl{state: e.retrieval.snapshot()}
-	fields := c.missingUserFields()
-	var supported []retrievalGap
-	for _, g := range c.state.Gaps {
-		if !retrievalScopeCovers(c.state.Scope, g.Scope) || !c.factNeeded(&g, make(map[string]bool)) {
-			continue
-		}
-		if !g.Derived && c.evidenceAvailable(&g) && c.checkDependencies(&g) == nil {
-			supported = append(supported, g)
-		}
-	}
-	if len(fields) == 0 {
-		return content
-	}
-	question := missingConditionsQuestion(fields)
-	if content == question {
-		return question
-	}
-	if e.retrievalGuard && strings.TrimSpace(content) != "" {
-		verdict, err := e.retrievalAdmission(ctx, "blocked_answer", map[string]any{"candidate": content, "supported_independent_facts": supported, "missing_user_fields": fields})
-		if err == nil && verdict.Decision == "allow" {
-			if verdict.ClarificationComplete {
-				return content
-			}
-			if len(supported) > 0 {
-				return content + "\n\n" + question
-			}
-		}
-	}
-	return question
-}
-
-const maxFollowUpButtons = 3
-
 var (
-	buttonSend = regexp.MustCompile(`(?m)^[ \t]*<button-send>([^<>]+)</button-send>[ \t]*\n?`)
-	// Match standalone button lines (single or multiple buttons on one line),
-	// optionally prefixed with list numbers or bullets.
-	buttonSendLine      = regexp.MustCompile(`^[ \t]*(?:(?:\d+[.)、]|[-*+•])[ \t]+)?<button-send>([^<>]+)</button-send>[ \t]*$`)
-	buttonSendTag       = regexp.MustCompile(`<button-send>([^<>]*)</button-send>`)
-	buttonSendLineMulti = regexp.MustCompile(`^[ \t]*(?:(?:\d+[.)、]|[-*+•])[ \t]+)?(?:<button-send>[^<>]*</button-send>[ \t,;，；、|/]*)+$`)
-	inlineButtonSend    = regexp.MustCompile(`<button-send>.*?</button-send>`)
-	followUpHeadingLine = regexp.MustCompile(`(?i)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*{1,2})?[ \t]*(?:相关问题|猜你想问|你可能还想问|您可能还想问|推荐问题|延伸问题|继续提问|下一步(?:建议|可问|问题)?|related questions|follow-up questions|suggested questions)[ \t：:]*(?:\*{1,2})?[ \t：:]*$`)
 	referenceHeading    = regexp.MustCompile(`^[ \t]*#{2,3}[ \t]+参考来源[ \t：:\r]*$`)
 	markdownHeadingLine = regexp.MustCompile(`^[ \t]*#{1,6}[ \t]+`)
 	htmlAnchorTag       = regexp.MustCompile(`(?i)<a\b[^>]*>`)
@@ -207,9 +53,6 @@ var (
 	bareHTTPURL         = regexp.MustCompile(`(?i)https?://[^\s<>"'` + "`" + `\\，。；！？、（）【】]+`)
 	verifiedCitationTag = regexp.MustCompile(`<(?:kb|web)\b[^>]*/?>`)
 	referenceListPrefix = regexp.MustCompile(`^[ \t]*(?:[-*+•]|\d+[.)、])[ \t]+`)
-	noAnswerOrRefusal   = regexp.MustCompile(`(?:无法回答与[^。！？\n]{0,24}无关|超出(?:服务|解答|支持)范围|(?:当前)?知识库(?:中)?(?:没有|未)(?:查询到|找到|检索到)[^。！？\n]{0,30}(?:解答|答案|对应|相关))`)
-	// "X 不支持 Y", "X：不支持", "| X | 不支持 |" — X and Y stop at clause/cell boundaries.
-	unsupportedClaim = regexp.MustCompile(`([^，,。；;！!？?\n|：:]*?)[\s|：:]*(?:暂|目前|均|都|并|尚|还|也)*不支持([^，,。；;！!？?\n|]*)`)
 )
 
 func (e *AgentEngine) isFixedResponseValue(trimmed string) bool {
@@ -225,27 +68,7 @@ func (e *AgentEngine) isFixedResponseValue(trimmed string) bool {
 }
 
 func (e *AgentEngine) hasMissingUserFields() bool {
-	if e == nil || e.retrieval == nil {
-		return false
-	}
-	return len((&retrievalControl{state: e.retrieval.snapshot()}).missingUserFields()) > 0
-}
-
-func (e *AgentEngine) isNoAnswerOrRefusalBody(body string) bool {
-	trimmed := strings.TrimSpace(body)
-	if trimmed == "" || e.isRuntimeFallbackAnswer(trimmed) || e.isFixedResponseValue(trimmed) {
-		return true
-	}
-	candidate := strings.TrimSpace(stripTrailingReferenceSection(unwrapOuterMarkdownFence(trimmed)))
-	if candidate == "" || e.isRuntimeFallbackAnswer(candidate) || e.isFixedResponseValue(candidate) {
-		return true
-	}
-	semanticBody := strings.TrimSpace(unfencedText(stripTrailingReferenceSection(trimmed)))
-	if len([]rune(semanticBody)) <= 220 && !strings.HasPrefix(semanticBody, "## ") && !strings.Contains(semanticBody, "\n## ") &&
-		noAnswerOrRefusal.MatchString(semanticBody) {
-		return true
-	}
-	return false
+	return e != nil && e.retrieval != nil && e.retrieval.isAwaitingUserInput()
 }
 
 // isFenceToggleLine returns whether line opens or closes a fenced code block,
@@ -665,198 +488,4 @@ func (e *AgentEngine) sanitizeReferenceSection(answer string) string {
 		}
 	}
 	return strings.TrimRight(strings.Join(parts, "\n\n"), " \t\r\n")
-}
-
-// removePrecedingFollowUpHeading clears a standalone "相关问题" heading directly
-// above a removed or normalized button block (skipping blank lines).
-func removePrecedingFollowUpHeading(lines []string, removed []bool, from int) {
-	for i := from - 1; i >= 0; i-- {
-		if removed[i] || strings.TrimSpace(lines[i]) == "" {
-			continue
-		}
-		if followUpHeadingLine.MatchString(lines[i]) {
-			removed[i] = true
-		}
-		return
-	}
-}
-
-// stripFollowUpButtons removes all <button-send> tags and any standalone
-// follow-up heading immediately preceding them.
-func stripFollowUpButtons(answer string) string {
-	if !strings.Contains(answer, "<button-send>") {
-		return answer
-	}
-	lines := strings.Split(answer, "\n")
-	removed := make([]bool, len(lines))
-	protected := fencedLines(lines)
-	for i, line := range lines {
-		if !protected[i] && (buttonSendLineMulti.MatchString(line) || buttonSendLine.MatchString(line)) {
-			removed[i] = true
-			removePrecedingFollowUpHeading(lines, removed, i)
-		}
-	}
-	out := make([]string, 0, len(lines))
-	for i, line := range lines {
-		if removed[i] {
-			continue
-		}
-		if !protected[i] && strings.Contains(line, "<button-send>") {
-			cleaned := strings.TrimSpace(inlineButtonSend.ReplaceAllString(line, ""))
-			if cleaned == "" {
-				continue
-			}
-			line = cleaned
-		}
-		out = append(out, line)
-	}
-	return strings.TrimRight(strings.Join(out, "\n"), " \t\r\n")
-}
-
-// sanitizeFollowUpButtons enforces deterministic <button-send> rules at answer
-// publication: strip all buttons on fallback/refusal/clarification turns, and
-// normalize, split multi-button lines, deduplicate, drop contradicted items,
-// and cap to 3 on normal turns.
-func (e *AgentEngine) sanitizeFollowUpButtons(answer string) string {
-	if !strings.Contains(answer, "<button-send>") {
-		return answer
-	}
-	body := stripFollowUpButtons(answer)
-	if e.hasMissingUserFields() || e.isNoAnswerOrRefusalBody(body) {
-		return body
-	}
-
-	rawLines := strings.Split(answer, "\n")
-	lines := make([]string, 0, len(rawLines))
-	hadDroppedEmptyButton := false
-	rawProtected := fencedLines(rawLines)
-	for i, line := range rawLines {
-		if !rawProtected[i] && buttonSendLineMulti.MatchString(line) {
-			matches := buttonSendTag.FindAllStringSubmatch(line, -1)
-			emittedAny := false
-			for _, m := range matches {
-				text := strings.TrimSpace(m[1])
-				if text == "" {
-					hadDroppedEmptyButton = true
-					continue
-				}
-				lines = append(lines, "<button-send>"+text+"</button-send>")
-				emittedAny = true
-			}
-			if !emittedAny && hadDroppedEmptyButton {
-				// Leave a marker blank removal for preceding follow-up heading cleanup below.
-				for j := len(lines) - 1; j >= 0; j-- {
-					if strings.TrimSpace(lines[j]) == "" {
-						continue
-					}
-					if followUpHeadingLine.MatchString(lines[j]) {
-						lines = append(lines[:j], lines[j+1:]...)
-					}
-					break
-				}
-			}
-			continue
-		}
-		lines = append(lines, line)
-	}
-
-	removed := make([]bool, len(lines))
-	seen := make(map[string]bool)
-	protected := fencedLines(lines)
-	for i, line := range lines {
-		if protected[i] {
-			continue
-		}
-		match := buttonSendLine.FindStringSubmatch(line)
-		if match == nil {
-			continue
-		}
-		removePrecedingFollowUpHeading(lines, removed, i)
-		text := strings.TrimSpace(match[1])
-		if text == "" || seen[text] {
-			removed[i] = true
-			continue
-		}
-		seen[text] = true
-		lines[i] = "<button-send>" + text + "</button-send>"
-	}
-	normalized := make([]string, 0, len(lines))
-	for i, line := range lines {
-		if !removed[i] {
-			normalized = append(normalized, line)
-		}
-	}
-
-	filtered := dropContradictedButtons(strings.Join(normalized, "\n"))
-
-	filteredLines := strings.Split(filtered, "\n")
-	capped := make([]string, 0, len(filteredLines))
-	keptButtons := 0
-	filteredProtected := fencedLines(filteredLines)
-	for i, line := range filteredLines {
-		if !filteredProtected[i] && buttonSendLine.MatchString(line) {
-			if keptButtons >= maxFollowUpButtons {
-				continue
-			}
-			keptButtons++
-		}
-		capped = append(capped, line)
-	}
-	return strings.TrimRight(strings.Join(capped, "\n"), " \t\r\n")
-}
-
-// claimPart trims list/table/quote markers; deictic subjects ("该SDK") and
-// one-rune leftovers carry no matchable name.
-func claimPart(s string, subject bool) string {
-	s = strings.Trim(s, " \t-*+#>")
-	if subject {
-		for _, p := range []string{"该", "本", "此", "这", "当前"} {
-			if strings.HasPrefix(s, p) {
-				return ""
-			}
-		}
-	}
-	if len([]rune(s)) < 2 {
-		return ""
-	}
-	return s
-}
-
-// dropContradictedButtons removes follow-up buttons that name what the body
-// itself declared unsupported: both subject and object when the claim has both
-// ("抖音小游戏不支持沙盒支付" drops "抖音小游戏沙盒支付怎么配置", keeps
-// "微信小游戏沙盒支付怎么配置"). The body text is never modified.
-// ponytail: substring match on clause parts; long objects ("不支持在iOS上使用X")
-// slip through — upgrade to structured support decisions if evals show misses.
-func dropContradictedButtons(answer string) string {
-	body := buttonSend.ReplaceAllString(unfencedText(answer), "")
-	var claims [][2]string
-	for _, m := range unsupportedClaim.FindAllStringSubmatch(body, -1) {
-		if strings.HasSuffix(m[1], "非") || strings.HasSuffix(m[1], "否") { // 并非不支持 / 是否不支持
-			continue
-		}
-		if c := [2]string{claimPart(m[1], true), claimPart(m[2], false)}; c[0] != "" || c[1] != "" {
-			claims = append(claims, c)
-		}
-	}
-	if len(claims) == 0 {
-		return answer
-	}
-	lines := strings.SplitAfter(answer, "\n")
-	protected := fencedLines(lines)
-	for i, line := range lines {
-		if protected[i] {
-			continue
-		}
-		lines[i] = buttonSend.ReplaceAllStringFunc(line, func(line string) string {
-			text := buttonSend.FindStringSubmatch(line)[1]
-			for _, c := range claims {
-				if (c[0] == "" || strings.Contains(text, c[0])) && (c[1] == "" || strings.Contains(text, c[1])) {
-					return ""
-				}
-			}
-			return line
-		})
-	}
-	return strings.Join(lines, "")
 }

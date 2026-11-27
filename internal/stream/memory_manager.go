@@ -20,6 +20,7 @@ type memoryStreamData struct {
 type liveRunMarker struct {
 	assistantMessageID string
 	requestID          string
+	expiresAt          time.Time
 }
 
 // MemoryStreamManager implements StreamManager using in-memory storage
@@ -29,8 +30,38 @@ type MemoryStreamManager struct {
 	// Map: sessionID -> the run currently generating. Single-process only,
 	// which is exactly why the memory backend is not suitable for a
 	// multi-replica deployment (see stream.NewStreamManager).
-	liveRuns map[string]liveRunMarker
-	mu       sync.RWMutex
+	liveRuns   map[string]liveRunMarker
+	liveRunTTL time.Duration
+	mu         sync.RWMutex
+}
+
+// WithLiveRunTTL overrides the live-run lease TTL (default 2m).
+func (m *MemoryStreamManager) WithLiveRunTTL(ttl time.Duration) *MemoryStreamManager {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ttl > 0 {
+		m.liveRunTTL = ttl
+	}
+	return m
+}
+
+func (m *MemoryStreamManager) effectiveLiveRunTTL() time.Duration {
+	if m.liveRunTTL > 0 {
+		return m.liveRunTTL
+	}
+	return defaultLiveRunTTL
+}
+
+func (m *MemoryStreamManager) activeLiveRunLocked(sessionID string, now time.Time) (liveRunMarker, bool) {
+	marker, ok := m.liveRuns[sessionID]
+	if !ok {
+		return liveRunMarker{}, false
+	}
+	if !marker.expiresAt.IsZero() && !now.Before(marker.expiresAt) {
+		delete(m.liveRuns, sessionID)
+		return liveRunMarker{}, false
+	}
+	return marker, true
 }
 
 // NewMemoryStreamManager creates a new in-memory stream manager
@@ -80,8 +111,6 @@ func (m *MemoryStreamManager) AppendEvent(
 	stream := m.getOrCreateStream(sessionID, messageID)
 
 	stream.mu.Lock()
-	defer stream.mu.Unlock()
-
 	// Set timestamp if not already set
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
@@ -90,6 +119,9 @@ func (m *MemoryStreamManager) AppendEvent(
 	// Append event
 	stream.events = append(stream.events, event)
 	stream.lastUpdated = time.Now()
+	stream.mu.Unlock()
+
+	_, _ = m.RefreshLiveRun(ctx, sessionID, messageID)
 
 	return nil
 }
@@ -271,26 +303,38 @@ func (m *MemoryStreamManager) SetLiveRun(
 ) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if existing, ok := m.liveRuns[sessionID]; ok && existing.assistantMessageID != assistantMessageID {
+	now := time.Now()
+	if existing, ok := m.activeLiveRunLocked(sessionID, now); ok && existing.assistantMessageID != assistantMessageID {
 		return ErrLiveRunExists
 	}
 	m.liveRuns[sessionID] = liveRunMarker{
 		assistantMessageID: assistantMessageID,
 		requestID:          requestID,
+		expiresAt:          now.Add(m.effectiveLiveRunTTL()),
 	}
 	return nil
 }
 
-// ClaimLiveRun overwrites the live-run marker for follow-up handoff.
+// ClaimLiveRun atomically hands off the live-run marker from
+// expectedAssistantID to assistantMessageID.
 func (m *MemoryStreamManager) ClaimLiveRun(
 	_ context.Context,
-	sessionID, assistantMessageID, requestID string,
+	sessionID, expectedAssistantID, assistantMessageID, requestID string,
 ) error {
+	if expectedAssistantID == "" || assistantMessageID == "" {
+		return ErrLiveRunExists
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
+	existing, ok := m.activeLiveRunLocked(sessionID, now)
+	if !ok || (existing.assistantMessageID != expectedAssistantID && existing.assistantMessageID != assistantMessageID) {
+		return ErrLiveRunExists
+	}
 	m.liveRuns[sessionID] = liveRunMarker{
 		assistantMessageID: assistantMessageID,
 		requestID:          requestID,
+		expiresAt:          now.Add(m.effectiveLiveRunTTL()),
 	}
 	return nil
 }
@@ -300,13 +344,34 @@ func (m *MemoryStreamManager) GetLiveRun(
 	_ context.Context,
 	sessionID string,
 ) (string, string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	marker, ok := m.liveRuns[sessionID]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	marker, ok := m.activeLiveRunLocked(sessionID, time.Now())
 	if !ok {
 		return "", "", nil
 	}
 	return marker.assistantMessageID, marker.requestID, nil
+}
+
+// RefreshLiveRun extends the live-run lease only while the marker still points
+// at assistantMessageID.
+func (m *MemoryStreamManager) RefreshLiveRun(
+	_ context.Context,
+	sessionID, assistantMessageID string,
+) (bool, error) {
+	if sessionID == "" || assistantMessageID == "" {
+		return false, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	marker, ok := m.activeLiveRunLocked(sessionID, now)
+	if !ok || marker.assistantMessageID != assistantMessageID {
+		return false, nil
+	}
+	marker.expiresAt = now.Add(m.effectiveLiveRunTTL())
+	m.liveRuns[sessionID] = marker
+	return true, nil
 }
 
 // ClearLiveRun drops the marker only when it still points at assistantMessageID.

@@ -84,24 +84,19 @@ type AgentEngine struct {
 	// contextRewrites counts compactions and tool-result trims. Either one
 	// changes messages an earlier request already sent, so the next request
 	// cannot be compared with that one for calibration.
-	contextRewrites          int
-	modelContext             *modelcontext.Registry // single request-local boundary for every model handle
-	retrieval                *retrievalControl
-	retrievalGateMu          sync.Mutex
-	retrievalGuard           bool
-	runtimeRetrieval         bool
-	retrievalSearchGapID     string
-	retrievalSearchInputID   string
-	retrievalProjectReviewed string
-	retrievalHistory         []string
-	retrievalPrevious        json.RawMessage
-	turnShownChunks          map[string]bool
-	retrievalSave            func(context.Context, json.RawMessage) error
-	retrievalTurnID          string
-	turnHasWikiSearch        bool // the tool calls being executed include wiki_search
-	faqBroadDocumentQuery    string
-	retrievalUserMessage     struct{ id, text string }
-	fastChatModel            chat.Chat
+	contextRewrites       int
+	modelContext          *modelcontext.Registry // single request-local boundary for every model handle
+	retrieval             *retrievalControl
+	retrievalGateMu       sync.Mutex
+	runtimeRetrieval      bool
+	retrievalPrevious     json.RawMessage
+	turnShownChunks       map[string]bool
+	retrievalSave         func(context.Context, json.RawMessage) error
+	retrievalTurnID       string
+	turnHasWikiSearch     bool // the tool calls being executed include wiki_search
+	faqBroadDocumentQuery string
+	retrievalUserMessage  struct{ id, text string }
+	fastChatModel         chat.Chat
 	// steerSink, when set, lets users append messages into the running turn.
 	// Drained at every round boundary; nil disables mid-run injection.
 	steerSink         types.SteerSink
@@ -125,6 +120,8 @@ type AgentEngine struct {
 	progress turnProgress
 	// Hold speculative parent prose until delegated work has been reviewed.
 	holdCollaborationAnswer bool
+	// hooks holds optional downstream vertical extensions (defaults to GameSDKHooks).
+	hooks EngineHooks
 }
 
 // maxSteerOverruns caps loop-end injects past MaxIterations. One extra round
@@ -287,9 +284,6 @@ func (e *AgentEngine) buildSystemPrompt(ctx context.Context) string {
 		logger.Debugf(ctx, "[Agent][Prompt] section=%s bytes=%d", section.Name, len(section.Content))
 	}
 	prompt := renderSystemPromptSections(sections) + e.collaborationGuidance()
-	if e.retrievalGuard && e.retrieval != nil {
-		prompt += "\n\n" + questionSearchGuidance()
-	}
 	if e.runNote != "" {
 		prompt += "\n\n" + e.runNote
 	}
@@ -497,7 +491,6 @@ func (e *AgentEngine) Execute(
 		imgs = imageURLs[0]
 	}
 	e.beginTurn(query, imgs, state)
-	e.setRetrievalHistory(llmContext)
 	if e.retrieval != nil {
 		e.retrievalTurnID = messageID
 	}
@@ -527,14 +520,7 @@ func (e *AgentEngine) Execute(
 		"tool_count": len(tools),
 		"tools":      toolListStr,
 	})
-	if plan, ok := e.maybePlan(ctx, query, messages, state); ok {
-		state.Plan = plan
-		messages = append(messages, planInstruction(plan))
-		e.emitPlanProgress(ctx, plan, sessionID, state.CurrentRound)
-		common.PipelineInfo(ctx, "Agent", "plan_injected", map[string]interface{}{
-			"session_id": sessionID, "steps": len(plan.Steps),
-		})
-	}
+	e.planStart(ctx, query, state, &messages, sessionID)
 
 	_, err = e.executeLoop(ctx, state, query, messages, tools, sessionID, messageID)
 	if err != nil {
@@ -795,7 +781,7 @@ func (e *AgentEngine) finishStalledTurn(
 	// answer would show an opening line and call the turn finished, so the
 	// fallback speaks for it instead.
 	answer := response.Content
-	if len(response.ToolCalls) > 0 || planInProgress(state) || state.Plan != nil && isPrivatePlanReport(answer) {
+	if len(response.ToolCalls) > 0 || e.planShouldSuppressAnswer(state, answer) {
 		answer = ""
 	}
 	// The guard stopped a model that produced no usable text, but this turn may
@@ -1133,7 +1119,7 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, err
 		}
 	}
-	if guards.childAnswerRevised || planInProgress(state) && state.Plan.ReportRetries > 0 {
+	if guards.childAnswerRevised || e.planRestrictsTools(state) {
 		tools = nil
 	}
 	// Background-work context rides the same boundary for the same reasons,
@@ -1332,57 +1318,8 @@ func (e *AgentEngine) runReActIteration(
 		}
 		return iterOutcomeBreak, nil
 	}
-	if planInProgress(state) && state.Plan.ReportRetries > 0 && len(response.ToolCalls) > 0 {
-		e.failToolCalls(ctx, response, &step, state.CurrentRound, sessionID, "Tool calls are not allowed while repairing a step report.")
-		state.RoundSteps = append(state.RoundSteps, step)
-		*messagesPtr = e.appendToolResults(*messagesPtr, step)
-		state.Plan.ReportRetries = 0
-		completePlanStep(state.Plan, `{"status":"blocked","result":"The step report could not be repaired without another tool call."}`)
-		*messagesPtr = append(*messagesPtr, planFinalInstruction(state.Plan))
-		return iterOutcomeNext, nil
-	}
-	if state.Plan != nil && state.Plan.Current < len(state.Plan.Steps) &&
-		(isNaturalStopFinishReason(response.FinishReason) || isLengthFinishReason(response.FinishReason)) &&
-		len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
-		step.IntermediateAnswer = true
-		step.PlanReport = true
-		state.RoundSteps = append(state.RoundSteps, step)
-		*messagesPtr = append(*messagesPtr, chat.Message{Role: "assistant", Content: response.Content,
-			ReasoningContent: response.ReasoningContent, ReasoningSignature: response.ReasoningSignature,
-			ReasoningMetadata: response.ReasoningMetadata})
-		waiting, err := e.waitPlanCollaboration(ctx, state, messagesPtr)
-		if err != nil {
-			return iterOutcomeBreak, err
-		}
-		if !waiting {
-			content := response.Content
-			if isLengthFinishReason(response.FinishReason) {
-				content = `{"status":"blocked","result":"The step response was truncated."}`
-			}
-			if !isLengthFinishReason(response.FinishReason) && !validPlanReport(content) && state.Plan.ReportRetries == 0 {
-				state.Plan.ReportRetries++
-			} else {
-				state.Plan.ReportRetries = 0
-				content = checkPlanToolResults(state, content)
-				completePlanStep(state.Plan, content)
-				if state.Plan.Current < len(state.Plan.Steps) {
-					state.Plan.Steps[state.Plan.Current].StartStep = len(state.RoundSteps)
-				}
-			}
-		}
-		nextRound := state.CurrentRound + 1
-		if e.withinIterationBudget(nextRound) || e.steerOverruns < maxSteerOverruns {
-			injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
-			injected += e.injectBackground(ctx, state, messagesPtr, true)
-			if injected > 0 && !e.withinIterationBudget(nextRound) {
-				e.steerOverruns++
-				e.allowSteerOverrun = true
-			}
-		}
-		*messagesPtr = append(*messagesPtr, planInstruction(state.Plan))
-		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound+1)
-		guards.sawPlainRound = false
-		return iterOutcomeNext, nil
+	if handled, outcome, err := e.planHandleRound(ctx, state, response, &step, messagesPtr, guards, sessionID, assistantMessageID); handled {
+		return outcome, err
 	}
 
 	// A delegated deliverable must not silently become a partial success. Give
@@ -1431,7 +1368,7 @@ func (e *AgentEngine) runReActIteration(
 			return iterOutcomeBreak, nil
 		}
 		buttonsRan = true
-		if !planInProgress(state) && toolCallsSucceeded(step.ToolCalls) {
+		if !e.planActive(state) && toolCallsSucceeded(step.ToolCalls) {
 			answer := *response
 			answer.ToolCalls, answer.FinishReason = nil, "stop"
 			answer.Content, err = e.publicAnswer(ctx, response.Content, *messagesPtr)
@@ -1444,16 +1381,6 @@ func (e *AgentEngine) runReActIteration(
 			}
 			analyzed = &answer
 		}
-	}
-	if !guards.independentWorkRetried && len(tools) > 0 && len(response.ToolCalls) == 0 && isNaturalStopFinishReason(response.FinishReason) &&
-		!planInProgress(state) && e.withinIterationBudget(state.CurrentRound+1) && e.clarificationLeavesIndependentWork(analyzed.Content) {
-		guards.independentWorkRetried = true
-		guards.pendingRuntimeNotice = "An independent part of the user request remains. Use its registered gap to retrieve or record existing evidence, then include its answer or precise limitation alongside the clarification. Keep dependent work stopped."
-		state.PendingSteerMessages = step.UserMessagesBefore
-		state.PendingBackground = step.BackgroundInjections
-		// The retry opens a new answer event; retract a draft this round already streamed.
-		e.retractAnswer(ctx, sessionID, response.AnswerEventID)
-		return iterOutcomeContinue, nil
 	}
 	verdict := e.analyzeResponse(ctx, analyzed, step, state.CurrentRound, sessionID, roundStart)
 	if verdict.isDone {
@@ -1662,7 +1589,7 @@ func (e *AgentEngine) runReActIteration(
 		repeatedToolCount  int
 	)
 	for _, toolCall := range step.ToolCalls {
-		if e.retrieval != nil && (kbToolNames[toolCall.Name] || toolCall.Name == reviewRetrievalTool) {
+		if e.retrieval != nil && kbToolNames[toolCall.Name] {
 			continue
 		}
 		if name, attempts, shouldNudge := guards.recordFailedToolCall(toolCall); shouldNudge {
@@ -1678,19 +1605,11 @@ func (e *AgentEngine) runReActIteration(
 	state.RoundSteps = append(state.RoundSteps, step)
 	*messagesPtr = e.appendToolResults(*messagesPtr, step)
 	*messagesPtr = e.appendToolImages(ctx, *messagesPtr, step)
+	if e.retrieval != nil && e.retrieval.hasPersistenceFailed() {
+		return iterOutcomeBreak, errRetrievalStateSave
+	}
 	if finished, err := e.finishUserQuestion(ctx, state, step, messagesPtr, sessionID, assistantMessageID); finished || err != nil {
 		return iterOutcomeBreak, err
-	}
-	if question := e.reviewedGoalQuestion(state, step); question != "" && e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID) == 0 {
-		if err := ctx.Err(); err != nil {
-			return iterOutcomeBreak, err
-		}
-		if err := e.eventBus.Emit(ctx, event.Event{ID: generateEventID("clarification"), Type: event.EventAgentFinalAnswer, SessionID: sessionID,
-			Data: event.AgentFinalAnswerData{Content: question, Done: true}}); err != nil {
-			return iterOutcomeBreak, err
-		}
-		state.FinalAnswer, state.IsComplete = question, true
-		return iterOutcomeBreak, nil
 	}
 	if e.onlyRejectedRetrievals(step) {
 		if e.retrieval.takeDecisionCorrection() {

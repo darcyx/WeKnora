@@ -1025,8 +1025,12 @@ func (m *transcriptStreamManager) SetLiveRun(context.Context, string, string, st
 	return nil
 }
 
-func (m *transcriptStreamManager) ClaimLiveRun(context.Context, string, string, string) error {
+func (m *transcriptStreamManager) ClaimLiveRun(context.Context, string, string, string, string) error {
 	return nil
+}
+
+func (m *transcriptStreamManager) RefreshLiveRun(context.Context, string, string) (bool, error) {
+	return true, nil
 }
 
 func (m *transcriptStreamManager) GetLiveRun(context.Context, string) (string, string, error) {

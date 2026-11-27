@@ -37,10 +37,13 @@ func retrievalScopeForTargets(targets types.SearchTargets) string {
 		if target == nil || target.KnowledgeBaseID == "" {
 			continue
 		}
-		item := retrievalSourceTarget{Type: target.Type, KBID: target.KnowledgeBaseID, TenantID: target.TenantID,
-			Documents: sortedRetrievalIDs(target.KnowledgeIDs)}
+		item := retrievalSourceTarget{
+			Type:      target.Type,
+			KBID:      target.KnowledgeBaseID,
+			TenantID:  target.TenantID,
+			Documents: sortedRetrievalIDs(target.KnowledgeIDs),
+		}
 		if len(item.Documents) > 0 {
-			// ScopeTagIDs may already be resolved into documents; physical TagIDs still intersect FAQ results.
 			item.Type = types.SearchTargetTypeKnowledge
 			item.Tags = sortedRetrievalIDs(target.TagIDs)
 		} else {
@@ -77,7 +80,6 @@ func retrievalScopeCovers(available, requested string) bool {
 }
 
 // Targets are a union; each target's document and physical tag filters intersect.
-// Unknown legacy scopes may only match exactly; their permissions cannot be guessed.
 func retrievalScopesCover(available []string, requested string) bool {
 	if slices.Contains(available, requested) {
 		return true
@@ -122,11 +124,10 @@ func retrievalScopesCover(available []string, requested string) bool {
 	return true
 }
 
-// An expanded scope may spend new allowances only on ranges absent from the old scope.
 func retrievalScopesOverlap(previous []string, requested string) bool {
 	wanted, ok := decodeRetrievalScope(requested)
 	if !ok {
-		return true // Unverified boundaries cannot establish an independent range.
+		return true
 	}
 	intersects := func(a, b []string) bool {
 		return len(a) == 0 || len(b) == 0 || slices.ContainsFunc(a, func(id string) bool { return slices.Contains(b, id) })
@@ -151,7 +152,6 @@ func retrievalScopesOverlap(previous []string, requested string) bool {
 	return false
 }
 
-// errRetrievalScopeUnverified marks a saved and a current scope that cannot be compared.
 var errRetrievalScopeUnverified = errors.New("retrieval scope has no verified source boundaries")
 
 func (c *retrievalControl) activateScope(scope string) error {
@@ -186,10 +186,8 @@ func restoreRetrievalForScope(saved retrievalState, scope string) (*retrievalCon
 	return c, nil
 }
 
-// restoreSavedRetrieval returns nil when the saved ledger is too old to read or
-// its scope cannot be compared with the current one: the caller keeps its fresh
-// ledger, which only forgets spent search allowances. Returning the error would
-// fail every later turn, because the stored ledger is never rewritten.
+// restoreSavedRetrieval returns nil when the saved ledger predates v3 or its
+// scope cannot be compared with the current one: the caller keeps a fresh ledger.
 func (e *AgentEngine) restoreSavedRetrieval(ctx context.Context, saved retrievalState) (*retrievalControl, error) {
 	for _, attempt := range saved.Attempts {
 		if attempt.Completed && attempt.Outcome == retrievalSuccess && kbToolNames[attempt.Tool] && !attempt.StructuredSources {
@@ -222,36 +220,6 @@ func (c *retrievalControl) restoreScopes() error {
 	return nil
 }
 
-func (c *retrievalControl) validateGapScope(g *retrievalGap) error {
-	if !slices.Contains(c.state.Scopes, g.Scope) {
-		return fmt.Errorf("fact has no registered source scope")
-	}
-	var priorScopes []string
-	parentFound := false
-	for i := range c.state.Gaps {
-		prior := &c.state.Gaps[i]
-		if prior.ID == g.ID {
-			break
-		}
-		if sameRetrievalFact(prior, g.Fact, g.Conditions) {
-			priorScopes = append(priorScopes, prior.Scope)
-			parentFound = parentFound || prior.ID == g.ScopeFrom
-		}
-	}
-	if len(priorScopes) == 0 && g.ScopeFrom == "" {
-		return nil
-	}
-	if !parentFound || retrievalScopesCover(priorScopes, g.Scope) {
-		return fmt.Errorf("fact scope revision must reference an earlier matching fact and add a verified source range")
-	}
-	for _, attempt := range c.state.Attempts {
-		if attempt.GapID == g.ID && retrievalScopesOverlap(priorScopes, attempt.Scope) {
-			return fmt.Errorf("expanded fact reservation includes an earlier source range")
-		}
-	}
-	return nil
-}
-
 func (c *retrievalControl) observationInScope(callID, tool string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -264,13 +232,12 @@ func (e *AgentEngine) retrievalResultInScope(call types.ToolCall) bool {
 		return true
 	}
 	if call.Result != nil && call.Result.Data[retrievalDispatchBlocked] == true {
-		return true // Rejected decisions contain feedback, not retrieved evidence.
+		return true
 	}
 	return e.retrieval.observationInScope(e.retrievalCallReference(call.ID), call.Name)
 }
 
-// Narrow only from selectors the actual tool consumes, never from ignored fields or query wording.
-// shortcut: only supported KB selectors narrow reservations; cross-scope readers still need verified document/chunk provenance.
+// Narrow only from selectors the actual tool consumes.
 func retrievalExecutionScope(scope, tool, arguments string) string {
 	if tool != "search_knowledge" && tool != "query_knowledge_graph" && tool != "wiki_search" {
 		return scope
@@ -287,14 +254,14 @@ func retrievalExecutionScope(scope, tool, arguments string) string {
 		return scope
 	}
 	if tool == "wiki_search" && args.KBID != "" {
-		args.KBIDs = append(args.KBIDs, args.KBID) // Wiki search unions its legacy singular selector.
+		args.KBIDs = append(args.KBIDs, args.KBID)
 	}
 	if len(args.KBIDs) == 0 {
 		return scope
 	}
 	for _, id := range args.KBIDs {
 		if !slices.ContainsFunc(parsed.Targets, func(t retrievalSourceTarget) bool { return t.KBID == id }) {
-			return scope // The tool still validates invalid parameters; do not infer an empty authorized scope.
+			return scope
 		}
 	}
 	parsed.Targets = slices.DeleteFunc(parsed.Targets, func(t retrievalSourceTarget) bool { return !slices.Contains(args.KBIDs, t.KBID) })

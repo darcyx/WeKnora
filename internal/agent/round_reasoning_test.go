@@ -34,28 +34,23 @@ func TestThinkingOffOnlyBeforeEvidence(t *testing.T) {
 	require.Equal(t, api.ReasoningMinimal, plain.roundReasoningEffort(ctx, tools), "no retrieval ledger, no signal")
 }
 
-func TestStableRetrievalToolsSurviveModeSwitch(t *testing.T) {
+func TestStableRetrievalToolsStayIdenticalAcrossSearches(t *testing.T) {
 	ctx := context.Background()
 	e, _ := newRuntimeRetrievalProbeEngine(t)
 	e.EnableRuntimeRetrieval()
-	e.toolRegistry.RegisterTool(&retrievalProbe{BaseTool: agenttools.NewBaseTool("read_document", "test reader", json.RawMessage(`{
-		"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false
-	}`))})
-	require.Len(t, e.buildToolsForLLM(), 2, "by default the runtime phase sends the original tools")
+	e.beginTurn("question", nil, &types.AgentState{})
+	require.Len(t, e.buildToolsForLLM(), 2, "runtime retrieval sends the original tools")
 	require.Empty(t, e.retrievalStatePrompt())
 
-	t.Setenv(stableRetrievalToolsEnv, "true")
 	before, err := json.Marshal(e.buildToolsForLLM())
 	require.NoError(t, err)
-	require.Contains(t, string(before), reviewRetrievalTool)
-	require.NotContains(t, string(before), `"required":["id","retrieval"]`, "metadata stays optional in both phases")
-	require.NotEmpty(t, e.retrievalStatePrompt(), "runtime-phase guidance rides the trailing notice")
+	require.NotContains(t, string(before), "review_retrieval")
+	require.NotContains(t, string(before), `"retrieval"`)
 
-	e.executeToolCallsParallel(ctx, searchCalls("a", "b", "c"), &types.AgentStep{}, 0, "session", "message")
-	require.False(t, e.usesRuntimeRetrieval(), "the search grace is spent, structured retrieval takes over")
+	e.executeToolCallsParallel(ctx, searchCalls("a", "b", "c", "d"), &types.AgentStep{}, 0, "session", "message")
 	after, err := json.Marshal(e.buildToolsForLLM())
 	require.NoError(t, err)
-	require.Equal(t, string(before), string(after), "the tool prefix must not change, or the cached history misses")
+	require.Equal(t, string(before), string(after), "the tool prefix must never mutate mid-turn, keeping prompt prefix cache warm")
 }
 
 func TestResourceNavigationFastAnswerUsesOneWikiAndProtectsOtherWork(t *testing.T) {
@@ -108,10 +103,10 @@ func TestResourceNavigationFastAnswerUsesOneWikiAndProtectsOtherWork(t *testing.
 }
 
 func TestResourceNavigationRunsWikiThenFastAnswer(t *testing.T) {
-	model := &runtimeRetrievalChat{mockChat: &mockChat{responses: []mockResponse{
+	model := &mockChat{responses: []mockResponse{
 		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "tool_calls", ToolCalls: []types.LLMToolCall{{ID: "read", Type: "function", Function: types.FunctionCall{Name: agenttools.ToolWikiReadPage, Arguments: `{"slugs":["backend"]}`}}}}}},
 		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "服务端文档介绍服务端联调。", Done: true, FinishReason: "stop"}}},
-	}}}
+	}}
 	e := newTestEngine(t, model)
 	e.config.ReasoningEffort = "minimal"
 	e.config.ResourceNavigationFastAnswer = true

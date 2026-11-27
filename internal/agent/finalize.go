@@ -42,10 +42,8 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// messages. Tool output must retain its role and call ID; never promote it
 	// into user instructions during error recovery or iteration-limit synthesis.
 	messages := append([]chat.Message(nil), conversation...)
-	if state.Plan != nil {
-		messages = append(messages, planFinalInstruction(state.Plan))
-	}
-	holdAnswer := state.Plan != nil || e.holdRetrievalAnswer()
+	e.planPrepareFinalSynthesis(state, &messages)
+	holdAnswer := e.planHoldsAnswer(state) || e.holdRetrievalAnswer()
 	runtimeNotice := "<runtime_event>{\"source\":\"runtime\",\"type\":\"final_synthesis\",\"message\":\"Tool " +
 		"execution has ended for this run. Respond to the current task, including the " +
 		"latest user corrections and source restrictions in the conversation. Base " +
@@ -61,22 +59,22 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// Generate a single ID for this entire final answer stream
 	answerID := generateEventID("answer")
 	logger.Debugf(ctx, "[Agent][FinalAnswer] AnswerID: %s", answerID)
-	var published strings.Builder
+	pipe := e.newStreamAnswerPipeline(ctx, streamAnswerPipelineConfig{
+		sessionID:           sessionID,
+		answerID:            answerID,
+		deferTerminalOnDone: true,
+		holdAnswer:          holdAnswer,
+	})
 	defer func() {
-		if retErr == nil || published.Len() == 0 {
+		if retErr == nil || pipe.StreamedLen() == 0 {
 			return
 		}
 		if ctx.Err() != nil {
-			state.FinalAnswer = published.String()
+			state.FinalAnswer = pipe.Streamed()
 		} else {
 			e.retractAnswer(ctx, sessionID, answerID)
 		}
 	}()
-	providerDone := false
-	terminalContent := ""
-	splitter := agenttools.NewThinkStreamSplitter()
-	sentinelGate := newFixedSentinelStreamGate(e.config.FixedResponses)
-	refGate := newReferenceSectionStreamGate()
 
 	var llmResult *streamLLMResult
 	var err error
@@ -112,43 +110,10 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			},
 			func(chunk *types.StreamResponse, _ string) {
 				// Defensive filter: only emit answer content, skip thinking chunks
-				if holdAnswer || chunk.ResponseType == types.ResponseTypeThinking {
+				if chunk.ResponseType == types.ResponseTypeThinking {
 					return
 				}
-				_, answerContent := splitter.Feed(chunk.Content)
-				if splitter.TakeAnswerReset() {
-					sentinelGate.Reset()
-					refGate.Reset()
-					e.retractAnswer(ctx, sessionID, answerID)
-					published.Reset()
-				}
-				if chunk.Done {
-					_, tail := splitter.Flush()
-					answerContent += tail
-					providerDone = true
-				}
-				answerContent = refGate.Feed(sentinelGate.Feed(answerContent))
-				if chunk.Done && !sentinelGate.Held() {
-					answerContent += refGate.Flush()
-				}
-				// Do not close the answer until the whole stream has succeeded: a
-				// later error may require replacing this attempt with a retry.
-				if providerDone {
-					terminalContent += answerContent
-					return
-				}
-				if answerContent != "" {
-					logger.Debugf(ctx, "[Agent][FinalAnswer] Emitting answer chunk: %d chars", len(answerContent))
-					_ = e.eventBus.Emit(ctx, event.Event{
-						ID:        answerID,
-						Type:      event.EventAgentFinalAnswer,
-						SessionID: sessionID,
-						Data: event.AgentFinalAnswerData{
-							Content: answerContent,
-						},
-					})
-					published.WriteString(answerContent)
-				}
+				pipe.HandleContentChunk(chunk)
 			},
 		)
 		// A provider can report a full window as a length stop instead of an
@@ -186,14 +151,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 					messages, _ = e.compactFinalAnswerContext(ctx, messages, state.CurrentRound+1,
 						runtimeNotice, compaction.ReasonThreshold)
 				}
-				if published.Len() > 0 {
-					e.retractAnswer(ctx, sessionID, answerID)
-				}
-				published.Reset()
-				providerDone, terminalContent = false, ""
-				splitter = agenttools.NewThinkStreamSplitter()
-				sentinelGate.Reset()
-				refGate.Reset()
+				pipe.ResetForRetry()
 				continue
 			}
 			break
@@ -212,27 +170,13 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 			break // Sending the same rejected context again cannot recover.
 		}
 		messages = compacted
-		if published.Len() > 0 {
-			e.retractAnswer(ctx, sessionID, answerID)
-		}
-		published.Reset()
-		providerDone, terminalContent = false, ""
-		splitter = agenttools.NewThinkStreamSplitter()
-		sentinelGate.Reset()
-		refGate.Reset()
+		pipe.ResetForRetry()
 	}
 	if toolOnlyResult != nil && (err != nil || strings.TrimSpace(agenttools.StripThinkBlocks(llmResult.Content)) == "") {
 		if err != nil {
 			logger.Warnf(ctx, "[Agent][FinalAnswer] Tool-only retry failed; using fallback: %v", err)
 		}
-		if published.Len() > 0 {
-			e.retractAnswer(ctx, sessionID, answerID)
-		}
-		published.Reset()
-		terminalContent = ""
-		splitter = agenttools.NewThinkStreamSplitter()
-		sentinelGate.Reset()
-		refGate.Reset()
+		pipe.ResetForRetry()
 		llmResult, messages, err = toolOnlyResult, toolOnlyMessages, nil
 	}
 	if err != nil {
@@ -243,7 +187,6 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		})
 		return err
 	}
-	_, tail := splitter.Flush()
 	// Safety net: strip any residual <think> blocks that may have leaked through
 	fullAnswer := agenttools.StripThinkBlocks(llmResult.Content)
 	// Streamed text stays unless post-processing changed it; then replace it whole.
@@ -251,25 +194,10 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	if err != nil {
 		return err
 	}
-	if holdAnswer || sentinelGate.Held() || refGate.Held() {
-		// An interrupted step can still produce its private report despite the final instruction.
-		if state.Plan != nil && isPrivatePlanReport(public) {
-			public = e.fallbackAnswer()
-		}
-		if published.Len() > 0 && strings.HasPrefix(public, published.String()) {
-			fullAnswer, terminalContent, tail = public, "", public[published.Len():]
-		} else {
-			if published.Len() > 0 {
-				e.retractAnswer(ctx, sessionID, answerID)
-			}
-			fullAnswer, terminalContent, tail = public, "", public
-		}
-	} else if public != fullAnswer {
-		if published.Len() > 0 {
-			e.retractAnswer(ctx, sessionID, answerID)
-		}
-		fullAnswer, terminalContent, tail = public, "", public
+	if holdAnswer || pipe.SentinelHeld() || pipe.RefHeld() {
+		public = e.planSanitizeFinal(state, public)
 	}
+	fullAnswer, terminalContent, tail := pipe.ReconcileFinal(public, fullAnswer)
 	// With tools disabled some models still reply with only a tool call;
 	// never finish the turn with a blank answer.
 	if strings.TrimSpace(fullAnswer) == "" {
@@ -427,14 +355,7 @@ func (e *AgentEngine) emitCompletionEvent(
 	if state.SuspendedStep != nil {
 		steps = append(append([]types.AgentStep(nil), steps...), *state.SuspendedStep)
 	}
-	if state.Plan != nil {
-		steps = slices.Clone(steps)
-		for i := range steps {
-			if steps[i].PlanReport || isPrivatePlanReport(steps[i].Thought) {
-				steps[i].Thought = ""
-			}
-		}
-	}
+	steps = e.planScrubCompletionSteps(state, steps)
 	seen := e.takeBackgroundSeen()
 	if len(state.PendingSteerMessages) > 0 || len(state.PendingBackground) > 0 || len(seen) > 0 {
 		// A stop or model failure can arrive after delivery but before the next

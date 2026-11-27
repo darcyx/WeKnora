@@ -605,59 +605,6 @@ func escapeXMLText(s string) string {
 	return s
 }
 
-// renderAppInfoBlock wraps raw app_info in a model-facing <app_info> envelope
-// annotated as static project metadata (not verified live runtime config) and
-// normalizes multi-value device_type strings without mutating e.appInfo.
-func renderAppInfoBlock(appInfo string) string {
-	appInfo = types.SanitizeLiveAppInfoJSON(appInfo)
-	attrs := ` type="static_project_metadata" live_config_verified="false"`
-	note := ""
-	if devices := parseAppInfoDeviceTypes(appInfo); len(devices) > 1 {
-		attrs += fmt.Sprintf(` multi_device_type="true" device_type_values="%s"`, escapeXMLAttr(strings.Join(devices, ",")))
-		note = "<!-- Note: device_type lists multiple platforms (see device_type_values attribute); do not assume a single target platform from app_info alone. -->"
-	}
-	if note != "" {
-		return fmt.Sprintf("  <app_info%s>%s\n  %s</app_info>\n", attrs, escapeXMLText(appInfo), note)
-	}
-	return fmt.Sprintf("  <app_info%s>%s</app_info>\n", attrs, escapeXMLText(appInfo))
-}
-
-func parseAppInfoDeviceTypes(appInfo string) []string {
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(appInfo), &raw); err != nil || raw == nil {
-		return nil
-	}
-	var deviceStr string
-	if gi, ok := raw["gameInfo"].(map[string]any); ok {
-		deviceStr, _ = gi["device_type"].(string)
-	}
-	if strings.TrimSpace(deviceStr) == "" {
-		deviceStr, _ = raw["device_type"].(string)
-	}
-	if strings.TrimSpace(deviceStr) == "" {
-		return nil
-	}
-	parts := strings.FieldsFunc(deviceStr, func(r rune) bool {
-		switch r {
-		case '、', ',', '，', '/', '|', ';', '；', ' ', '\t':
-			return true
-		default:
-			return false
-		}
-	})
-	var out []string
-	seen := make(map[string]bool)
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-	return out
-}
-
 // buildRuntimeContextBlock builds a metadata block with current time, session
 // info, app info supplied in the request ext object, and the
 // *active retrieval scope for this turn only*. It is injected
@@ -677,6 +624,22 @@ func buildRuntimeContextBlock(
 	assistantName string,
 	appInfo string,
 ) string {
+	return buildRuntimeContextBlockWithHooks(sessionID, kbs, docs, origin, page, assistantName, appInfo, defaultEngineHooks)
+}
+
+func buildRuntimeContextBlockWithHooks(
+	sessionID string,
+	kbs []*KnowledgeBaseInfo,
+	docs []*SelectedDocumentInfo,
+	origin *QuestionOriginInfo,
+	page *PageContextInfo,
+	assistantName string,
+	appInfo string,
+	hooks EngineHooks,
+) string {
+	if hooks == nil {
+		hooks = defaultEngineHooks
+	}
 	var sb strings.Builder
 	sb.WriteString("<runtime_context scope=\"this_turn\">\n")
 	fmt.Fprintf(&sb, "  <current_time>%s</current_time>\n", time.Now().Format("2006-01-02"))
@@ -688,7 +651,7 @@ func buildRuntimeContextBlock(
 	}
 
 	if appInfo != "" {
-		sb.WriteString(renderAppInfoBlock(appInfo))
+		sb.WriteString(hooks.RenderAppInfo(appInfo))
 	}
 
 	if len(kbs) > 0 {
@@ -934,8 +897,8 @@ func sanitizeMustUseField(s string) string {
 // not written to rendered_content / history.
 func (e *AgentEngine) RenderUserTurnContent(sessionID, query string) string {
 	e.registerRuntimeReferences()
-	runtimeCtx := buildRuntimeContextBlock(
-		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName, e.appInfo)
+	runtimeCtx := buildRuntimeContextBlockWithHooks(
+		sessionID, e.knowledgeBasesInfo, e.selectedDocs, e.questionOrigin, e.pageContext, e.assistantName, e.appInfo, e.extHooks())
 	runtimeCtx = e.modelContext.EncodeKnownIssues(e.modelContext.CompactKnownText(runtimeCtx))
 	pinnedSkills := e.pinnedSkills
 	var unavailablePinned []string
@@ -1115,7 +1078,8 @@ func (e *AgentEngine) buildToolsForLLM() []chat.Tool {
 		})
 	}
 
-	return e.modelContext.EncodeTools(e.retrievalTools(tools))
+	// Never mutate tool schemas mid-turn: keeps the provider prompt prefix cache warm.
+	return e.modelContext.EncodeTools(tools)
 }
 
 // appendToolResults adds tool results to the in-turn message history following
@@ -1172,7 +1136,7 @@ func (e *AgentEngine) appendToolResults(
 		if e.retrievalResultInScope(toolCall) {
 			resultContent = e.modelContext.ModelToolResultForTool(toolCall.Name, toolCall.Result)
 		}
-		if e.retrieval != nil && (kbToolNames[toolCall.Name] || toolCall.Name == reviewRetrievalTool) {
+		if e.retrieval != nil && kbToolNames[toolCall.Name] {
 			if toolCall.Result == nil || toolCall.Result.Data[retrievalDispatchBlocked] != true {
 				ref := e.retrievalCallReference(toolCall.ID)
 				e.retrieval.restoreObservation(ref, e.modelContext.DecodeObservationText(resultContent), toolCall.Name)
@@ -1273,8 +1237,8 @@ func (e *AgentEngine) hasActiveKBScope() bool {
 	if e.retrieval != nil {
 		return true
 	}
-	if e.retrievalGuard {
-		// Retrieval guard is enabled, yet initRetrieval left e.retrieval nil
+	if e.runtimeRetrieval {
+		// Runtime retrieval is enabled, yet initRetrieval left e.retrieval nil
 		// because this run has no active KB retrieval tools/targets.
 		return false
 	}

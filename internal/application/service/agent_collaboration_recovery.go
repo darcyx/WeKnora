@@ -16,6 +16,7 @@ import (
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
@@ -285,7 +286,9 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 	if err = s.streams.SetLiveRun(ctx, session.ID, answer.ID, answer.RequestID); err != nil {
 		return err
 	}
+	stopHeartbeat := stream.StartLiveRunHeartbeat(ctx, s.streams, session.ID, answer.ID)
 	defer func() {
+		stopHeartbeat()
 		if err := s.streams.ClearLiveRun(context.WithoutCancel(ctx), session.ID, answer.ID); err != nil {
 			logger.Warnf(ctx, "Failed to clear collaboration live stream: %v", err)
 		}
@@ -321,7 +324,7 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 
 		KnowledgeBaseIDs: saved.KnowledgeBaseIDs, KnowledgeIDs: saved.KnowledgeIDs, TagScopes: saved.TagScopes,
 		MCPServiceIDs: saved.MCPServiceIDs, SkillNames: saved.SkillNames, WebSearchEnabled: saved.WebSearchEnabled,
-		LocalBrowserEnabled: saved.LocalBrowserEnabled, AppInfo: types.SanitizeLiveAppInfoJSON(saved.AppInfo),
+		LocalBrowserEnabled: saved.LocalBrowserEnabled, AppInfo: types.SanitizeAppInfoJSON(saved.AppInfo),
 		RunNote: saved.RunNote, QuotedContext: saved.QuotedContext,
 		QuestionOrigin: saved.QuestionOrigin, PageContext: saved.PageContext, AssistantAccess: saved.AssistantAccess,
 		Mode: types.RunModeAttended, Suspendable: true, Resume: &types.AgentResume{Snapshot: data},

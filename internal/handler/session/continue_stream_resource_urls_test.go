@@ -92,8 +92,12 @@ func (s *stubStreamManager) SetLiveRun(context.Context, string, string, string) 
 	return nil
 }
 
-func (s *stubStreamManager) ClaimLiveRun(context.Context, string, string, string) error {
+func (s *stubStreamManager) ClaimLiveRun(context.Context, string, string, string, string) error {
 	return nil
+}
+
+func (s *stubStreamManager) RefreshLiveRun(context.Context, string, string) (bool, error) {
+	return true, nil
 }
 
 func (s *stubStreamManager) GetLiveRun(context.Context, string) (string, string, error) {

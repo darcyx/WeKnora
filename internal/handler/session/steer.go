@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -373,6 +375,9 @@ func (h *Handler) liveAgentRun(ctx context.Context, sessionID string) (string, e
 			if source := getString(evt.Data, "source_message_id"); source != "" && source != assistantID {
 				sources[source] = true
 			}
+		}
+		if source := strings.TrimSpace(msg.ExecutionContext.SteerHandoffSourceID); source != "" && source != assistantID {
+			sources[source] = true
 		}
 		for source := range sources {
 			older, _, err := h.streamManager.GetSteerEvents(ctx, sessionID, source, 0)
@@ -1018,6 +1023,9 @@ func (h *Handler) claimNextSteerFollowUp(
 		IsCompleted: false,
 		RequestID:   followUp.requestID,
 		CreatedAt:   time.Now(),
+		ExecutionContext: types.MessageExecutionContext{
+			SteerHandoffSourceID: prevMessageID,
+		},
 	}
 	followUp.suggestionAttribution = nil
 	followUp.userMessageID = ""
@@ -1060,7 +1068,18 @@ func (h *Handler) claimNextSteerFollowUp(
 		return nil, false
 	}
 	followUp.steerCarryOver = nil
-	if err := h.streamManager.ClaimLiveRun(ctx, followUp.sessionID, followUp.assistantMessage.ID, followUp.requestID); err != nil {
+	if err := h.streamManager.ClaimLiveRun(ctx, followUp.sessionID, prevMessageID, followUp.assistantMessage.ID, followUp.requestID); err != nil {
+		if stderrors.Is(err, stream.ErrLiveRunExists) {
+			// Ownership already moved to a different run (or was cleared by
+			// another replica). Never overwrite the new run's marker; roll back
+			// the speculative assistant row and preserve the queued inputs.
+			logger.Warnf(ctx, "steer follow-up claim rejected: ownership moved from %s for session %s", prevMessageID, followUp.sessionID)
+			checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			h.rollbackTurnMessages(checkCtx, &followUp, true, true)
+			_ = h.preservePendingSteers(checkCtx, prevReqCtx, prevMessageID, backlog)
+			cancel()
+			return nil, false
+		}
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{"session_id": followUp.sessionID})
 		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		ownerID, ownerReq, lookupErr := h.streamManager.GetLiveRun(checkCtx, followUp.sessionID)
@@ -1085,6 +1104,7 @@ func (h *Handler) claimNextSteerFollowUp(
 	// Sweep it onto B now that B is the live run.
 	if lateAll, _, err := h.streamManager.GetSteerEvents(ctx, prevReqCtx.sessionID, prevMessageID, 0); err != nil {
 		logger.Warnf(ctx, "steer late-handoff read failed for session %s: %v", prevReqCtx.sessionID, err)
+		followUp.steerNeedsSourceSweep = true
 	} else if late := selectSteerBacklog(lateAll, injected); len(late) > 0 {
 		seen := make(map[string]bool, len(backlog))
 		for _, evt := range backlog {
@@ -1109,6 +1129,9 @@ func (h *Handler) claimNextSteerFollowUp(
 			h.markSteerEventsConsumed(ctx, prevReqCtx.sessionID, prevMessageID, followUp.steerCarryOver)
 			followUp.steerCarryOver = nil
 		}
+	}
+	if !followUp.steerNeedsSourceSweep && len(followUp.steerCarryOver) == 0 && followUp.assistantMessage != nil {
+		followUp.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
 	}
 	return &followUp, true
 }
@@ -1292,12 +1315,30 @@ func (h *Handler) closeFailedSteerFollowUp(ctx context.Context, req *qaRequestCo
 	}
 	req.assistantMessage.Content = qaFailureContent
 	req.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
-	if err := h.completeAssistantMessage(cleanup, req.assistantMessage, "", ""); err != nil {
+	dbPersisted := h.completeAssistantMessage(cleanup, req.assistantMessage, "", "") == nil
+	events, _, err := h.streamManager.GetSteerEvents(cleanup, req.sessionID, req.assistantMessage.ID, 0)
+	preserved := err == nil &&
+		h.preservePendingSteers(cleanup, req, req.assistantMessage.ID, selectSteerBacklog(events, nil)) &&
+		h.preservePendingSteers(cleanup, req, req.steerSourceID, req.steerCarryOver)
+	if preserved && req.steerNeedsSourceSweep && req.steerSourceID != "" {
+		lateAll, _, lateErr := h.streamManager.GetSteerEvents(cleanup, req.sessionID, req.steerSourceID, 0)
+		preserved = lateErr == nil && h.preservePendingSteers(cleanup, req, req.steerSourceID, selectSteerBacklog(lateAll, nil))
+	}
+	if !preserved {
+		logger.Warnf(cleanup, "failed to preserve pending follow-up inputs for session %s", req.sessionID)
+		if !dbPersisted {
+			// Best-effort clear so a double failure does not leave a dead marker
+			// blocking the session until lease expiry when no recovery row exists.
+			_ = h.streamManager.ClearLiveRun(cleanup, req.sessionID, req.assistantMessage.ID)
+		}
 		return
 	}
-	events, _, err := h.streamManager.GetSteerEvents(cleanup, req.sessionID, req.assistantMessage.ID, 0)
-	if err != nil || !h.preservePendingSteers(cleanup, req, req.assistantMessage.ID, selectSteerBacklog(events, nil)) || !h.preservePendingSteers(cleanup, req, req.steerSourceID, req.steerCarryOver) {
-		logger.Warnf(cleanup, "failed to preserve pending follow-up inputs for session %s", req.sessionID)
+	if !dbPersisted {
+		// All queued inputs are safely persisted as user messages; release the
+		// live-run marker directly since the assistant row could not be marked complete.
+		if err := h.streamManager.ClearLiveRun(cleanup, req.sessionID, req.assistantMessage.ID); err != nil {
+			logger.Warnf(cleanup, "failed to clear failed follow-up marker: %v", err)
+		}
 		return
 	}
 	ownerID, _, err := h.streamManager.GetLiveRun(cleanup, req.sessionID)

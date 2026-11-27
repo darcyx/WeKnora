@@ -18,7 +18,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-var errFAQMatchUnavailable = errors.New("FAQ matching unavailable")
 var errFAQTurnChanged = errors.New("FAQ evaluation interrupted by a changed user turn")
 
 const faqPreflightTimeout = 10 * time.Second
@@ -36,14 +35,6 @@ type agentFAQOutcome struct {
 	evaluation *agentFAQEvaluation
 	err        error
 }
-
-type faqMatchUnavailableError struct{ cause error }
-
-func (e *faqMatchUnavailableError) Error() string {
-	return fmt.Sprintf("%v: %v", errFAQMatchUnavailable, e.cause)
-}
-func (e *faqMatchUnavailableError) Unwrap() error        { return e.cause }
-func (e *faqMatchUnavailableError) Is(target error) bool { return target == errFAQMatchUnavailable }
 
 // preflightAgentFAQ evaluates without publishing; nil means not eligible.
 func (s *sessionService) preflightAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (*agentFAQEvaluation, error) {
@@ -289,7 +280,7 @@ func (s *sessionService) findAgentExactFAQs(ctx context.Context, query string, c
 	defer cancel()
 	result, err := search.FindExactFAQs(searchCtx, query)
 	if err != nil {
-		return result, &faqMatchUnavailableError{cause: err}
+		return result, fmt.Errorf("FAQ matching unavailable: %w", err)
 	}
 	return result, nil
 }

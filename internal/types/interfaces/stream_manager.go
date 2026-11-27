@@ -64,9 +64,15 @@ type StreamManager interface {
 	// replace the previous run uses ClaimLiveRun.
 	SetLiveRun(ctx context.Context, sessionID, assistantMessageID, requestID string) error
 
-	// ClaimLiveRun overwrites the live-run marker. Used when a finishing
-	// turn hands the session to a follow-up before it CAS-clears itself.
-	ClaimLiveRun(ctx context.Context, sessionID, assistantMessageID, requestID string) error
+	// ClaimLiveRun atomically hands the live-run marker from expectedAssistantID
+	// to assistantMessageID (idempotent if it already points to assistantMessageID).
+	// Returns stream.ErrLiveRunExists when another run has taken ownership.
+	ClaimLiveRun(ctx context.Context, sessionID, expectedAssistantID, assistantMessageID, requestID string) error
+
+	// RefreshLiveRun extends the live-run lease only while the marker still
+	// points at assistantMessageID. Read paths must not renew the lease; only
+	// the active run's writer/heartbeat may extend it.
+	RefreshLiveRun(ctx context.Context, sessionID, assistantMessageID string) (bool, error)
 
 	// GetLiveRun returns the session's generating assistant message, or empty
 	// strings when no run is marked live.

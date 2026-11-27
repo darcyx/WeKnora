@@ -1,23 +1,11 @@
 package agent
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
-
-func TestPublicAnswerDegradesOnGuardError(t *testing.T) {
-	e := registeredMissingFields(t, "渠道")
-	e.EnableRetrievalGuard()
-	e.appInfo = `{"channel":"微信小游戏"}`
-	raw, _ := json.Marshal(retrievalAdmission{Decision: "continue", Reason: "invalid quote", UserAnswers: []retrievalConditionAnswer{{GapID: "gap-1", retrievalUserAnswer: retrievalUserAnswer{Field: "渠道", InputID: e.projectInputID(), Quote: "抖音小游戏"}}}})
-	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: string(raw)}
-	answer, err := e.publicAnswer(t.Context(), "打开支付配置并开启沙盒开关。", nil)
-	require.NoError(t, err)
-	require.Equal(t, e.enforceMissingConditions(t.Context(), "打开支付配置并开启沙盒开关。"), answer)
-}
 
 func TestDropContradictedButtons(t *testing.T) {
 	cases := []struct{ name, in, want string }{
@@ -64,13 +52,6 @@ func TestSanitizeFollowUpButtonsStripsOnFallbackRefusalAndMissingConditions(t *t
 		got, err := e.publicAnswer(t.Context(), in, nil)
 		require.NoError(t, err)
 		require.Equal(t, "**现状**：当前知识库没有查询到该问题对应的解答。\n\n**建议**：建议将该问题反馈给相关同事。", got)
-	})
-
-	t.Run("missing user conditions strips buttons on clarification", func(t *testing.T) {
-		e := registeredMissingFields(t, "平台")
-		in := "方便提供一下平台吗？\n\n## 相关问题\n<button-send>Android 怎么接</button-send>"
-		got := e.sanitizeFollowUpButtons(in)
-		require.Equal(t, "方便提供一下平台吗？", got)
 	})
 }
 

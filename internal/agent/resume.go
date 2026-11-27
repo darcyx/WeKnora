@@ -34,8 +34,8 @@ func (e *AgentEngine) Resume(
 	if err != nil {
 		return nil, err
 	}
-	if snap.Plan != nil && (snap.Plan.Current < 0 || snap.Plan.Current > len(snap.Plan.Steps) || len(snap.Plan.Steps) == 0 || len(snap.Plan.Steps) > 6) {
-		return nil, fmt.Errorf("snapshot plan is inconsistent")
+	if err := validateSnapshotPlan(snap.Plan); err != nil {
+		return nil, err
 	}
 	e.bindCollaborationInput(sessionID, messageID)
 	p := snap.PendingRound
@@ -90,7 +90,6 @@ func (e *AgentEngine) Resume(
 		return nil, fmt.Errorf("retrieval snapshot belongs to a different assistant message")
 	}
 	e.beginTurn(snap.Query, snap.ImageURLs, state)
-	e.setRetrievalHistory(llmContext)
 	if e.retrieval != nil {
 		e.retrievalTurnID = messageID
 	}
@@ -209,10 +208,7 @@ func (e *AgentEngine) Resume(
 		}
 		state.CurrentRound++
 	}
-	if state.Plan != nil {
-		messages = append(messages, planInstruction(state.Plan))
-		e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound)
-	}
+	e.planResume(ctx, state, &messages, sessionID)
 
 	enteredLoop = true
 	if _, err := e.executeLoop(ctx, state, snap.Query, messages, tools, sessionID, messageID); err != nil {

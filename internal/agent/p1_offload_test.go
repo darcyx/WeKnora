@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
 
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -330,12 +332,19 @@ func TestRenderAppInfoBlockStaticMetadataAndMultiDevice(t *testing.T) {
 }
 
 func TestReadDocumentCanContinueBeyondTwoOffsets(t *testing.T) {
-	c := newRetrievalControl("goal", "scope")
-	c.state.Gaps = []retrievalGap{{ID: "g1", Scope: "scope", Status: retrievalPending, LastCallID: "a2", LastReview: retrievalProgress}}
-	for i, args := range []string{`{"id":"doc-1","offset":0}`, `{"id":"doc-1","offset":20}`, `{"id":"doc-1","offset":40}`} {
-		c.state.Attempts = append(c.state.Attempts, retrievalAttempt{ID: []string{"a0", "a1", "a2"}[i], GapID: "g1", Tool: "read_document", Arguments: args, Scope: "scope", Completed: true, Outcome: retrievalSuccess, Content: "next page"})
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.selectedDocs = []*SelectedDocumentInfo{{KnowledgeID: "doc-1", Title: "doc-1"}}
+	e.SetRetrievalUserMessage("q", "read doc-1")
+	e.beginTurn("read doc-1", nil, &types.AgentState{})
+	for i, args := range []string{`{"id":"doc-1","offset":0}`, `{"id":"doc-1","offset":20}`, `{"id":"doc-1","offset":40}`, `{"id":"doc-1","offset":60}`} {
+		tc := types.LLMToolCall{ID: []string{"a0", "a1", "a2", "a3"}[i], Function: types.FunctionCall{Name: agenttools.ToolReadDocument, Arguments: args}}
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal([]byte(args), &parsed))
+		_, err := e.prepareRetrievalCall(t.Context(), tc, parsed)
+		require.NoError(t, err)
+		require.NoError(t, e.retrieval.observeWithSources(e.retrievalCallReference(tc.ID), "next page", retrievalSuccess, true, []string{"doc-1"}, []string{"doc-1"}))
 	}
-	require.NoError(t, c.acquire("g1", "a3", retrievalRead, "next page", "read_document", `{"id":"doc-1","offset":60}`))
 }
 
 func TestRound2ReferenceSanitizationAndStreamingEdgeCases(t *testing.T) {

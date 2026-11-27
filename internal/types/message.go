@@ -595,6 +595,11 @@ type MessageExecutionContext struct {
 	// without this the LLM wrapper auto-creates an orphan chat.completion
 	// trace instead of nesting under the agent turn.
 	LangfuseTraceparent string `json:"langfuse_traceparent,omitempty"`
+	// SteerHandoffSourceID records the predecessor assistant message ID while a
+	// steer follow-up turn's late-arriving source sweep is still pending, so any
+	// replica can sweep the predecessor's steer list during recovery even if the
+	// follow-up's own steer list is empty or the originating replica crashed.
+	SteerHandoffSourceID string `json:"steer_handoff_source_id,omitempty"`
 }
 
 func (c MessageExecutionContext) Value() (driver.Value, error) {

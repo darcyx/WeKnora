@@ -56,7 +56,7 @@ func TestFAQBroadDocumentSearchPreservesOtherActions(t *testing.T) {
 }
 
 func TestFAQBroadDocumentSearchUsesDispatchScopeAndLedger(t *testing.T) {
-	e, probe := newRetrievalProbeEngine(t)
+	e, probe := newRuntimeRetrievalProbeEngine(t)
 	targets := types.SearchTargets{
 		{Type: types.SearchTargetTypeKnowledge, KnowledgeBaseID: "doc", KnowledgeIDs: []string{"selected"}},
 		{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "pack"},

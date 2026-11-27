@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"slices"
 	"strings"
@@ -21,33 +23,6 @@ type retrievalFailure struct {
 	RetryAvailable   bool                                             `json:"retry_available,omitempty"`
 }
 
-func outstandingRetrievalFailures(attempts []retrievalAttempt, gapID string) []retrievalFailure {
-	var failures []retrievalFailure
-	for _, attempt := range attempts {
-		if attempt.GapID != gapID || !attempt.Completed {
-			continue
-		}
-		if attempt.Action == retrievalRecovery && attempt.Outcome == retrievalSuccess && attempt.RecoveryCallID != "" {
-			for i := range failures {
-				failure := &failures[i]
-				if failure.CallID != attempt.RecoveryCallID || len(failure.Targets) == 0 ||
-					(!slices.Contains(attempt.RecoveryStages, failure.Stage) && !(len(attempt.RecoveryStages) == 0 && (failure.Stage == "search" || failure.Stage == "embedding"))) {
-					continue
-				}
-				failure.Targets = slices.DeleteFunc(failure.Targets, func(target *types.SearchTarget) bool {
-					return slices.ContainsFunc(attempt.RecoveryTargets, func(recovered *types.SearchTarget) bool {
-						return reflect.DeepEqual(target, recovered)
-					})
-				})
-				failure.KnowledgeBaseIDs = failure.Targets.GetAllKnowledgeBaseIDs()
-			}
-			failures = slices.DeleteFunc(failures, func(f retrievalFailure) bool { return len(f.KnowledgeBaseIDs) == 0 })
-		}
-		failures = append(failures, cloneRetrievalFailures(attempt.Failures)...)
-	}
-	return failures
-}
-
 func cloneRetrievalFailures(failures []retrievalFailure) []retrievalFailure {
 	cloned := slices.Clone(failures)
 	for i := range cloned {
@@ -57,25 +32,70 @@ func cloneRetrievalFailures(failures []retrievalFailure) []retrievalFailure {
 	return cloned
 }
 
-func hasRecoverableSource(failures []retrievalFailure) bool {
-	for _, failure := range failures {
-		for _, id := range failure.KnowledgeBaseIDs {
-			if recoverableSource(failures, id) {
-				return true
-			}
-		}
+func retrievalCallOutcome(ctx context.Context, result *types.ToolResult, err error) retrievalOutcome {
+	if ctx.Err() != nil {
+		return retrievalUnknown
 	}
-	return false
+	if err == nil && result != nil && result.Success {
+		return retrievalSuccess
+	}
+	if result != nil && result.InvalidArguments {
+		return retrievalInput
+	}
+	return retrievalFailureOutcome(err)
 }
 
-func recoverableSource(failures []retrievalFailure, id string) bool {
-	return len(recoverableRetrievalTargets(failures, id)) > 0
+func retrievalFailureOutcome(err error) retrievalOutcome {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return retrievalUnknown
+		}
+		for _, cause := range causes {
+			if retrievalFailureOutcome(cause) != retrievalTransient {
+				return retrievalUnknown
+			}
+		}
+		return retrievalTransient
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return retrievalFailureOutcome(cause)
+	}
+	var networkError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+		return retrievalTransient
+	}
+	return retrievalUnknown
+}
+
+func retrievalCallFailures(ctx context.Context, result *types.ToolResult) []retrievalFailure {
+	if result == nil {
+		return nil
+	}
+	failures := make([]retrievalFailure, 0, len(result.RetrievalFailures))
+	for _, failure := range result.RetrievalFailures {
+		outcome := retrievalUnknown
+		if ctx.Err() == nil {
+			outcome = retrievalFailureOutcome(failure.Cause)
+		}
+		ids := slices.Clone(failure.KnowledgeBaseIDs)
+		slices.Sort(ids)
+		failures = append(failures, retrievalFailure{
+			KnowledgeBaseIDs: slices.Compact(ids),
+			Outcome:          outcome,
+			Targets:          failure.Targets.Clone(),
+			Stage:            failure.Stage,
+			Retry:            failure.Retry,
+			RetryAvailable:   failure.Retry != nil,
+		})
+	}
+	return failures
 }
 
 func recoverableRetrievalTargets(failures []retrievalFailure, id string, restoring ...bool) types.SearchTargets {
 	var targets types.SearchTargets
 	canReplay := func(f retrievalFailure) bool {
-		return f.Stage == "search" || f.Stage == "embedding" || f.Retry != nil || len(restoring) > 0 && restoring[0] && f.RetryAvailable
+		return f.Stage == "search" || f.Stage == "embedding" || f.Retry != nil || (len(restoring) > 0 && restoring[0] && f.RetryAvailable)
 	}
 	for _, failure := range failures {
 		if failure.Outcome != retrievalTransient || !canReplay(failure) {
@@ -109,8 +129,6 @@ func retrievalArgumentScope(arguments string) (map[string]any, []string, error) 
 	var ids []string
 	if value, present := args["knowledge_base_ids"]; present {
 		encoded, _ := json.Marshal(value)
-		// Empty or null selects every base, exactly like an absent key, so the
-		// callers' len(ids) == 0 handling decides what that means for a recovery.
 		if err := json.Unmarshal(encoded, &ids); err != nil {
 			return nil, nil, fmt.Errorf("invalid recovery knowledge_base_ids")
 		}
@@ -153,7 +171,7 @@ func validateScopedRecovery(previous *retrievalAttempt, arguments string, restor
 
 func validateRetrievalFailureTargets(attempt *retrievalAttempt, failure retrievalFailure) error {
 	if len(failure.Targets) == 0 {
-		return nil // Legacy observations remain readable, but cannot grant a precise recovery.
+		return nil
 	}
 	if strings.TrimSpace(failure.Stage) == "" ||
 		!slices.Equal(sortedRetrievalIDs(failure.KnowledgeBaseIDs), sortedRetrievalIDs(failure.Targets.GetAllKnowledgeBaseIDs())) {
@@ -241,12 +259,71 @@ func (c *retrievalControl) dispatchTargets(callID string) types.SearchTargets {
 	return nil
 }
 
+func (c *retrievalControl) dispatchRecovery(callID string) func(context.Context) (*types.ToolResult, error) {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	a := c.attempt(callID)
+	if a == nil || a.Action != retrievalRecovery || a.Completed {
+		return nil
+	}
+	previous := c.attempt(a.RecoveryCallID)
+	if previous == nil {
+		return nil
+	}
+	var retries []retrievalFailure
+	for _, failure := range previous.Failures {
+		if failure.Retry != nil && failure.Outcome == retrievalTransient && retrievalScopeCovers(retrievalScopeForTargets(a.RecoveryTargets), retrievalScopeForTargets(failure.Targets)) {
+			retries = append(retries, failure)
+		}
+	}
+	if len(retries) == 0 {
+		return nil
+	}
+	return func(ctx context.Context) (*types.ToolResult, error) {
+		var combined *types.ToolResult
+		var causes []error
+		for _, retry := range retries {
+			if ctx.Err() != nil {
+				return combined, ctx.Err()
+			}
+			result, err := retry.Retry(ctx)
+			if result == nil {
+				if err == nil {
+					err = fmt.Errorf("isolated retrieval stage returned no observation")
+				}
+				result = &types.ToolResult{Output: err.Error(), Error: err.Error()}
+			}
+			if err != nil {
+				causes = append(causes, err)
+				result.RetrievalFailures = append(result.RetrievalFailures, types.RetrievalFailure{
+					KnowledgeBaseIDs: retry.KnowledgeBaseIDs,
+					Targets:          retry.Targets.Clone(),
+					Stage:            retry.Stage,
+					Cause:            err,
+				})
+			}
+			if combined == nil {
+				combined = result
+			} else {
+				combined = mergeFAQSearchResult(combined, result)
+			}
+		}
+		if combined != nil && combined.Success {
+			return combined, nil
+		}
+		return combined, errors.Join(causes...)
+	}
+}
+
 func (c *retrievalControl) recoverySpent(original *retrievalAttempt, before string) bool {
 	if original.Action == retrievalRecovery {
 		return true
 	}
 	for _, attempt := range c.state.Attempts {
-		if attempt.ID == before {
+		if before != "" && attempt.ID == before {
 			break
 		}
 		if attempt.RecoveryCallID == original.ID {
@@ -267,7 +344,7 @@ func (c *retrievalControl) validateRecoveryReservation(attempt *retrievalAttempt
 		if len(attempt.RecoveryTargets) > 0 {
 			return fmt.Errorf("recovery targets require an original call")
 		}
-		return nil // Historical attempts cannot be replayed or clear unassociated failures.
+		return nil
 	}
 	var previous *retrievalAttempt
 	for i := range c.state.Attempts {
@@ -279,10 +356,10 @@ func (c *retrievalControl) validateRecoveryReservation(attempt *retrievalAttempt
 			previous = candidate
 		}
 	}
-	if previous == nil || !previous.Completed || previous.GapID != attempt.GapID || previous.Tool != attempt.Tool {
-		return fmt.Errorf("recovery must refer to an earlier observed operation of this gap")
+	if previous == nil || !previous.Completed || previous.Tool != attempt.Tool {
+		return fmt.Errorf("recovery must refer to an earlier observed operation")
 	}
-	if attempt.RuntimeManaged && c.recoverySpent(previous, attempt.ID) {
+	if c.recoverySpent(previous, attempt.ID) {
 		return fmt.Errorf("recovery already used for this operation")
 	}
 	for _, stage := range attempt.RecoveryStages {
@@ -312,19 +389,4 @@ func (c *retrievalControl) validateRecoveryReservation(attempt *retrievalAttempt
 		return fmt.Errorf("recovery reservation does not match its failed targets")
 	}
 	return nil
-}
-
-func independentRetrievalScope(failures []retrievalFailure, arguments string) bool {
-	_, ids, err := retrievalArgumentScope(arguments)
-	if err != nil || len(ids) == 0 {
-		return false
-	}
-	for _, id := range ids {
-		for _, failure := range failures {
-			if slices.Contains(failure.KnowledgeBaseIDs, id) {
-				return false
-			}
-		}
-	}
-	return true
 }

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/collaboration"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -229,9 +231,6 @@ func checkPlanToolResults(state *types.AgentState, content string) string {
 	for _, round := range state.RoundSteps[start:] {
 		roundResults := make(map[string]outcome)
 		for _, call := range round.ToolCalls {
-			if call.Name == reviewRetrievalTool {
-				continue
-			}
 			executedArgs := call.ExecutionArgs()
 			if kbToolNames[call.Name] {
 				executedArgs = retrievalToolArgs(executedArgs)
@@ -397,4 +396,157 @@ func completePlanStep(plan *types.ExecutionPlan, content string) {
 	} else {
 		plan.Current++
 	}
+}
+
+// --- Plan Engine Adapter ---
+// All ReAct loop, streaming, resume, and finalization touchpoints call into
+// these cohesive adapter methods so the core engine stays free of scattered
+// state.Plan conditionals and internal report-leak guards.
+
+func validateSnapshotPlan(plan *types.ExecutionPlan) error {
+	if plan != nil && (plan.Current < 0 || plan.Current > len(plan.Steps) || len(plan.Steps) == 0 || len(plan.Steps) > 6) {
+		return fmt.Errorf("snapshot plan is inconsistent")
+	}
+	return nil
+}
+
+func (e *AgentEngine) planStart(ctx context.Context, query string, state *types.AgentState, messages *[]chat.Message, sessionID string) {
+	if plan, ok := e.maybePlan(ctx, query, *messages, state); ok {
+		state.Plan = plan
+		*messages = append(*messages, planInstruction(plan))
+		e.emitPlanProgress(ctx, plan, sessionID, state.CurrentRound)
+		common.PipelineInfo(ctx, "Agent", "plan_injected", map[string]interface{}{
+			"session_id": sessionID, "steps": len(plan.Steps),
+		})
+	}
+}
+
+func (e *AgentEngine) planResume(ctx context.Context, state *types.AgentState, messages *[]chat.Message, sessionID string) {
+	if state == nil || state.Plan == nil {
+		return
+	}
+	*messages = append(*messages, planInstruction(state.Plan))
+	e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound)
+}
+
+func (e *AgentEngine) planActive(state *types.AgentState) bool {
+	return planInProgress(state)
+}
+
+func (e *AgentEngine) planHoldsAnswer(state *types.AgentState) bool {
+	return state != nil && state.Plan != nil
+}
+
+func (e *AgentEngine) planRestrictsTools(state *types.AgentState) bool {
+	return planInProgress(state) && state.Plan.ReportRetries > 0
+}
+
+func (e *AgentEngine) planShouldSuppressAnswer(state *types.AgentState, answer string) bool {
+	return planInProgress(state) || (state != nil && state.Plan != nil && isPrivatePlanReport(answer))
+}
+
+func (e *AgentEngine) planSanitizePublished(state *types.AgentState, content string, publishAnswer bool) string {
+	if state != nil && state.Plan != nil && !planInProgress(state) && isPrivatePlanReport(content) {
+		if publishAnswer {
+			return e.fallbackAnswer()
+		}
+		return ""
+	}
+	return content
+}
+
+func (e *AgentEngine) planPrepareFinalSynthesis(state *types.AgentState, messages *[]chat.Message) {
+	if state != nil && state.Plan != nil {
+		*messages = append(*messages, planFinalInstruction(state.Plan))
+	}
+}
+
+func (e *AgentEngine) planSanitizeFinal(state *types.AgentState, public string) string {
+	if state != nil && state.Plan != nil && isPrivatePlanReport(public) {
+		return e.fallbackAnswer()
+	}
+	return public
+}
+
+func (e *AgentEngine) planScrubCompletionSteps(state *types.AgentState, steps []types.AgentStep) []types.AgentStep {
+	if state == nil || state.Plan == nil {
+		return steps
+	}
+	cleaned := slices.Clone(steps)
+	for i := range cleaned {
+		if cleaned[i].PlanReport || isPrivatePlanReport(cleaned[i].Thought) {
+			cleaned[i].Thought = ""
+		}
+	}
+	return cleaned
+}
+
+// planHandleRound intercepts plan step-report repair and step advancement so
+// executeOneIteration does not embed plan state-machine transitions inline.
+func (e *AgentEngine) planHandleRound(
+	ctx context.Context,
+	state *types.AgentState,
+	response *types.ChatResponse,
+	step *types.AgentStep,
+	messagesPtr *[]chat.Message,
+	guards *loopGuards,
+	sessionID, assistantMessageID string,
+) (bool, iterOutcome, error) {
+	if planInProgress(state) && state.Plan.ReportRetries > 0 && len(response.ToolCalls) > 0 {
+		e.failToolCalls(ctx, response, step, state.CurrentRound, sessionID, "Tool calls are not allowed while repairing a step report.")
+		state.RoundSteps = append(state.RoundSteps, *step)
+		*messagesPtr = e.appendToolResults(*messagesPtr, *step)
+		state.Plan.ReportRetries = 0
+		completePlanStep(state.Plan, `{"status":"blocked","result":"The step report could not be repaired without another tool call."}`)
+		*messagesPtr = append(*messagesPtr, planFinalInstruction(state.Plan))
+		return true, iterOutcomeNext, nil
+	}
+	if !planInProgress(state) ||
+		!(isNaturalStopFinishReason(response.FinishReason) || isLengthFinishReason(response.FinishReason)) ||
+		len(response.ToolCalls) > 0 || strings.TrimSpace(response.Content) == "" {
+		return false, iterOutcomeNext, nil
+	}
+	step.IntermediateAnswer = true
+	step.PlanReport = true
+	state.RoundSteps = append(state.RoundSteps, *step)
+	*messagesPtr = append(*messagesPtr, chat.Message{
+		Role:               "assistant",
+		Content:            response.Content,
+		ReasoningContent:   response.ReasoningContent,
+		ReasoningSignature: response.ReasoningSignature,
+		ReasoningMetadata:  response.ReasoningMetadata,
+	})
+	waiting, err := e.waitPlanCollaboration(ctx, state, messagesPtr)
+	if err != nil {
+		return true, iterOutcomeBreak, err
+	}
+	if !waiting {
+		content := response.Content
+		if isLengthFinishReason(response.FinishReason) {
+			content = `{"status":"blocked","result":"The step response was truncated."}`
+		}
+		if !isLengthFinishReason(response.FinishReason) && !validPlanReport(content) && state.Plan.ReportRetries == 0 {
+			state.Plan.ReportRetries++
+		} else {
+			state.Plan.ReportRetries = 0
+			content = checkPlanToolResults(state, content)
+			completePlanStep(state.Plan, content)
+			if state.Plan.Current < len(state.Plan.Steps) {
+				state.Plan.Steps[state.Plan.Current].StartStep = len(state.RoundSteps)
+			}
+		}
+	}
+	nextRound := state.CurrentRound + 1
+	if e.withinIterationBudget(nextRound) || e.steerOverruns < maxSteerOverruns {
+		injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+		injected += e.injectBackground(ctx, state, messagesPtr, true)
+		if injected > 0 && !e.withinIterationBudget(nextRound) {
+			e.steerOverruns++
+			e.allowSteerOverrun = true
+		}
+	}
+	*messagesPtr = append(*messagesPtr, planInstruction(state.Plan))
+	e.emitPlanProgress(ctx, state.Plan, sessionID, state.CurrentRound+1)
+	guards.sawPlainRound = false
+	return true, iterOutcomeNext, nil
 }

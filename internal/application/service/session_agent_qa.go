@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -155,22 +153,7 @@ func (s *sessionService) AgentQA(
 				receiver.SetFAQBroadDocumentSearch(req.Query)
 			}
 		}
-		if faqPreflight.cfg.FAQPreflightUsage != nil && prep != nil {
-			addFAQPreflightUsage(prep.config, *faqPreflight.cfg.FAQPreflightUsage)
-		}
-		if faqPreflight.cfg.FAQPreflightChecked && prep != nil {
-			prep.config.FAQPreflightChecked = true
-		}
-		if len(faqPreflight.cfg.FAQPreflightQuestions) > 0 && prep != nil {
-			prep.config.FAQPreflightQuestions = append(prep.config.FAQPreflightQuestions, faqPreflight.cfg.FAQPreflightQuestions...)
-		}
-		if prep != nil && len(faqPreflight.cfg.FAQPreflightRejections) > 0 {
-			if prep.config.FAQPreflightRejections == nil {
-				prep.config.FAQPreflightRejections = make(map[string]types.FAQPreflightRejection)
-			}
-			maps.Copy(prep.config.FAQPreflightRejections, faqPreflight.cfg.FAQPreflightRejections)
-		}
-		if prep != nil && prep.engine != nil && (faqPreflight.cfg.FAQPreflightUsage != nil || len(faqPreflight.cfg.FAQPreflightQuestions) > 0 || len(faqPreflight.cfg.FAQPreflightRejections) > 0) {
+		if prep != nil {
 			if applier, ok := prep.engine.(interface {
 				ApplyFAQPreflight(*types.TokenUsage, []string, map[string]types.FAQPreflightRejection)
 			}); ok {
@@ -306,7 +289,7 @@ func resumableAgentRequest(ctx context.Context, req *types.QARequest) types.Resu
 		AssistantAccess:     req.AssistantAccess,
 		UserMessageID:       req.UserMessageID,
 		Language:            types.LanguageFromContextOrDefault(ctx),
-		AppInfo:             types.SanitizeLiveAppInfoJSON(req.AppInfo),
+		AppInfo:             types.SanitizeAppInfoJSON(req.AppInfo),
 		LocalBrowserEnabled: req.LocalBrowserEnabled,
 		RunNote:             req.RunNote,
 		QuotedContext:       req.QuotedContext,
@@ -326,20 +309,6 @@ func hardIterationCap(cfg *appconfig.Config) int {
 		return 0 // AgentConfig.HardIterationLimit applies its default.
 	}
 	return cfg.Agent.HardIterationCap()
-}
-
-// Only explicit, standalone documentation definition/navigation requests qualify.
-var resourceNavigationQuestion = regexp.MustCompile(`^(?:(?:服务端|客户端|SDK|PCSDK|接口|开发|接入|项目)文档(?:是什么|在哪里|在哪|入口在哪|入口在哪里)|什么是(?:服务端|客户端|SDK|PCSDK|接口|开发|接入|项目)文档)[？?。]?$`)
-
-func eligibleResourceNavigation(req *types.QARequest, cfg *types.AgentConfig) bool {
-	if req == nil || cfg == nil || req.ReasoningEffort != "" || cfg.PlanningEnabled ||
-		(cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "minimal") || req.Resume != nil || req.RunNote != "" ||
-		req.Session == nil || req.Session.Kind == types.SessionKindAgentDelegated || len(req.SkillNames) > 0 || len(req.MCPServiceIDs) > 0 ||
-		len(req.ImageURLs) > 0 || req.ImageDescription != "" || len(req.Attachments) > 0 || req.QuotedContext != "" ||
-		req.PageContext != nil || req.LocalBrowserEnabled || req.WebSearchEnabled {
-		return false
-	}
-	return resourceNavigationQuestion.MatchString(strings.TrimSpace(req.Query))
 }
 
 func (s *sessionService) buildAgentConfig(

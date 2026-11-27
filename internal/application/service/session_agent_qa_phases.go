@@ -515,11 +515,6 @@ func (s *sessionService) executePreparedAgentTurn(
 ) error {
 	sessionID := setup.sessionID
 	qaCtx = prep.qaCtx
-	if len(prep.config.FAQPreflightQuestions) > 0 {
-		if receiver, ok := prep.engine.(interface{ SetFAQPreflightQuestions([]string) }); ok {
-			receiver.SetFAQPreflightQuestions(prep.config.FAQPreflightQuestions)
-		}
-	}
 	if prep.deferEmptyStaging {
 		if _, err := stager.stageSessionAttachments(
 			qaCtx, sessionID, prep.config.SandboxConfigID, req.Session.TenantID, nil, prep.layout,

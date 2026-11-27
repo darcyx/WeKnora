@@ -25,6 +25,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/sandbox/allocation"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -1074,7 +1075,11 @@ func (r *installerRun) round(ctx context.Context, prompt string) error {
 		}); err != nil {
 			return err
 		}
+		stopHeartbeat := stream.StartLiveRunHeartbeat(
+			ctx, r.steer.service.streams, installSteerSession(r.sessionID), r.transcript.assistantMessageID,
+		)
 		defer func() {
+			stopHeartbeat()
 			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), installCleanupTimeout)
 			defer cancel()
 			_ = r.steer.service.withInstallSteerLock(cleanup, r.sessionID, func(ctx context.Context) error {

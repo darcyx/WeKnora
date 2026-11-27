@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/automation"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
@@ -470,7 +471,9 @@ func (s *AutomationService) agentQA(
 		if err := s.streams.SetLiveRun(ctx, session.ID, answer.ID, answer.RequestID); err != nil {
 			return failed("could not publish the run: " + err.Error())
 		}
+		stopHeartbeat := stream.StartLiveRunHeartbeat(ctx, s.streams, session.ID, answer.ID)
 		defer func() {
+			stopHeartbeat()
 			if err := s.streams.ClearLiveRun(context.WithoutCancel(ctx), session.ID, answer.ID); err != nil {
 				logger.Warnf(ctx, "Clear automation live run: %v", err)
 			}

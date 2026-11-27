@@ -289,14 +289,6 @@ func TestPlanReadFailureCanUseEarlierStepEvidence(t *testing.T) {
 	require.Equal(t, "unverified", state.Plan.Steps[1].Status)
 }
 
-func TestPlanRetrievalReviewCannotSubstituteToolEvidence(t *testing.T) {
-	state := &types.AgentState{Plan: &types.ExecutionPlan{Steps: []types.ExecutionPlanStep{{}}}, RoundSteps: []types.AgentStep{{ToolCalls: []types.ToolCall{
-		{Name: agenttools.ToolSearchKnowledge, Result: &types.ToolResult{Success: false}},
-		{Name: reviewRetrievalTool, Result: &types.ToolResult{Success: true}},
-	}}}}
-	require.Contains(t, checkPlanToolResults(state, `{"status":"completed","result":"found"}`), `"blocked"`)
-}
-
 func TestPlanRetrievalRecoveryMatchesExecutedArguments(t *testing.T) {
 	state := &types.AgentState{Plan: &types.ExecutionPlan{Steps: []types.ExecutionPlanStep{{}}}, RoundSteps: []types.AgentStep{
 		{ToolCalls: []types.ToolCall{{Name: agenttools.ToolSearchKnowledge, Args: map[string]any{"query": "A", "retrieval": map[string]any{"action": "initial"}}, Result: &types.ToolResult{Success: false}}}},

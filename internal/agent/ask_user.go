@@ -17,26 +17,9 @@ func (e *AgentEngine) finishUserQuestion(ctx context.Context, state *types.Agent
 		if call.Name != agenttools.ToolAskUser || call.Result == nil || !call.Result.Success || call.Result.UserQuestion == nil {
 			continue
 		}
-		hadBlockers := e.retrieval != nil && len((&retrievalControl{state: e.retrieval.snapshot()}).missingUserFields()) > 0
-		e.retrievalGateMu.Lock()
-		err := e.resolveProjectConditions(ctx)
-		e.retrievalGateMu.Unlock()
-		if err != nil {
-			return false, err
-		}
 		question := call.Result.Output
-		usesToolQuestion := true
-		if e.retrieval != nil {
-			if fields := (&retrievalControl{state: e.retrieval.snapshot()}).missingUserFields(); len(fields) > 0 {
-				question = missingConditionsQuestion(fields)
-				usesToolQuestion = false
-			} else if hadBlockers {
-				*messages = append(*messages, chat.Message{Role: "system", Content: "Project context supplies the missing fields. Continue using the established context without asking for them again."})
-				return false, nil
-			}
-		}
 		// Collaboration owns delivery and finish; its ordinary loop must collect child results first.
-		if state.Plan != nil || e.collaboration != nil || e.clarificationLeavesIndependentWork(question) {
+		if e.planHoldsAnswer(state) || e.collaboration != nil {
 			*messages = append(*messages, chat.Message{Role: "system", Content: "ask_user returned without waiting. Complete remaining independent work and collect delegated results before including this question in the final answer. Follow the existing plan reporting protocol and preserve completed deliverables for the final answer. Keep dependent work stopped; do not ask the same question again."})
 			return false, nil
 		}
@@ -58,22 +41,30 @@ func (e *AgentEngine) finishUserQuestion(ctx context.Context, state *types.Agent
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		answer := stripFollowUpButtons(question)
-		prelude := strings.TrimSpace(stripFollowUpButtons(agenttools.StripThinkBlocks(step.Thought)))
+		answer := e.extHooks().StripFollowUpButtons(question)
+		prelude := strings.TrimSpace(e.extHooks().StripFollowUpButtons(agenttools.StripThinkBlocks(step.Thought)))
 		if prelude != "" && !strings.Contains(prelude, strings.TrimSpace(answer)) {
 			answer = prelude + "\n\n" + answer
 		} else {
 			prelude = ""
 		}
-		var publishedQuestion string
-		if usesToolQuestion {
-			payload, err := json.Marshal(map[string]interface{}{"question": call.Result.UserQuestion, "prelude": prelude, "content": answer})
-			if err != nil {
+		payload, err := json.Marshal(map[string]interface{}{"question": call.Result.UserQuestion, "prelude": prelude, "content": answer})
+		if err != nil {
+			return false, err
+		}
+		publishedQuestion := string(payload)
+		if e.retrieval != nil {
+			if e.retrieval.hasPersistenceFailed() {
+				return false, errRetrievalStateSave
+			}
+			if err := e.retrieval.markAwaitingUserInput(); err != nil {
 				return false, err
 			}
-			publishedQuestion = string(payload)
 		}
 		if err := e.eventBus.Emit(ctx, event.Event{ID: generateEventID("clarification"), Type: event.EventAgentFinalAnswer, SessionID: sessionID, Data: event.AgentFinalAnswerData{Content: answer, Done: true, PublishedQuestion: publishedQuestion}}); err != nil {
+			if e.retrieval != nil {
+				e.retrieval.clearAwaitingUserInput()
+			}
 			return false, err
 		}
 		if publishedQuestion != "" {

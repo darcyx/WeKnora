@@ -42,11 +42,8 @@ func (c *cancelAfterSentinelChat) ChatStream(_ context.Context, _ []chat.Message
 func (c *cancelAfterSentinelChat) GetModelName() string { return "cancel-test" }
 func (c *cancelAfterSentinelChat) GetModelID() string   { return "cancel-test-id" }
 
-func TestProjectInputIDIgnoresRotatingAppInfoToken(t *testing.T) {
+func TestRenderAppInfoBlockPreservesLiveToken(t *testing.T) {
 	e1 := &AgentEngine{appInfo: `{"app_id":"10001","token":"tok-1","channel":"wechat"}`}
-	e2 := &AgentEngine{appInfo: `{"app_id":"10001","token":"tok-2","channel":"wechat"}`}
-	require.Equal(t, e1.projectInputID(), e2.projectInputID())
-
 	rendered := renderAppInfoBlock(e1.appInfo)
 	require.Contains(t, rendered, "tok-1")
 	require.Contains(t, rendered, `"app_id":"10001"`)
@@ -73,38 +70,19 @@ func TestRuntimeDocumentObservedIncludesQuestionOriginAndPageContext(t *testing.
 }
 
 func TestRetrievalControlRollsBackOnPersistErrorAndPublicAnswerChecksWithoutAppInfo(t *testing.T) {
-	c := newRetrievalControl("check config", "kb:1")
-	id, err := c.register(retrievalFactProposal{GoalQuote: "check config", Fact: "config"})
-	require.NoError(t, err)
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.beginTurn("check config", nil, &types.AgentState{})
+	e.retrieval.persist = func(retrievalState) error { return errors.New("db write failed") }
 
-	c.persist = func(retrievalState) error { return errors.New("db write failed") }
-	err = c.acquire(id, "call-1", retrievalInitial, "", "search_knowledge", `{"query":"config"}`)
+	tc := types.LLMToolCall{ID: "call-1", Function: types.FunctionCall{Name: agenttools.ToolSearchKnowledge, Arguments: `{"query":"config"}`}}
+	_, err := e.prepareRetrievalCall(context.Background(), tc, map[string]any{"query": "config"})
 	require.ErrorIs(t, err, errRetrievalStateSave)
-	require.Empty(t, c.snapshot().Attempts, "failed persist must roll back in-memory state")
-	require.Equal(t, retrievalPending, c.snapshot().Gaps[0].Status)
+	require.Empty(t, e.retrieval.snapshot().Attempts, "failed persist must roll back in-memory state")
 
-	e := &AgentEngine{
-		config:    &types.AgentConfig{},
-		retrieval: c,
-		// AppInfo intentionally empty: damaged state must still be caught!
-	}
+	// AppInfo intentionally empty: damaged state must still be caught!
 	_, err = e.publicAnswer(context.Background(), "some answer", nil)
 	require.ErrorIs(t, err, errRetrievalStateSave)
-}
-
-func TestApplyRetrievalReviewAllowsNewFactWithoutDistinctFromWhenGuardEnabled(t *testing.T) {
-	c := newRetrievalControl("check login and pay", "kb:1")
-	_, err := c.register(retrievalFactProposal{GoalQuote: "check login", Fact: "login"})
-	require.NoError(t, err)
-
-	review := retrievalReview{
-		NewFact:           &retrievalFactProposal{GoalQuote: "pay", Fact: "pay"},
-		Status:            retrievalNeedsUser,
-		MissingUserFields: []string{"order_id"},
-	}
-	require.Error(t, c.applyReview(review))
-	require.NoError(t, c.applyReviewWithOptions(review, false))
-	require.Len(t, c.snapshot().Gaps, 2)
 }
 
 func TestRenderUserTurnContentHandlesNilSkillsManagerForPinnedSkills(t *testing.T) {

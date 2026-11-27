@@ -272,7 +272,7 @@ func (e *AgentEngine) executeToolCalls(
 		return nil
 	}
 
-	e.useFAQBroadDocumentSearch(response)
+	e.extHooks().OnBeforeToolDispatch(e, response)
 
 	logger.Infof(ctx, "[Agent][Round-%d] Executing %d tool call(s)", round, n)
 	e.turnHasWikiSearch = slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool { return call.Function.Name == agenttools.ToolWikiSearch })
@@ -325,71 +325,6 @@ func (e *AgentEngine) executeToolCalls(
 		}
 	}
 	return nil
-}
-
-// useFAQBroadDocumentSearch replaces one model-selected document search while
-// preserving the caller's resolved retrieval targets and the other tool calls.
-func (e *AgentEngine) useFAQBroadDocumentSearch(response *types.ChatResponse) {
-	if e.faqBroadDocumentQuery == "" || response == nil || isLengthFinishReason(response.FinishReason) {
-		return
-	}
-	if slices.ContainsFunc(response.ToolCalls, func(call types.LLMToolCall) bool {
-		return call.Function.Name == agenttools.ToolAskUser || call.Function.Name == agenttools.ToolWikiSearch
-	}) {
-		return
-	}
-	for i := range response.ToolCalls {
-		call := &response.ToolCalls[i]
-		if call.Function.Name != agenttools.ToolSearchKnowledge || len(call.UnresolvedHandles) != 0 {
-			continue
-		}
-		var args map[string]any
-		if json.Unmarshal([]byte(call.Function.Arguments), &args) != nil || args == nil || args["retrieval"] != nil {
-			continue
-		}
-		ids, idsOK := args["knowledge_base_ids"].([]any)
-		if args["knowledge_base_ids"] != nil && !idsOK {
-			continue
-		}
-		validIDs := true
-		for _, id := range ids {
-			name, ok := id.(string)
-			if !ok || e.config == nil || !slices.Contains(e.config.SearchTargets.GetAllKnowledgeBaseIDs(), name) {
-				validIDs = false
-				break
-			}
-		}
-		if !validIDs {
-			continue
-		}
-		document := false
-		for _, kb := range e.knowledgeBasesInfo {
-			if kb == nil || kb.Type != "document" || !slices.Contains(kb.Capabilities, "chunks") {
-				continue
-			}
-			if len(ids) == 0 || slices.Contains(ids, any(kb.ID)) {
-				document = true
-				break
-			}
-		}
-		if !document {
-			continue
-		}
-		args["query"] = e.faqBroadDocumentQuery
-		delete(args, "knowledge_base_ids")
-		delete(args, "metadata")
-		delete(args, "mode")
-		encoded, err := json.Marshal(args)
-		if err != nil {
-			return
-		}
-		if call.ModelArguments == "" {
-			call.ModelArguments = call.Function.Arguments
-		}
-		call.Function.Arguments = string(encoded)
-		e.faqBroadDocumentQuery = ""
-		return
-	}
 }
 
 // truncatedArgumentsError is handed to the model instead of a tool result when
@@ -453,7 +388,7 @@ func (e *AgentEngine) executeToolCallsParallel(
 		// makes the second one fail the "previous attempt completed" check. The
 		// ledger is protected by retrievalGateMu; the ordering is what needs
 		// serialising, and only for knowledge-base tools.
-		if !agenttools.CanRunConcurrently(tc.Function.Name) || e.retrievalGuard && isBudgetedSearchTool(tc.Function.Name) ||
+		if !agenttools.CanRunConcurrently(tc.Function.Name) ||
 			kbToolNames[tc.Function.Name] && e.retrieval != nil {
 			// Drain preceding reads before a mutation, and finish the mutation
 			// before starting later reads. Every ledger-controlled retrieval,
@@ -608,7 +543,7 @@ func (e *AgentEngine) runToolCallAnswered(
 		if controlledRetrieval && completed.Result != nil && !completed.Result.Success && completed.Result.Output == "" {
 			completed.Result.Output = completed.Result.Error
 		}
-		if !dispatched && e.retrieval != nil && (controlledRetrieval || tc.Function.Name == reviewRetrievalTool) &&
+		if !dispatched && e.retrieval != nil && controlledRetrieval &&
 			completed.Result != nil && !completed.Result.Success {
 			if completed.Result.Data == nil {
 				completed.Result.Data = make(map[string]any)
@@ -688,14 +623,6 @@ func (e *AgentEngine) runToolCallAnswered(
 	if e.turnHasWikiSearch && wikiShadowsSearch(tc.Function.Name, args) {
 		return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
 			Result: &types.ToolResult{Success: false, Error: wikiParallelSearchError}}
-	}
-	if e.retrieval != nil && tc.Function.Name == reviewRetrievalTool {
-		if len(tc.UnresolvedHandles) > 0 {
-			return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, ProviderMetadata: tc.ProviderMetadata,
-				Result: &types.ToolResult{Success: false, Error: "Retrieval review rejected: unresolved evidence reference"}}
-		}
-		return types.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args,
-			ProviderMetadata: tc.ProviderMetadata, Result: e.reviewRetrieval(ctx, tc.Function.Arguments)}
 	}
 	executionArguments := tc.Function.Arguments
 	if controlledRetrieval {

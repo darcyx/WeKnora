@@ -193,9 +193,6 @@ func (e *AgentEngine) beginTurn(query string, imageURLs []string, state *types.A
 	e.pendingSteerFAQ = ""
 	e.progress.collaborationDeliveries = nil
 	e.retrievalTurnID = ""
-	e.retrievalProjectReviewed = ""
-	e.retrievalSearchGapID = ""
-	e.retrievalSearchInputID = ""
 	e.turnShownChunks = nil
 	e.initRetrieval(query)
 }

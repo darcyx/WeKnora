@@ -56,18 +56,10 @@ func TestRuntimeRetrievalStatePrompt_IncludesConfiguredNoAnswer(t *testing.T) {
 	engine.runtimeRetrieval = true
 	engine.retrieval = newRetrievalControl("taptap沙盒支付怎么设置", "scope-a")
 	engine.retrieval.state.UserInputIDs = []string{"u1"}
-	engine.retrieval.state.Gaps = []retrievalGap{{
-		ID:          "gap-1",
-		Scope:       "scope-a",
-		Fact:        "taptap沙盒支付怎么设置",
-		Status:      retrievalPending,
-		SearchGrace: questionSearchGrace,
-	}}
-	for i := 0; i < questionSearchGrace; i++ {
+	for i := 0; i < maxSearchesPerQuestion; i++ {
 		engine.retrieval.state.Attempts = append(engine.retrieval.state.Attempts, retrievalAttempt{
 			ID:         fmt.Sprintf("call-%d", i+1),
 			QuestionID: "u1",
-			GapID:      "gap-1",
 			Scope:      "scope-a",
 			Tool:       "search_knowledge",
 			Action:     retrievalSearch,
@@ -76,7 +68,6 @@ func TestRuntimeRetrievalStatePrompt_IncludesConfiguredNoAnswer(t *testing.T) {
 		})
 	}
 	prompt := engine.retrievalStatePrompt()
-	assert.Contains(t, prompt, "The ordinary search allowance is spent.")
-	assert.Contains(t, prompt, "do not read unrelated or placeholder docs")
+	assert.Contains(t, prompt, "The search budget for this question is spent.")
 	assert.Contains(t, prompt, `"`+fixed+`"`)
 }

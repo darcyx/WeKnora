@@ -370,7 +370,7 @@ func TestRebindSteerMovesEventOntoNewLiveRun(t *testing.T) {
 	}
 	evt := steerEventWithDelivery("late-1", "landed on A", steerDeliveryAfter)
 	require.NoError(t, mgr.AppendSteerEvents(ctx, "sess-1", "assist-A", []interfaces.StreamEvent{evt}))
-	require.NoError(t, mgr.ClaimLiveRun(ctx, "sess-1", "assist-B", "req-B"))
+	require.NoError(t, mgr.ClaimLiveRun(ctx, "sess-1", "assist-A", "assist-B", "req-B"))
 
 	queuedOn, status, err := h.rebindSteerIfLiveRunMoved(ctx, "sess-1", "assist-A", evt)
 	require.NoError(t, err)
@@ -433,7 +433,7 @@ type steerClaimFailingManager struct {
 	interfaces.StreamManager
 }
 
-func (s *steerClaimFailingManager) ClaimLiveRun(context.Context, string, string, string) error {
+func (s *steerClaimFailingManager) ClaimLiveRun(context.Context, string, string, string, string) error {
 	return errors.New("redis down")
 }
 
@@ -487,7 +487,7 @@ func TestRebindSteerKeepsEventWhenAppendFails(t *testing.T) {
 	}
 	evt := steerEventWithDelivery("late-1", "landed on A", steerDeliveryAfter)
 	require.NoError(t, inner.AppendSteerEvents(ctx, "sess-1", "assist-A", []interfaces.StreamEvent{evt}))
-	require.NoError(t, inner.ClaimLiveRun(ctx, "sess-1", "assist-B", "req-B"))
+	require.NoError(t, inner.ClaimLiveRun(ctx, "sess-1", "assist-A", "assist-B", "req-B"))
 
 	_, _, err := h.rebindSteerIfLiveRunMoved(ctx, "sess-1", "assist-A", evt)
 	require.Error(t, err)
@@ -605,8 +605,8 @@ func TestCompletedRunRecoversQueuedInputBeforeClearingMarker(t *testing.T) {
 
 type ambiguousClaimStream struct{ interfaces.StreamManager }
 
-func (s ambiguousClaimStream) ClaimLiveRun(ctx context.Context, sessionID, messageID, requestID string) error {
-	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, messageID, requestID); err != nil {
+func (s ambiguousClaimStream) ClaimLiveRun(ctx context.Context, sessionID, expectedID, messageID, requestID string) error {
+	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, expectedID, messageID, requestID); err != nil {
 		return err
 	}
 	return errors.New("claim response timed out")
@@ -632,8 +632,8 @@ type uncertainClaimStream struct {
 	consumeFails bool
 }
 
-func (s *uncertainClaimStream) ClaimLiveRun(ctx context.Context, sessionID, messageID, requestID string) error {
-	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, messageID, requestID); err != nil {
+func (s *uncertainClaimStream) ClaimLiveRun(ctx context.Context, sessionID, expectedID, messageID, requestID string) error {
+	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, expectedID, messageID, requestID); err != nil {
 		return err
 	}
 	s.lookupFails = true
@@ -703,4 +703,78 @@ func TestCompletedRunWithoutRecoveryMarkerKeepsNormalIdleBehavior(t *testing.T) 
 	events, _, err := mgr.GetSteerEvents(ctx, "s", "a", 0)
 	require.NoError(t, err)
 	require.False(t, steerEventConsumed(events[0]))
+}
+
+func TestClaimNextSteerFollowUpRejectsStolenLiveRunWithoutOverwritingNewOwner(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	// Replica 2 already took ownership as assist-C after assist-A's lease expired or cleared.
+	require.NoError(t, mgr.SetLiveRun(ctx, "sess-1", "assist-C", "req-C"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "sess-1", "assist-A", []interfaces.StreamEvent{
+		steerEventWithDelivery("after-1", "queued on A", steerDeliveryAfter),
+	}))
+
+	msgs := &steerPersistingMessageStub{}
+	h := &Handler{
+		sessionService: &steerOwnedSessionStub{},
+		messageService: msgs,
+		streamManager:  mgr,
+	}
+	followUp, ok := h.claimNextSteerFollowUp(ctx, &qaRequestContext{sessionID: "sess-1", session: &types.Session{ID: "sess-1"}},
+		&sseStreamContext{assistantMessage: &types.Message{ID: "assist-A"}})
+	require.False(t, ok)
+	require.Nil(t, followUp)
+
+	// Replica 2's live run C must remain untouched.
+	liveID, liveReq, err := mgr.GetLiveRun(ctx, "sess-1")
+	require.NoError(t, err)
+	require.Equal(t, "assist-C", liveID)
+	require.Equal(t, "req-C", liveReq)
+
+	// Speculative assistant B was rolled back, while queued user message was preserved.
+	require.Len(t, msgs.byID, 1)
+	preserved := msgs.byID[stableSteerMessageID("sess-1", "after-1")]
+	require.NotNil(t, preserved)
+	require.Equal(t, "queued on A", preserved.Content)
+}
+
+func TestLiveAgentRunRecoversLateSourceSteersAcrossReplicasViaExecutionContext(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	// Replica 1 handed off A -> B, B's own steer list is empty, and a late steer sits on A.
+	require.NoError(t, mgr.SetLiveRun(ctx, "sess-1", "assist-B", "req-B"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "sess-1", "assist-A", []interfaces.StreamEvent{
+		steerEventWithDelivery("late-from-A", "late steer accepted on A", steerDeliveryAfter),
+	}))
+
+	// Replica 2 only sees PG row B (completed with steer_recovery_pending + SteerHandoffSourceID) and shared Redis.
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{
+		"assist-B": {
+			ID:          "assist-B",
+			SessionID:   "sess-1",
+			IsCompleted: true,
+			RunState:    types.MessageRunStateSteerRecoveryPending,
+			ExecutionContext: types.MessageExecutionContext{
+				SteerHandoffSourceID: "assist-A",
+			},
+		},
+	}}}
+	replica2 := &Handler{messageService: msgs, streamManager: mgr}
+
+	current, err := replica2.liveAgentRun(ctx, "sess-1")
+	require.NoError(t, err)
+	require.Empty(t, current)
+
+	// Late steer from A must be persisted as a user message and marked consumed on A.
+	recovered := msgs.byID[stableSteerMessageID("sess-1", "late-from-A")]
+	require.NotNil(t, recovered, "Replica 2 must recover late steer from predecessor A via ExecutionContext.SteerHandoffSourceID")
+	require.Equal(t, "late steer accepted on A", recovered.Content)
+	sourceEvents, _, err := mgr.GetSteerEvents(ctx, "sess-1", "assist-A", 0)
+	require.NoError(t, err)
+	require.Len(t, sourceEvents, 1)
+	require.True(t, steerEventConsumed(sourceEvents[0]))
+
+	liveID, _, err := mgr.GetLiveRun(ctx, "sess-1")
+	require.NoError(t, err)
+	require.Empty(t, liveID)
 }

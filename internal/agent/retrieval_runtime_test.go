@@ -3,651 +3,1011 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
-	"github.com/Tencent/WeKnora/internal/modelcontext"
+	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/models/chat"
-	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/trace"
 )
 
-type runtimeRetrievalChat struct {
-	*mockChat
-	boundaryCalls int
-}
-
-func (m *runtimeRetrievalChat) Chat(_ context.Context, messages []chat.Message, _ *chat.ChatOptions) (*types.ChatResponse, error) {
-	m.boundaryCalls++
-	return &types.ChatResponse{Content: `{"decision":"allow","reason":"the question has no necessary missing user conditions"}`}, nil
-}
-
-func newRuntimeRetrievalProbeEngine(t *testing.T) (*AgentEngine, *retrievalProbe) {
-	e, probe := newRetrievalProbeEngine(t)
-	e.chatModel = &runtimeRetrievalChat{mockChat: &mockChat{}}
-	return e, probe
-}
-
-func TestRuntimeRetrievalUsesOriginalToolsAndRecordedOutcomes(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	model := &runtimeRetrievalChat{mockChat: &mockChat{}}
-	e.chatModel = model
-	search.output = `<retrieval><document id="doc"><content>配置说明</content></document></retrieval>`
-	search.published = []types.PublishedSourceRef{{ID: "doc", Citable: true}}
-	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "完整配置步骤"}
-	e.toolRegistry.RegisterTool(reader)
-	for _, tool := range e.buildToolsForLLM() {
-		require.NotEqual(t, reviewRetrievalTool, tool.Function.Name)
-		require.NotContains(t, string(tool.Function.Parameters), `"retrieval"`)
-		require.NotContains(t, tool.Function.Description, questionSearchGuidance())
-	}
-	require.Contains(t, e.buildSystemPrompt(t.Context()), questionSearchGuidance())
-	require.Empty(t, e.retrievalStatePrompt())
-	first := retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
-	require.True(t, first.Result.Success, first.Result.Error)
-	read := retrievalProbeCall(e, "read", agenttools.ToolReadDocument, `{"id":"doc"}`)
-	require.True(t, read.Result.Success, read.Result.Error)
-	require.Len(t, reader.calls, 1)
-	unknown := retrievalProbeCall(e, "unknown", agenttools.ToolReadDocument, `{"id":"invented"}`)
-	require.False(t, unknown.Result.Success)
-	require.Len(t, reader.calls, 1)
-	require.Equal(t, retrievalPending, e.retrieval.snapshot().Gaps[0].Status, "execution success does not prove answer sufficiency")
-	repeated := retrievalProbeCall(e, "repeat", agenttools.ToolReadDocument, `{"id":"doc"}`)
-	require.False(t, repeated.Result.Success)
-	require.Len(t, reader.calls, 1)
-	require.Equal(t, 1, model.boundaryCalls)
-	_, err := restoreRetrievalControl(e.retrieval.snapshot())
-	require.NoError(t, err)
-}
-
-func TestRuntimeRetrievalDoesNotRepeatSuccessfulSearch(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	first := retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox","limit":3}`)
-	require.True(t, first.Result.Success, first.Result.Error)
-	before := e.retrieval.snapshot()
-	// JSON key ordering must not turn the same request into a new search.
-	repeat := retrievalProbeCall(e, "repeat", agenttools.ToolSearchKnowledge, `{"limit":3,"query":"sandbox"}`)
-	require.False(t, repeat.Result.Success)
-	require.Contains(t, repeat.Result.Error, "exact search already completed")
-	require.Len(t, search.calls, 1)
-	require.Equal(t, before, e.retrieval.snapshot(), "blocked repetition must not consume an allowance")
-	wider := retrievalProbeCall(e, "wider", agenttools.ToolSearchKnowledge, `{"query":"sandbox","limit":10}`)
-	require.True(t, wider.Result.Success, wider.Result.Error)
-	require.Len(t, search.calls, 2, "a genuinely wider request still needs retrieval")
-}
-
-func TestRuntimeRetrievalGraceThenOriginalSupplementAndStop(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	for i := 0; i < questionSearchGrace; i++ {
-		call := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i))
-		require.True(t, call.Result.Success, call.Result.Error)
-	}
-	require.False(t, e.usesRuntimeRetrieval())
-	require.Contains(t, e.retrievalStatePrompt(), "ordinary search allowance is spent")
-	compact := e.retrievalStatePrompt()
-	require.Contains(t, compact, "a no_progress review")
-	e.runtimeRetrieval = false
-	structured := e.retrievalStatePrompt()
-	e.runtimeRetrieval = true
-	require.Less(t, len(compact), len(structured)/2, "ordinary QA must not carry the full dependency and scope protocol")
-	require.Equal(t, strings.Split(compact, "</retrieval_user_inputs>")[0], strings.Split(structured, "</retrieval_user_inputs>")[0], "compact guidance must retain the complete runtime state")
-	t.Logf("retrieval notice: ordinary=%d bytes, structured=%d bytes", len(compact), len(structured))
-	denied := retrievalProbeCall(e, "unreviewed", agenttools.ToolSearchKnowledge, `{"query":"again"}`).Result
-	require.False(t, denied.Success)
-	require.Contains(t, denied.Error, "ordinary search allowance exhausted")
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: fmt.Sprint(questionSearchGrace - 1), Status: retrievalNoProgress}))
-	call := retrievalProbeCall(e, "supplement", agenttools.ToolSearchKnowledge, `{"query":"TapTap configuration","retrieval":{"gap_id":"gap-1","action":"supplement","lead":"TapTap"}}`)
-	require.True(t, call.Result.Success, call.Result.Error)
-	require.NotContains(t, e.retrievalStatePrompt(), "a no_progress review")
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: "supplement", Status: retrievalNoProgress}))
-	require.False(t, retrievalProbeCall(e, "spent", agenttools.ToolSearchKnowledge, `{"query":"yet another wording"}`).Result.Success)
-	require.Len(t, search.calls, questionSearchGrace+1)
-	_, err := restoreRetrievalControl(e.retrieval.snapshot())
-	require.NoError(t, err)
-}
-
-func TestRuntimeRetrievalSpentAfterFailedSearch(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	for i := 1; i <= questionSearchGrace; i++ {
-		if i == questionSearchGrace {
-			search.err = context.DeadlineExceeded
-		}
-		result := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i)).Result
-		require.Equal(t, i < questionSearchGrace, result.Success)
-	}
-	prompt := e.retrievalStatePrompt()
-	require.Contains(t, prompt, "Recover a needed transient failure")
-	require.NotContains(t, prompt, "a no_progress review")
-}
-
-func TestRuntimeRetrievalReadsPublishedRecentReferences(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.knowledgeBasesInfo = []*KnowledgeBaseInfo{nil, {ID: "kb", RecentDocs: []RecentDocInfo{
-		{KnowledgeID: "doc", ChunkID: "faq"}, {KnowledgeID: "second"}, {KnowledgeID: "unpublished"},
-	}}}
-	reader := runtimeRegressionReader()
-	e.toolRegistry.RegisterTool(reader)
-	refs := []string{e.modelContext.RegisterDocument("doc"), e.modelContext.RegisterContextChunk(modelcontext.ChunkReference{ChunkID: "faq", KnowledgeID: "doc", KnowledgeBaseID: "kb"})}
-	for i, ref := range refs {
-		calls := []types.LLMToolCall{{ID: fmt.Sprintf("read-%d", i), Function: types.FunctionCall{Name: agenttools.ToolReadDocument, Arguments: fmt.Sprintf(`{"id":%q}`, ref)}}}
-		e.modelContext.DecodeToolCalls(calls)
-		call := e.runToolCall(t.Context(), calls[0], 0, 0, 1, "session", "message")
-		require.True(t, call.Result.Success, call.Result.Error)
-	}
-	require.Len(t, reader.calls, 2)
-	require.False(t, retrievalProbeCall(e, "hidden", agenttools.ToolReadDocument, `{"id":"unpublished"}`).Result.Success)
-	require.False(t, retrievalProbeCall(e, "unknown", agenttools.ToolReadDocument, `{"id":"invented"}`).Result.Success)
-	require.Len(t, reader.calls, 2)
-}
-
-func TestRuntimeRetrievalKeepsFailureAndPersistenceBoundaries(t *testing.T) {
-	for _, saveFails := range []bool{false, true} {
-		t.Run(fmt.Sprint(saveFails), func(t *testing.T) {
-			e, search := newRuntimeRetrievalProbeEngine(t)
-			e.EnableRuntimeRetrieval()
-			e.chatModel = &runtimeRetrievalChat{mockChat: &mockChat{}}
-			search.err = context.DeadlineExceeded
-			if saveFails {
-				e.retrieval.persist = func(retrievalState) error { return fmt.Errorf("storage unavailable") }
-			}
-			for i := 0; i < 3; i++ {
-				require.False(t, retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
-			}
-			if saveFails {
-				require.Empty(t, search.calls)
-			} else {
-				require.Len(t, search.calls, 2, "one execution and one recovery")
-			}
-		})
-	}
-}
-
-func TestRuntimeRetrievalPreservesExplicitDependencies(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	id, err := e.retrieval.register(retrievalFactProposal{GoalQuote: "TapTap", Fact: "payment status"})
-	require.NoError(t, err)
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: id, Status: retrievalNeedsUser, MissingUserFields: []string{"order"}}))
-	require.False(t, e.usesRuntimeRetrieval())
-	var names []string
-	for _, tool := range e.buildToolsForLLM() {
-		names = append(names, tool.Function.Name)
-	}
-	require.Contains(t, names, reviewRetrievalTool)
-}
-
-func TestRuntimeRetrievalPreservesExplicitStop(t *testing.T) {
-	for _, status := range []retrievalStatus{retrievalSatisfied, retrievalExhausted} {
-		t.Run(string(status), func(t *testing.T) {
-			e, search := newRuntimeRetrievalProbeEngine(t)
-			e.EnableRuntimeRetrieval()
-			require.True(t, retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
-			require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", CallID: "first", Status: status, Quotes: []string{"Only general information"}}))
-			require.False(t, retrievalProbeCall(e, "next", agenttools.ToolSearchKnowledge, `{"query":"configuration steps"}`).Result.Success)
-			require.Len(t, search.calls, 1)
-		})
-	}
-}
-
-func TestRuntimeRetrievalIdenticalNewMessageGetsFreshBudgetWithoutModelReview(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	require.True(t, retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
-	raw, err := json.Marshal(e.retrieval.snapshot())
-	require.NoError(t, err)
-	next, search := newRuntimeRetrievalProbeEngine(t)
-	next.EnableRuntimeRetrieval()
-	next.SetRetrievalUserMessage("next-message", "TapTap sandbox configuration")
-	model := &runtimeRetrievalChat{mockChat: &mockChat{}}
-	next.chatModel = model
-	next.SetRetrievalPersistence(raw, nil)
-	require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-	for i := 0; i < questionSearchGrace; i++ {
-		require.True(t, retrievalProbeCall(next, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i)).Result.Success)
-	}
-	require.False(t, retrievalProbeCall(next, "spent", agenttools.ToolSearchKnowledge, `{"query":"again"}`).Result.Success)
-	require.Len(t, search.calls, questionSearchGrace)
-	require.Len(t, next.retrieval.snapshot().Gaps, 1)
-	require.Zero(t, model.boundaryCalls)
-}
-
-func TestRuntimeRetrievalNormalLoopNeedsOnlySearchAndAnswerRounds(t *testing.T) {
-	model := &runtimeRetrievalChat{mockChat: &mockChat{responses: []mockResponse{
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "tool_calls",
-			ToolCalls: []types.LLMToolCall{{ID: "search", Function: types.FunctionCall{Name: agenttools.ToolSearchKnowledge, Arguments: `{"query":"sandbox"}`}}}}}},
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "请按文档配置。", Done: true, FinishReason: "stop"}}},
-	}}}
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.chatModel = model
-	state, err := e.Execute(t.Context(), "session", "message", "TapTap sandbox configuration", nil)
-	require.NoError(t, err)
-	require.Equal(t, "请按文档配置。", state.FinalAnswer)
-	require.Len(t, search.calls, 1)
-	require.Equal(t, 2, model.callCount)
-	require.Equal(t, 1, model.boundaryCalls)
-}
-
-func TestRuntimeRetrievalDirectAnswerOrQuestionDoesNotNeedStatusReview(t *testing.T) {
-	for _, answer := range []string{"可以在设置中配置。", "请提供订单号。", "通用配置方法见上述说明；查询这笔订单还需要订单号。"} {
-		t.Run(answer, func(t *testing.T) {
-			e, _ := newRuntimeRetrievalProbeEngine(t)
-			e.EnableRuntimeRetrieval()
-			model := &runtimeRetrievalChat{mockChat: &mockChat{}}
-			e.chatModel = model
-			got, err := e.publicAnswer(t.Context(), answer, nil)
-			require.NoError(t, err)
-			require.Equal(t, answer, got)
-			require.Equal(t, 1, model.boundaryCalls)
-			require.Empty(t, e.retrieval.snapshot().Gaps)
-		})
-	}
-}
-
-func TestRuntimeRetrievalPlanAloneDoesNotRequireStructuredProtocol(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.progress.state.Plan = &types.ExecutionPlan{}
-	require.True(t, e.usesRuntimeRetrieval())
-	var names []string
-	for _, tool := range e.buildToolsForLLM() {
-		names = append(names, tool.Function.Name)
-	}
-	require.NotContains(t, names, reviewRetrievalTool)
-}
-
-func TestRuntimeRetrievalReadBatchSharesQuestionWithoutInFlightRejection(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	search.output = `<retrieval><document id="one"/><document id="two"/></retrieval>`
-	search.published = []types.PublishedSourceRef{{ID: "one", Citable: true}, {ID: "two", Citable: true}}
-	require.True(t, retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
-	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "document content"}
-	e.toolRegistry.RegisterTool(reader)
-	response := &types.ChatResponse{ToolCalls: []types.LLMToolCall{
-		{ID: "one", Function: types.FunctionCall{Name: agenttools.ToolReadDocument, Arguments: `{"id":"one"}`}},
-		{ID: "two", Function: types.FunctionCall{Name: agenttools.ToolReadDocument, Arguments: `{"id":"two"}`}},
-	}}
-	var step types.AgentStep
-	require.Nil(t, e.executeToolCallsParallel(t.Context(), response, &step, 0, "session", "message"))
-	require.Len(t, step.ToolCalls, 2)
-	for _, call := range step.ToolCalls {
-		require.True(t, call.Result.Success, call.Result.Error)
-	}
-	require.Len(t, reader.calls, 2)
-}
-
-func TestRuntimeRetrievalRecoversEarlierPartialFailureAfterReading(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	targets := types.SearchTargets{{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb", TenantID: 1}}
-	e.config.SearchTargets = targets
-	e.beginTurn("TapTap sandbox configuration", nil, &types.AgentState{})
-	e.EnableRuntimeRetrieval()
-	search.result = &types.ToolResult{Success: true, Output: `<retrieval><document id="doc"/></retrieval>`, PublishedSources: []types.PublishedSourceRef{{ID: "doc", Citable: true}},
-		RetrievalFailures: []types.RetrievalFailure{{KnowledgeBaseIDs: []string{"kb"}, Targets: targets, Stage: "embedding", Cause: context.DeadlineExceeded}}}
-	require.True(t, retrievalProbeCall(e, "search", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
-	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)), output: "usable evidence"}
-	e.toolRegistry.RegisterTool(reader)
-	require.True(t, retrievalProbeCall(e, "read", agenttools.ToolReadDocument, `{"id":"doc"}`).Result.Success)
-	search.result = &types.ToolResult{Success: true, Output: "recovered evidence"}
-	call := retrievalProbeCall(e, "recover", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["kb"]}`)
-	require.True(t, call.Result.Success, call.Result.Error)
-	state := e.retrieval.snapshot()
-	require.Equal(t, "search", state.Attempts[2].RecoveryCallID)
-	require.Empty(t, outstandingRetrievalFailures(state.Attempts, "gap-1"))
-	_, err := restoreRetrievalControl(state)
-	require.NoError(t, err)
-}
-
-func TestRuntimeRetrievalContinuationFromBroadQuestion(t *testing.T) {
-	const goal = "sdk的沙盒支付怎么设置"
-	for _, tc := range []struct {
-		name, input, decision string
-		used                  int
-		newBranch             bool
-	}{
-		{"platform after two searches", "App Store iOS 内购", "allow", 2, true},
-		{"platform matched to original fact", "App Store iOS 内购", "reuse", 2, false},
-		{"platform after one search", "App Store iOS 内购", "allow", 1, true},
-		{"rephrasing after two searches", "再查一下 SDK 沙盒支付配置", "reuse", 2, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e, _ := newRuntimeRetrievalProbeEngine(t)
-			e.EnableRuntimeRetrieval()
-			e.SetRetrievalUserMessage("original", goal)
-			e.beginTurn(goal, nil, &types.AgentState{})
-			for i := 0; i < tc.used; i++ {
-				call := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i))
-				require.True(t, call.Result.Success, call.Result.Error)
-			}
-			raw, err := json.Marshal(e.retrieval.snapshot())
-			require.NoError(t, err)
-			next, search := newRuntimeRetrievalProbeEngine(t)
-			next.EnableRuntimeRetrieval()
-			next.SetRetrievalUserMessage("followup", tc.input)
-			next.beginTurn(tc.input, nil, &types.AgentState{})
-			next.SetRetrievalPersistence(raw, nil)
-			next.chatModel = &projectContextChat{mockChat: &mockChat{}, replies: []string{
-				`{"decision":"continue","gap_id":"gap-1","reason":"same overall goal"}`,
-				fmt.Sprintf(`{"decision":"%s","gap_id":"gap-1","reason":"checked the applicability of the current input"}`, tc.decision),
-			}}
-			require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-			for i := 0; i < questionSearchGrace; i++ {
-				call := retrievalProbeCall(next, fmt.Sprintf("followup-%d", i), agenttools.ToolSearchKnowledge,
-					fmt.Sprintf(`{"query":"query-%d","retrieval":{"action":"initial","goal_quote":%q,"fact":%q}}`, i, tc.input, tc.input))
-				require.True(t, call.Result.Success, call.Result.Error)
-			}
-			// Even a fully grounded initial proposal cannot re-register this message for more searches.
-			extra := retrievalProbeCall(next, "extra", agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"different wording","retrieval":{"action":"initial","goal_quote":%q,"goal_input_id":"message:followup","fact":"another fact"}}`, tc.input))
-			require.False(t, extra.Result.Success)
-			require.Len(t, next.chatModel.(*projectContextChat).calls, 2)
-			require.Len(t, search.calls, questionSearchGrace)
-			state := next.retrieval.snapshot()
-			require.Len(t, state.Attempts, tc.used+questionSearchGrace)
-			require.Equal(t, "message:original", state.Attempts[0].QuestionID)
-			require.Equal(t, "message:followup", state.Attempts[tc.used].QuestionID)
-			if tc.newBranch {
-				require.Len(t, state.Gaps, 2)
-				require.Equal(t, tc.input, state.Gaps[1].Conditions)
-				require.Equal(t, state.Gaps[1].ID, state.Attempts[tc.used].GapID)
-			} else {
-				require.Len(t, state.Gaps, 1)
-			}
-			_, err = restoreRetrievalControl(state)
-			require.NoError(t, err)
-		})
-	}
-}
-
-func TestQuestionBudgetSurvivesResumeAndLegacyAttempts(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(fmt.Sprint(legacy), func(t *testing.T) {
-			const goal = "SDK 沙盒支付"
-			e, _ := newRuntimeRetrievalProbeEngine(t)
-			e.EnableRuntimeRetrieval()
-			e.SetRetrievalUserMessage("question", goal)
-			e.beginTurn(goal, nil, &types.AgentState{})
-			e.retrievalTurnID = "reply"
-			for i := 0; i < questionSearchGrace; i++ {
-				call := retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i))
-				require.True(t, call.Result.Success, call.Result.Error)
-			}
-			saved := e.retrieval.snapshot()
-			if legacy {
-				for i := range saved.Attempts {
-					saved.Attempts[i].QuestionID = ""
-				}
-			}
-			raw, err := json.Marshal(saved)
-			require.NoError(t, err)
-			for _, msg := range []struct {
-				id, turn string
-				want     bool
-			}{{"question", "reply", false}, {"new-question", "new-reply", true}} {
-				next, search := newRuntimeRetrievalProbeEngine(t)
-				next.EnableRuntimeRetrieval()
-				next.SetRetrievalUserMessage(msg.id, goal)
-				next.beginTurn(goal, nil, &types.AgentState{})
-				next.retrievalTurnID = msg.turn
-				next.SetRetrievalPersistence(raw, nil)
-				require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-				call := retrievalProbeCall(next, "retry", agenttools.ToolSearchKnowledge, `{"query":"new words"}`)
-				require.Equal(t, msg.want, call.Result.Success, call.Result.Error)
-				require.Equal(t, msg.want, len(search.calls) == 1)
-				_, err = restoreRetrievalControl(next.retrieval.snapshot())
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestRuntimeRetrievalRejectedCallDoesNotReintroduceReviewProtocol(t *testing.T) {
-	model := &runtimeRetrievalChat{mockChat: &mockChat{responses: []mockResponse{
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "tool_calls",
-			ToolCalls: []types.LLMToolCall{{ID: "read", Function: types.FunctionCall{Name: agenttools.ToolReadDocument, Arguments: `{"id":"invented"}`}}}}}},
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "当前没有可读取的文档。", Done: true, FinishReason: "stop"}}},
-	}}}
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.chatModel = model
-	reader := &retrievalProbe{BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`))}
-	e.toolRegistry.RegisterTool(reader)
-	state, err := e.Execute(t.Context(), "session", "message", "TapTap sandbox configuration", nil)
-	require.NoError(t, err)
-	require.Equal(t, "当前没有可读取的文档。", state.FinalAnswer)
-	require.Empty(t, reader.calls)
-	require.Len(t, model.calls, 2)
-	for _, message := range model.calls[1] {
-		require.NotContains(t, message.Content, reviewRetrievalTool)
-		require.NotContains(t, message.Content, "action=initial")
-	}
-	require.Equal(t, 1, model.boundaryCalls)
-}
-
-func TestRuntimeRetrievalMissingUserConditionsBlockFirstSearch(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"needs_user","missing_user_fields":["扣款情况","订单号"],"reason":"payment investigation requires these user facts"}`}
-	call := retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"payment missing"}`)
-	require.False(t, call.Result.Success)
-	require.Empty(t, search.calls)
-	require.Equal(t, retrievalNeedsUser, e.retrieval.snapshot().Gaps[0].Status)
-	require.False(t, e.usesRuntimeRetrieval())
-}
-
-func TestRuntimeRetrievalAnsweredConditionGetsBranchAdmission(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	for i := 0; i < questionSearchGrace; i++ {
-		require.True(t, retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i)).Result.Success)
-	}
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", Status: retrievalNeedsUser, MissingUserFields: []string{"channel"}}))
-	raw, err := json.Marshal(e.retrieval.snapshot())
-	require.NoError(t, err)
-	next, search := newRuntimeRetrievalProbeEngine(t)
-	next.EnableRuntimeRetrieval()
-	next.SetRetrievalUserMessage("channel-answer", "iOS")
-	next.beginTurn("iOS", nil, &types.AgentState{})
-	next.SetRetrievalPersistence(raw, nil)
-	next.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"continue","reason":"the user supplied the missing channel","user_answers":[{"gap_id":"gap-1","field":"channel","input_id":"message:channel-answer","quote":"iOS"}]}`}
-	require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-	model := &runtimeRetrievalChat{mockChat: &mockChat{}}
-	next.chatModel = model
-	for i := 0; i < questionSearchGrace; i++ {
-		call := retrievalProbeCall(next, fmt.Sprintf("ios-%d", i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"iOS configuration %d"}`, i))
-		require.True(t, call.Result.Success, call.Result.Error)
-	}
-	require.Equal(t, 1, model.boundaryCalls)
-	require.Len(t, search.calls, questionSearchGrace)
-	require.Len(t, next.retrieval.snapshot().Gaps, 2)
-}
-
-// The continuation guard is model output: answers for a gap that is not
-// blocked on the user must be ignored, not fail the whole turn.
-func TestRuntimeRetrievalContinuationIgnoresAnswersForUnblockedGap(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	require.True(t, retrievalProbeCall(e, "first", agenttools.ToolSearchKnowledge, `{"query":"payment setup"}`).Result.Success)
-	require.Equal(t, retrievalPending, e.retrieval.snapshot().Gaps[0].Status)
-	raw, err := json.Marshal(e.retrieval.snapshot())
-	require.NoError(t, err)
-	next, _ := newRuntimeRetrievalProbeEngine(t)
-	next.EnableRuntimeRetrieval()
-	next.SetRetrievalUserMessage("followup", "iOS")
-	next.beginTurn("iOS", nil, &types.AgentState{})
-	next.SetRetrievalPersistence(raw, nil)
-	next.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"continue","reason":"same goal","user_answers":[{"gap_id":"gap-1","field":"channel","input_id":"message:followup","quote":"iOS"}]}`}
-	require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-	gap := next.retrieval.snapshot().Gaps[0]
-	require.Equal(t, retrievalPending, gap.Status)
-	require.Empty(t, gap.UserAnswers)
-}
-
-// Continuation answers are applied one by one: an invalid field must not drop
-// a valid answer to another field of the same gap.
-func TestRuntimeRetrievalContinuationKeepsValidAnswerBesideInvalidOne(t *testing.T) {
-	e, _ := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	for i := 0; i < questionSearchGrace; i++ {
-		require.True(t, retrievalProbeCall(e, fmt.Sprint(i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"query-%d"}`, i)).Result.Success)
-	}
-	require.NoError(t, e.retrieval.applyReview(retrievalReview{GapID: "gap-1", Status: retrievalNeedsUser, MissingUserFields: []string{"channel", "version"}}))
-	raw, err := json.Marshal(e.retrieval.snapshot())
-	require.NoError(t, err)
-	next, _ := newRuntimeRetrievalProbeEngine(t)
-	next.EnableRuntimeRetrieval()
-	next.SetRetrievalUserMessage("channel-answer", "iOS")
-	next.beginTurn("iOS", nil, &types.AgentState{})
-	next.SetRetrievalPersistence(raw, nil)
-	next.chatModel = &boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"continue","reason":"the user supplied the channel","user_answers":[{"gap_id":"gap-1","field":"channel","input_id":"message:channel-answer","quote":"iOS"},{"gap_id":"gap-1","field":"version","input_id":"message:channel-answer","quote":"1.0.3"}]}`}
-	require.NoError(t, next.initializeRetrievalContinuation(t.Context()))
-	gap := next.retrieval.snapshot().Gaps[0]
-	require.Equal(t, retrievalNeedsUser, gap.Status)
-	require.Equal(t, []string{"version"}, gap.MissingUserFields)
-	require.Len(t, gap.UserAnswers, 1)
+type retrievalProbe struct {
+	agenttools.BaseTool
+	calls   []json.RawMessage
+	output  string
+	result  *types.ToolResult
+	err     error
+	execute func(context.Context, json.RawMessage) (*types.ToolResult, error)
 }
 
 func searchCalls(queries ...string) *types.ChatResponse {
-	response := &types.ChatResponse{}
-	for _, query := range queries {
-		args, _ := json.Marshal(map[string]string{"query": query})
-		response.ToolCalls = append(response.ToolCalls, types.LLMToolCall{ID: query, Function: types.FunctionCall{
-			Name: agenttools.ToolSearchKnowledge, Arguments: string(args),
-		}})
+	calls := make([]types.LLMToolCall, 0, len(queries))
+	for i, q := range queries {
+		raw, _ := json.Marshal(map[string]any{"query": q})
+		calls = append(calls, types.LLMToolCall{
+			ID:       fmt.Sprintf("search-%d", i+1),
+			Type:     "function",
+			Function: types.FunctionCall{Name: agenttools.ToolSearchKnowledge, Arguments: string(raw)},
+		})
 	}
-	return response
+	return &types.ChatResponse{ToolCalls: calls, FinishReason: "tool_calls"}
 }
 
-type delayedRetrievalBoundaryChat struct{ *boundaryChat }
-
-func (m *delayedRetrievalBoundaryChat) Chat(ctx context.Context, messages []chat.Message, opts *chat.ChatOptions) (*types.ChatResponse, error) {
-	// Leave time for premature background I/O to run while admission is pending.
-	time.Sleep(50 * time.Millisecond)
-	return m.boundaryChat.Chat(ctx, messages, opts)
+func (p *retrievalProbe) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
+	p.calls = append(p.calls, append(json.RawMessage(nil), args...))
+	if p.execute != nil {
+		return p.execute(ctx, args)
+	}
+	if p.err != nil {
+		return p.result, p.err
+	}
+	if p.result != nil {
+		return p.result, nil
+	}
+	out := p.output
+	if out == "" {
+		out = "search output"
+	}
+	return &types.ToolResult{
+		Success: true,
+		Output:  out,
+		Data:    map[string]any{"display_type": "search_results", "results": []map[string]any{}},
+	}, nil
 }
 
-func TestParallelRetrievalMissingConditionsPreventExecution(t *testing.T) {
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	e.chatModel = &delayedRetrievalBoundaryChat{&boundaryChat{mockChat: &mockChat{}, reply: `{"decision":"needs_user","missing_user_fields":["channel"],"reason":"the channel is required"}`}}
+func retrievalScopeTarget(kbID string) *types.SearchTarget {
+	return &types.SearchTarget{
+		Type:            types.SearchTargetTypeKnowledgeBase,
+		KnowledgeBaseID: kbID,
+		TenantID:        1,
+	}
+}
+
+func newRuntimeRetrievalProbeEngine(t *testing.T) (*AgentEngine, *retrievalProbe) {
+	t.Helper()
+	e := newTestEngine(t, &mockChat{})
+	e.config.SearchTargets = types.SearchTargets{retrievalScopeTarget("kb-1")}
+	e.toolRegistry = agenttools.NewToolRegistry()
+	searchProbe := &retrievalProbe{
+		BaseTool: agenttools.NewBaseTool(agenttools.ToolSearchKnowledge, "search", json.RawMessage(`{
+			"type":"object",
+			"properties":{"query":{"type":"string"},"knowledge_base_ids":{"type":"array","items":{"type":"string"}}},
+			"required":["query"]
+		}`)),
+	}
+	readProbe := &retrievalProbe{
+		BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{
+			"type":"object",
+			"properties":{"id":{"type":"string"},"offset":{"type":"integer"}},
+			"required":["id"]
+		}`)),
+	}
+	e.toolRegistry.RegisterTool(searchProbe)
+	e.toolRegistry.RegisterTool(readProbe)
+	e.beginTurn("question", nil, &types.AgentState{})
+	return e, searchProbe
+}
+
+func newPartialRetrievalProbeEngine(t *testing.T) (*AgentEngine, *retrievalProbe) {
+	t.Helper()
+	e, probe := newRuntimeRetrievalProbeEngine(t)
+	e.config.SearchTargets = types.SearchTargets{
+		retrievalScopeTarget("healthy"),
+		retrievalScopeTarget("retryable"),
+	}
+	return e, probe
+}
+
+func partialRetrievalResult() *types.ToolResult {
+	return &types.ToolResult{
+		Success: true,
+		Output:  "partial results from healthy",
+		Data:    map[string]any{"display_type": "search_results", "results": []map[string]any{}},
+		RetrievalFailures: []types.RetrievalFailure{{
+			KnowledgeBaseIDs: []string{"retryable"},
+			Targets:          types.SearchTargets{retrievalScopeTarget("retryable")},
+			Stage:            "search",
+			Cause:            context.DeadlineExceeded,
+		}},
+	}
+}
+
+func retrievalProbeCall(e *AgentEngine, id, name, args string) types.ToolCall {
 	step := &types.AgentStep{}
-	e.executeToolCallsParallel(t.Context(), searchCalls("alpha", "beta"), step, 0, "session", "message")
-
-	require.Len(t, step.ToolCalls, 2)
-	for _, call := range step.ToolCalls {
-		require.False(t, call.Result.Success)
-		require.Contains(t, call.Result.Error, "channel")
+	e.executeSingleToolCall(
+		context.Background(),
+		types.LLMToolCall{ID: id, Function: types.FunctionCall{Name: name, Arguments: args}},
+		0, step, 0, 1, "sess", "msg",
+	)
+	if len(step.ToolCalls) == 0 {
+		return types.ToolCall{}
 	}
-	search.mu.Lock()
-	defer search.mu.Unlock()
-	require.Empty(t, search.calls, "refused searches must perform no tool I/O")
-	require.Empty(t, e.retrieval.snapshot().Attempts)
+	return step.ToolCalls[0]
 }
 
-func TestParallelRetrievalDoesNotExecuteRepeatedSearch(t *testing.T) {
-	for _, previousRound := range []bool{false, true} {
-		name := "same round"
-		if previousRound {
-			name = "previous round"
+func TestRuntimeRetrievalNeverMutatesToolSchemas(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("q1", "sandbox config")
+	e.beginTurn("sandbox config", nil, &types.AgentState{})
+
+	before := e.buildToolsForLLM()
+	beforeJSON, err := json.Marshal(before)
+	require.NoError(t, err)
+	require.NotContains(t, string(beforeJSON), "review_retrieval")
+	require.NotContains(t, string(beforeJSON), `"retrieval"`)
+
+	for i := 1; i <= maxSearchesPerQuestion; i++ {
+		call := retrievalProbeCall(e, fmt.Sprintf("s%d", i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"q-%d"}`, i))
+		require.True(t, call.Result.Success, call.Result.Error)
+	}
+
+	after := e.buildToolsForLLM()
+	afterJSON, err := json.Marshal(after)
+	require.NoError(t, err)
+	require.Equal(t, string(beforeJSON), string(afterJSON), "KB tool schemas must stay byte-identical across the entire turn for prompt prefix caching")
+}
+
+func TestRuntimeRetrievalBlocksDuplicateAndEnforcesBudget(t *testing.T) {
+	e, probe := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("q1", "sandbox config")
+	e.beginTurn("sandbox config", nil, &types.AgentState{})
+
+	first := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.True(t, first.Result.Success)
+
+	dup := retrievalProbeCall(e, "s2", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.False(t, dup.Result.Success)
+	require.Contains(t, dup.Result.Error, "exact search already completed")
+	require.Len(t, probe.calls, 1)
+
+	for i := 2; i <= maxSearchesPerQuestion; i++ {
+		call := retrievalProbeCall(e, fmt.Sprintf("u%d", i), agenttools.ToolSearchKnowledge, fmt.Sprintf(`{"query":"distinct-%d"}`, i))
+		require.True(t, call.Result.Success, call.Result.Error)
+	}
+	over := retrievalProbeCall(e, "over", agenttools.ToolSearchKnowledge, `{"query":"one-too-many"}`)
+	require.False(t, over.Result.Success)
+	require.Contains(t, over.Result.Error, "search budget exhausted")
+	require.Len(t, probe.calls, maxSearchesPerQuestion)
+	require.Contains(t, e.retrievalStatePrompt(), "search budget for this question is spent")
+}
+
+func TestRuntimeRetrievalValidatesReadDocumentObservedID(t *testing.T) {
+	e, probe := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("q1", "check docs")
+	e.beginTurn("check docs", nil, &types.AgentState{})
+
+	unseen := retrievalProbeCall(e, "r1", agenttools.ToolReadDocument, `{"id":"invented-doc"}`)
+	require.False(t, unseen.Result.Success)
+	require.Contains(t, unseen.Result.Error, "requires a document reference")
+
+	probe.result = &types.ToolResult{
+		Success: true,
+		Output:  "found doc-42",
+		Data: map[string]any{
+			"display_type": "search_results",
+			"results":      []map[string]any{{"knowledge_id": "doc-42", "chunk_id": "chunk-1"}},
+		},
+	}
+	searchCall := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"find doc"}`)
+	require.True(t, searchCall.Result.Success)
+
+	seen := retrievalProbeCall(e, "r2", agenttools.ToolReadDocument, `{"id":"doc-42"}`)
+	require.True(t, seen.Result.Success, seen.Result.Error)
+}
+
+func TestRuntimeRetrievalScopedPartialFailureRecoveryOnce(t *testing.T) {
+	e, probe := newPartialRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("q1", "sandbox")
+	e.beginTurn("sandbox", nil, &types.AgentState{})
+
+	probe.result = partialRetrievalResult()
+	first := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`)
+	require.True(t, first.Result.Success)
+
+	// Retry only the failed KB: succeeds and marks action=recovery.
+	probe.result = &types.ToolResult{Success: true, Output: "recovered", Data: map[string]any{"display_type": "search_results"}}
+	rec := retrievalProbeCall(e, "s2", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["retryable"]}`)
+	require.True(t, rec.Result.Success, rec.Result.Error)
+	require.Equal(t, retrievalRecovery, e.retrieval.snapshot().Attempts[1].Action)
+
+	// Repeating the succeeded recovery search is blocked as a duplicate.
+	dupRec := retrievalProbeCall(e, "s3", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["retryable"]}`)
+	require.False(t, dupRec.Result.Success)
+	require.Contains(t, dupRec.Result.Error, "exact search already completed")
+
+	// When a recovery itself fails transiently, a second recovery is also blocked.
+	e2, probe2 := newPartialRetrievalProbeEngine(t)
+	e2.EnableRuntimeRetrieval()
+	e2.SetRetrievalUserMessage("q2", "sandbox2")
+	e2.beginTurn("sandbox2", nil, &types.AgentState{})
+	probe2.result = partialRetrievalResult()
+	require.True(t, retrievalProbeCall(e2, "a1", agenttools.ToolSearchKnowledge, `{"query":"sandbox2"}`).Result.Success)
+	probe2.err = context.DeadlineExceeded
+	probe2.result = &types.ToolResult{Success: false, Error: "timeout"}
+	recFail := retrievalProbeCall(e2, "a2", agenttools.ToolSearchKnowledge, `{"query":"sandbox2","knowledge_base_ids":["retryable"]}`)
+	require.False(t, recFail.Result.Success)
+	recAgain := retrievalProbeCall(e2, "a3", agenttools.ToolSearchKnowledge, `{"query":"sandbox2","knowledge_base_ids":["retryable"]}`)
+	require.False(t, recAgain.Result.Success)
+	require.Contains(t, recAgain.Result.Error, "recovery already used")
+}
+
+func TestRuntimeRetrievalSnapshotVersioningAndValidation(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.beginTurn("q", nil, &types.AgentState{})
+	scope := e.retrieval.snapshot().Scope
+
+	// v1 and v2 snapshots are discarded cleanly without failing resume.
+	for _, legacyVersion := range []int{1, 2} {
+		restored, err := e.restoreSavedRetrieval(t.Context(), retrievalState{
+			Version: legacyVersion,
+			Scope:   scope,
+			Scopes:  []string{scope},
+		})
+		require.NoError(t, err)
+		require.Nil(t, restored, "legacy v%d snapshot should be discarded cleanly", legacyVersion)
+	}
+
+	// Valid v3 and v4 snapshots restore losslessly, preserving structured sources.
+	for _, supportedVersion := range []int{3, 4} {
+		saved := retrievalState{
+			Version:      supportedVersion,
+			Goal:         "check docs",
+			Scope:        scope,
+			Scopes:       []string{scope},
+			UserInputIDs: []string{"message:u1"},
+			Attempts: []retrievalAttempt{{
+				QuestionID:        "message:u1",
+				ID:                "call-1",
+				Scope:             scope,
+				Action:            retrievalInitial,
+				Tool:              agenttools.ToolSearchKnowledge,
+				Arguments:         `{"query":"docs"}`,
+				Completed:         true,
+				Outcome:           retrievalSuccess,
+				StructuredSources: true,
+				ObservedIDs:       []string{"doc-1"},
+				CitableIDs:        []string{"doc-1"},
+			}},
 		}
-		t.Run(name, func(t *testing.T) {
+		restored, err := e.restoreSavedRetrieval(t.Context(), saved)
+		require.NoError(t, err)
+		require.NotNil(t, restored, "v%d snapshot must restore losslessly", supportedVersion)
+		snap := restored.snapshot()
+		require.Equal(t, retrievalStateVersion, snap.Version)
+		require.Len(t, snap.Attempts, 1)
+		require.Equal(t, []string{"doc-1"}, snap.Attempts[0].ObservedIDs)
+		require.Equal(t, []string{"doc-1"}, snap.Attempts[0].CitableIDs)
+	}
+
+	// Unsupported versions return an error.
+	for _, badVersion := range []int{0, 5, 99} {
+		_, err := restoreRetrievalControl(retrievalState{Version: badVersion, Scope: scope, Scopes: []string{scope}})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unsupported retrieval snapshot version")
+	}
+
+	// Structural invariants: duplicate attempt ID, out-of-scope attempt, unknown question, invalid recovery.
+	_, err := restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "dup", Scope: scope, Action: retrievalInitial, Tool: agenttools.ToolSearchKnowledge},
+			{ID: "dup", Scope: scope, Action: retrievalSearch, Tool: agenttools.ToolSearchKnowledge},
+		},
+	})
+	require.Error(t, err)
+
+	_, err = restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "a1", Scope: retrievalScopeForTargets(types.SearchTargets{retrievalScopeTarget("other-kb")}), Action: retrievalInitial, Tool: agenttools.ToolSearchKnowledge},
+		},
+	})
+	require.Error(t, err)
+
+	_, err = restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "a1", Scope: scope, Action: retrievalRecovery, RecoveryCallID: "missing", Tool: agenttools.ToolSearchKnowledge},
+		},
+	})
+	require.Error(t, err)
+
+	// Completed/Outcome pairing validation and unfinished attempt reconciliation.
+	_, err = restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "a1", Scope: scope, Action: retrievalInitial, Tool: agenttools.ToolSearchKnowledge, Completed: true, Outcome: ""},
+		},
+	})
+	require.Error(t, err)
+
+	_, err = restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "a1", Scope: scope, Action: retrievalInitial, Tool: agenttools.ToolSearchKnowledge, Completed: false, Outcome: retrievalSuccess},
+		},
+	})
+	require.Error(t, err)
+
+	reconciled, err := restoreRetrievalControl(retrievalState{
+		Version: 4, Scope: scope, Scopes: []string{scope},
+		Attempts: []retrievalAttempt{
+			{ID: "a1", Scope: scope, Action: retrievalInitial, Tool: agenttools.ToolSearchKnowledge, Completed: false},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, reconciled.snapshot().Attempts[0].Completed)
+	require.Equal(t, retrievalUnknown, reconciled.snapshot().Attempts[0].Outcome)
+}
+
+func TestPartialRecoveryOnlyRecordsTransientOverlappingStagesAndRoundTrips(t *testing.T) {
+	e, probe := newRuntimeRetrievalProbeEngine(t)
+	e.config.SearchTargets = types.SearchTargets{
+		retrievalScopeTarget("kb-a"),
+		retrievalScopeTarget("kb-b"),
+		retrievalScopeTarget("kb-c"),
+	}
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u1", "mixed partial failure")
+	e.beginTurn("mixed partial failure", nil, &types.AgentState{})
+
+	// KB A has a non-transient embedding failure, KB B has a transient search timeout, KB C succeeds.
+	probe.result = &types.ToolResult{
+		Success: true,
+		Output:  "results from kb-c",
+		Data:    map[string]any{"display_type": "search_results", "results": []map[string]any{}},
+		RetrievalFailures: []types.RetrievalFailure{
+			{
+				KnowledgeBaseIDs: []string{"kb-a"},
+				Targets:          types.SearchTargets{retrievalScopeTarget("kb-a")},
+				Stage:            "embedding",
+				Cause:            errors.New("bad api key"),
+			},
+			{
+				KnowledgeBaseIDs: []string{"kb-b"},
+				Targets:          types.SearchTargets{retrievalScopeTarget("kb-b")},
+				Stage:            "search",
+				Cause:            context.DeadlineExceeded,
+			},
+		},
+	}
+	first := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"mixed"}`)
+	require.True(t, first.Result.Success)
+
+	// Retrying only KB B must record only ["search"] (never KB A's non-transient "embedding").
+	probe.result = &types.ToolResult{Success: true, Output: "recovered kb-b", Data: map[string]any{"display_type": "search_results"}}
+	rec := retrievalProbeCall(e, "s2", agenttools.ToolSearchKnowledge, `{"query":"mixed","knowledge_base_ids":["kb-b"]}`)
+	require.True(t, rec.Result.Success, rec.Result.Error)
+
+	snap := e.retrieval.snapshot()
+	require.Len(t, snap.Attempts, 2)
+	require.Equal(t, retrievalRecovery, snap.Attempts[1].Action)
+	require.Equal(t, []string{"search"}, snap.Attempts[1].RecoveryStages)
+
+	// The persisted snapshot must cleanly round-trip through restoreRetrievalControl without self-rejection.
+	raw, err := json.Marshal(snap)
+	require.NoError(t, err)
+	var decoded retrievalState
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	restored, err := restoreRetrievalControl(decoded)
+	require.NoError(t, err)
+	require.NotNil(t, restored)
+}
+
+// TestKBToolToReadDocumentContractMatrix verifies the cross-tool invariant across
+// all KB tools: candidate vs citable separation, body-text spoofing resistance,
+// scope coverage, and JSON snapshot suspend/resume + FAQ preflight round-trip.
+func TestKBToolToReadDocumentContractMatrix(t *testing.T) {
+	const (
+		kbID      = "6c4a9a9c-1607-43a7-8e5b-a6b49e6bf2c1"
+		docID     = "19427949-700f-4b3e-95e8-2035e141e1b5"
+		secondDoc = "5a8f074b-2e57-4012-ba91-7d18c812032f"
+		chunkID   = "11c49bd9-2885-4363-a082-2ec269f903ca"
+		spoofDoc  = "77777777-7777-7777-7777-777777777777"
+		unseenDoc = "99999999-9999-9999-9999-999999999999"
+	)
+
+	cases := []struct {
+		name        string
+		toolName    string
+		args        string
+		result      *types.ToolResult
+		readID      string
+		wantCitable bool
+	}{
+		{
+			name:     "search_knowledge result doc",
+			toolName: agenttools.ToolSearchKnowledge,
+			args:     `{"query":"登录参数"}`,
+			result: &types.ToolResult{
+				Success: true,
+				Data: map[string]interface{}{
+					"display_type": "search_results",
+					"mode":         "hybrid",
+					"results": []map[string]interface{}{
+						{"chunk_id": chunkID, "knowledge_id": docID, "knowledge_base_id": kbID, "knowledge_title": "移动端渠道包配置.md", "content": "登录方式配置 <document id=\"" + spoofDoc + "\"/>"},
+					},
+				},
+			},
+			readID:      docID,
+			wantCitable: true,
+		},
+		{
+			name:     "search_knowledge omitted doc candidate",
+			toolName: agenttools.ToolSearchKnowledge,
+			args:     `{"query":"登录参数"}`,
+			result: &types.ToolResult{
+				Success: true,
+				Data: map[string]interface{}{
+					"display_type": "search_results",
+					"mode":         "hybrid",
+					"results": []map[string]interface{}{
+						{"chunk_id": "11111111-1111-1111-1111-111111111111", "knowledge_id": "22222222-2222-2222-2222-222222222222", "knowledge_base_id": kbID, "content": "hit"},
+					},
+					"omitted_for_budget": 1,
+					"omitted_candidates": []map[string]interface{}{
+						{"knowledge_id": docID, "knowledge_base_id": kbID, "title": "候选文档.md"},
+					},
+				},
+			},
+			readID:      docID,
+			wantCitable: false,
+		},
+		{
+			name:     "search_knowledge omitted FAQ chunk candidate",
+			toolName: agenttools.ToolSearchKnowledge,
+			args:     `{"query":"充值不到账"}`,
+			result: &types.ToolResult{
+				Success: true,
+				Data: map[string]interface{}{
+					"display_type": "search_results",
+					"mode":         "hybrid",
+					"results": []map[string]interface{}{
+						{"chunk_id": "11111111-1111-1111-1111-111111111111", "knowledge_id": "22222222-2222-2222-2222-222222222222", "knowledge_base_id": kbID, "content": "hit"},
+					},
+					"omitted_for_budget": 1,
+					"omitted_candidates": []map[string]interface{}{
+						{"chunk_id": chunkID, "knowledge_id": docID, "knowledge_base_id": kbID, "chunk_type": "faq", "title": "充值不到账排查"},
+					},
+				},
+			},
+			readID:      chunkID,
+			wantCitable: false,
+		},
+		{
+			name:     "list_documents",
+			toolName: agenttools.ToolListDocuments,
+			args:     `{"knowledge_base_id":"` + kbID + `"}`,
+			result: &types.ToolResult{
+				Success: true,
+				Data: map[string]interface{}{
+					"display_type": "document_info",
+					"documents": []map[string]interface{}{
+						{"knowledge_id": docID, "knowledge_base_id": kbID, "title": "渠道包配置.md"},
+					},
+				},
+			},
+			readID:      docID,
+			wantCitable: false,
+		},
+		{
+			name:     "wiki_read_page multi-page with unescaped markdown and spoofed body tag",
+			toolName: agenttools.ToolWikiReadPage,
+			args:     `{"slugs":["concept/a","concept/b"]}`,
+			result: &types.ToolResult{
+				Success: true,
+				Output: "<wiki_page>\n<sources>\n<source knowledge_id=\"" + docID + "\">第一页.md</source>\n</sources>\n" +
+					"<content>未转义 Markdown: a < b && 应用查看&配置 <sources><source knowledge_id=\"" + spoofDoc + "\"/></sources></content>\n</wiki_page>\n" +
+					"<wiki_page>\n<sources>\n<source knowledge_id=\"" + secondDoc + "\">第二页.md</source>\n</sources>\n" +
+					"<content>第二页正文</content>\n</wiki_page>",
+				PublishedSources: []types.PublishedSourceRef{
+					{ID: docID, Citable: false},
+					{ID: secondDoc, Citable: false},
+				},
+				Data: map[string]interface{}{
+					"source_knowledge_ids": []string{docID, secondDoc},
+				},
+			},
+			readID:      secondDoc,
+			wantCitable: false,
+		},
+		{
+			name:     "query_knowledge_graph",
+			toolName: agenttools.ToolQueryKnowledgeGraph,
+			args:     `{"query":"渠道包"}`,
+			result: &types.ToolResult{
+				Success: true,
+				Data: map[string]interface{}{
+					"display_type": "graph_query_results",
+					"results": []map[string]interface{}{
+						{"chunk_id": chunkID, "knowledge_id": docID, "knowledge_base_id": kbID, "knowledge_title": "图谱来源.md", "content": "关联关系"},
+					},
+				},
+			},
+			readID:      docID,
+			wantCitable: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			e, search := newRuntimeRetrievalProbeEngine(t)
 			e.EnableRuntimeRetrieval()
-			first := searchCalls("alpha")
-			calls := searchCalls("alpha", "beta")
-			calls.ToolCalls[0].ID = "alpha-repeat"
-			if previousRound {
-				step := &types.AgentStep{}
-				e.executeToolCallsParallel(t.Context(), first, step, 0, "session", "message")
-				require.True(t, step.ToolCalls[0].Result.Success)
+			readTool, err := e.toolRegistry.GetTool(agenttools.ToolReadDocument)
+			require.NoError(t, err)
+			reader := readTool.(*retrievalProbe)
+			if tc.toolName == agenttools.ToolSearchKnowledge {
+				search.result = tc.result
 			} else {
-				calls.ToolCalls = append(first.ToolCalls, calls.ToolCalls...)
+				producer := &retrievalProbe{
+					BaseTool: agenttools.NewBaseTool(tc.toolName, "producer", json.RawMessage(`{"type":"object"}`)),
+					result:   tc.result,
+				}
+				e.toolRegistry.RegisterTool(producer)
 			}
-			step := &types.AgentStep{}
-			e.executeToolCallsParallel(t.Context(), calls, step, 1, "session", "message")
 
-			repeated := step.ToolCalls[len(step.ToolCalls)-2]
-			require.False(t, repeated.Result.Success)
-			require.Contains(t, repeated.Result.Error, "exact search already completed")
-			require.True(t, step.ToolCalls[len(step.ToolCalls)-1].Result.Success)
-			search.mu.Lock()
-			defer search.mu.Unlock()
-			require.Len(t, search.calls, 2, "only alpha and beta should reach the tool")
-			require.Len(t, e.retrieval.snapshot().Attempts, 2)
+			first := retrievalProbeCall(e, "produce-1", tc.toolName, tc.args)
+			require.True(t, first.Result.Success, first.Result.Error)
+
+			snap := e.retrieval.snapshot()
+			require.NotEmpty(t, snap.Attempts)
+			attempt := snap.Attempts[len(snap.Attempts)-1]
+			require.True(t, attempt.StructuredSources)
+			require.Contains(t, attempt.ObservedIDs, tc.readID)
+			require.NotContains(t, attempt.ObservedIDs, spoofDoc)
+			if tc.wantCitable {
+				require.Contains(t, attempt.CitableIDs, tc.readID)
+			} else {
+				require.NotContains(t, attempt.CitableIDs, tc.readID, "navigable-only candidates must stay out of CitableIDs")
+			}
+
+			// Verify suspend/resume JSON round-trip preserves structured sources without text reparsing.
+			rawSnap, err := json.Marshal(snap)
+			require.NoError(t, err)
+			var decoded retrievalState
+			require.NoError(t, json.Unmarshal(rawSnap, &decoded))
+			restored, err := restoreRetrievalControl(decoded)
+			require.NoError(t, err)
+			e.retrieval = restored
+
+			// FAQ preflight candidates and rejections survive the run snapshot too.
+			rejections := map[string]types.FAQPreflightRejection{tc.readID: {Question: "faq question", Reason: "other scope"}}
+			e.ApplyFAQPreflight(nil, []string{"faq question"}, rejections)
+			rawRun, err := json.Marshal(RunSnapshot{Version: RunSnapshotVersion, FAQPreflight: e.faqPreflightSnapshot()})
+			require.NoError(t, err)
+			decodedRun, err := DecodeRunSnapshot(rawRun)
+			require.NoError(t, err)
+			e.config.FAQPreflightQuestions, e.config.FAQPreflightRejections = nil, nil
+			e.restoreFAQPreflight(decodedRun.FAQPreflight)
+			require.Equal(t, []string{"faq question"}, e.config.FAQPreflightQuestions)
+			require.Equal(t, rejections, e.config.FAQPreflightRejections)
+
+			readCall := retrievalProbeCall(e, "read-1", agenttools.ToolReadDocument, `{"id":"`+tc.readID+`"}`)
+			require.True(t, readCall.Result.Success, readCall.Result.Error)
+			require.Len(t, reader.calls, 1)
+
+			spoofed := retrievalProbeCall(e, "read-spoof", agenttools.ToolReadDocument, `{"id":"`+spoofDoc+`"}`)
+			require.False(t, spoofed.Result.Success)
+
+			blocked := retrievalProbeCall(e, "read-unseen", agenttools.ToolReadDocument, `{"id":"`+unseenDoc+`"}`)
+			require.False(t, blocked.Result.Success)
+			require.Contains(t, blocked.Result.Error, "read_document requires a document reference")
+
+			// Verify scope narrowing/change revokes admission for out-of-scope observations.
+			e.retrieval.mu.Lock()
+			e.retrieval.state.Scope = `["kb:different-scope"]`
+			e.retrieval.mu.Unlock()
+			require.False(t, e.runtimeDocumentObserved(e.retrieval.snapshot(), tc.readID))
 		})
 	}
 }
 
-func TestParallelRetrievalTimingAndSpanCoverExecution(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(server.Close)
-	manager, err := langfuse.Init(langfuse.Config{
-		Enabled: true, Host: server.URL, PublicKey: "pk-test", SecretKey: "sk-test",
-		FlushAt: 8, FlushInterval: time.Hour, QueueSize: 32, RequestTimeout: time.Second, SampleRate: 1,
-	})
+func TestExecuteContinuationRestoresPreviousRetrievalStateForRetainHistory(t *testing.T) {
+	scope := retrievalScopeForTargets(types.SearchTargets{retrievalScopeTarget("kb-1")})
+	priorRef := retrievalCallReference("msg-1", "call-1")
+	prevState := retrievalState{
+		Version:      retrievalStateVersion,
+		Goal:         "first question",
+		Scope:        scope,
+		Scopes:       []string{scope},
+		UserInputIDs: []string{"message:u1"},
+		Attempts: []retrievalAttempt{{
+			QuestionID:        "message:u1",
+			ID:                priorRef,
+			Scope:             scope,
+			Action:            retrievalInitial,
+			Tool:              agenttools.ToolSearchKnowledge,
+			Arguments:         `{"query":"login"}`,
+			Completed:         true,
+			Outcome:           retrievalSuccess,
+			StructuredSources: true,
+			ObservedIDs:       []string{"doc-prev"},
+			CitableIDs:        []string{"doc-prev"},
+		}},
+		AwaitingUserInput: true,
+	}
+	prevRaw, err := json.Marshal(prevState)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, manager.Shutdown(context.Background()))
-		_, err := langfuse.Init(langfuse.Config{Enabled: false})
-		require.NoError(t, err)
-	})
-	ctx, root := manager.StartTrace(t.Context(), langfuse.TraceOptions{Name: "test"})
-	defer root.Finish(nil, nil)
-	ctx, roundSpan := manager.Tracer().Start(ctx, "agent.round.1")
-	defer roundSpan.End()
-	e, search := newRuntimeRetrievalProbeEngine(t)
-	e.EnableRuntimeRetrieval()
-	type executionRecord struct {
-		callID            string
-		span              sdktrace.ReadOnlySpan
-		started, finished time.Time
-	}
-	var executions []executionRecord
-	var mu sync.Mutex
-	e.toolRegistry = agenttools.NewToolRegistry()
-	e.toolRegistry.RegisterTool(&orderedTestTool{BaseTool: search.BaseTool, run: func(ctx context.Context) *types.ToolResult {
-		started := time.Now()
-		execution, _ := agenttools.ToolExecFromContext(ctx)
-		span, _ := trace.SpanFromContext(ctx).(sdktrace.ReadOnlySpan)
-		time.Sleep(50 * time.Millisecond)
-		mu.Lock()
-		executions = append(executions, executionRecord{execution.ToolCallID, span, started, time.Now()})
-		mu.Unlock()
-		return &types.ToolResult{Success: true, Output: "search evidence"}
-	}})
-	step := &types.AgentStep{}
-	e.executeToolCallsParallel(ctx, searchCalls("alpha", "beta"), step, 0, "session", "message")
 
-	mu.Lock()
-	defer mu.Unlock()
-	require.Len(t, step.ToolCalls, 2)
-	require.Len(t, executions, 2)
-	for i, call := range step.ToolCalls {
-		require.True(t, call.Result.Success, call.Result.Error)
-		require.GreaterOrEqual(t, call.Duration, int64(40), "duration must include the actual search")
-		execution := executions[i]
-		require.Equal(t, call.ID, execution.callID)
-		require.NotNil(t, execution.span)
-		require.Equal(t, "agent.tool.search_knowledge", execution.span.Name())
-		require.Equal(t, roundSpan.SpanContext().SpanID(), execution.span.Parent().SpanID())
-		require.False(t, execution.span.StartTime().After(execution.started))
-		require.False(t, execution.span.EndTime().Before(execution.finished))
+	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
+		{ResponseType: types.ResponseTypeAnswer, Content: "follow-up answer", Done: true, FinishReason: "stop"},
+	}}}}
+	e := newTestEngine(t, model)
+	e.config.SearchTargets = types.SearchTargets{retrievalScopeTarget("kb-1")}
+	e.config.RetainRetrievalHistory = true
+	e.toolRegistry = agenttools.NewToolRegistry()
+	e.toolRegistry.RegisterTool(&retrievalProbe{
+		BaseTool: agenttools.NewBaseTool(agenttools.ToolSearchKnowledge, "search", json.RawMessage(`{"type":"object"}`)),
+	})
+	e.toolRegistry.RegisterTool(&retrievalProbe{
+		BaseTool: agenttools.NewBaseTool(agenttools.ToolReadDocument, "read", json.RawMessage(`{"type":"object"}`)),
+	})
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u2", "follow-up question")
+	var savedRaw json.RawMessage
+	e.SetRetrievalPersistence(prevRaw, func(_ context.Context, raw json.RawMessage) error {
+		savedRaw = append(json.RawMessage(nil), raw...)
+		return nil
+	})
+
+	history := []chat.Message{
+		{Role: "user", Content: "first question"},
+		{
+			Role: "assistant",
+			ToolCalls: []chat.ToolCall{{
+				ID:   "call-1",
+				Type: "function",
+				Function: chat.FunctionCall{
+					Name:      agenttools.ToolSearchKnowledge,
+					Arguments: `{"query":"login"}`,
+				},
+			}},
+		},
+		{
+			Role:       "tool",
+			ToolCallID: "call-1",
+			TurnID:     "msg-1",
+			Name:       agenttools.ToolSearchKnowledge,
+			Content:    "preserved-turn1-kb-evidence",
+		},
+		{Role: "assistant", Content: "first answer"},
 	}
-	require.NotEqual(t, executions[0].span.SpanContext().SpanID(), executions[1].span.SpanContext().SpanID())
+
+	state, err := e.Execute(t.Context(), "sess-1", "msg-2", "follow-up question", history, nil)
+	require.NoError(t, err)
+	require.Equal(t, "follow-up answer", state.FinalAnswer)
+	require.NotEmpty(t, model.calls)
+
+	// Prior in-scope KB tool result must be replayed unredacted.
+	foundUnredacted := false
+	for _, msg := range model.calls[0] {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "preserved-turn1-kb-evidence") {
+			foundUnredacted = true
+			require.NotContains(t, msg.Content, "omitted")
+		}
+	}
+	require.True(t, foundUnredacted, "in-scope Turn 1 KB evidence must stay unredacted on Turn 2 continuation")
+
+	// Observed doc from Turn 1 remains readable on Turn 2, and AwaitingUserInput was cleared.
+	require.True(t, e.runtimeDocumentObserved(e.retrieval.snapshot(), "doc-prev"))
+	require.False(t, e.retrieval.isAwaitingUserInput())
+	require.Nil(t, RetrievalMissingUserFields(savedRaw))
+}
+
+func TestPersistenceFailureIsStickyAndBlocksAskUser(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u1", "need clarification")
+	e.beginTurn("need clarification", nil, &types.AgentState{})
+
+	failOnce := true
+	e.retrieval.mu.Lock()
+	e.retrieval.persist = func(_ retrievalState) error {
+		if failOnce {
+			failOnce = false
+			return errors.New("db write timeout")
+		}
+		return nil
+	}
+	e.retrieval.mu.Unlock()
+
+	// Trigger a persistence failure during tool preparation.
+	call := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"x"}`)
+	require.False(t, call.Result.Success)
+	require.True(t, e.retrieval.hasPersistenceFailed())
+
+	// Subsequent saves must stay blocked even though the underlying callback would now return nil.
+	e.retrieval.mu.Lock()
+	err := e.retrieval.saveLocked()
+	e.retrieval.mu.Unlock()
+	require.ErrorIs(t, err, errRetrievalStateSave)
+	require.True(t, e.retrieval.hasPersistenceFailed())
+
+	// Both publicAnswer and finishUserQuestion must fail with errRetrievalStateSave.
+	_, err = e.publicAnswer(t.Context(), "draft answer", nil)
+	require.ErrorIs(t, err, errRetrievalStateSave)
+
+	state := &types.AgentState{}
+	msgs := []chat.Message{{Role: "user", Content: "need clarification"}}
+	step := types.AgentStep{
+		ToolCalls: []types.ToolCall{{
+			ID:     "ask-1",
+			Name:   agenttools.ToolAskUser,
+			Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请问是手游还是端游？"}),
+		}},
+	}
+	done, err := e.finishUserQuestion(t.Context(), state, step, &msgs, "sess", "msg")
+	require.False(t, done)
+	require.ErrorIs(t, err, errRetrievalStateSave)
+	require.False(t, state.IsComplete)
+}
+
+func TestSteerNewQuestionDoesNotReusePriorQuestionFailure(t *testing.T) {
+	e, probe := newPartialRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u1", "question 1")
+	e.beginTurn("question 1", nil, &types.AgentState{})
+
+	// Question 1: search hits partial transient failure and uses its one-shot recovery.
+	probe.result = partialRetrievalResult()
+	require.True(t, retrievalProbeCall(e, "q1-s1", agenttools.ToolSearchKnowledge, `{"query":"sandbox"}`).Result.Success)
+	probe.err = context.DeadlineExceeded
+	probe.result = &types.ToolResult{Success: false, Error: "timeout"}
+	require.False(t, retrievalProbeCall(e, "q1-s2", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["retryable"]}`).Result.Success)
+
+	// Mid-run steer injects Question 2 (new UserInputID).
+	e.retrieval.recordUserInput("steer:1", "question 2")
+	probe.err = nil
+	probe.result = &types.ToolResult{Success: true, Output: "fresh q2 result", Data: map[string]any{"display_type": "search_results"}}
+
+	// Same search args on Question 2 must execute as a normal search, NOT fail with "recovery already used".
+	q2Call := retrievalProbeCall(e, "q2-s1", agenttools.ToolSearchKnowledge, `{"query":"sandbox","knowledge_base_ids":["retryable"]}`)
+	require.True(t, q2Call.Result.Success, q2Call.Result.Error)
+	snap := e.retrieval.snapshot()
+	last := snap.Attempts[len(snap.Attempts)-1]
+	require.Equal(t, "steer:1", last.QuestionID)
+	require.Equal(t, retrievalSearch, last.Action)
+	require.Empty(t, last.RecoveryCallID)
+}
+
+func TestFinalSynthesisStreamsLiveEvenWhenHoldCollaborationAnswerSet(t *testing.T) {
+	model := &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
+		{ResponseType: types.ResponseTypeAnswer, Content: "第一部分"},
+		{ResponseType: types.ResponseTypeAnswer, Content: "第二部分"},
+		{ResponseType: types.ResponseTypeAnswer, Content: "收尾", Done: true, FinishReason: "stop"},
+	}}}}
+	e := newTestEngine(t, model)
+	e.holdCollaborationAnswer = true
+
+	var liveChunks []string
+	var doneContent string
+	e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, evt event.Event) error {
+		data, ok := evt.Data.(event.AgentFinalAnswerData)
+		if !ok {
+			return nil
+		}
+		if data.Done {
+			doneContent += data.Content
+		} else if data.Content != "" {
+			liveChunks = append(liveChunks, data.Content)
+		}
+		return nil
+	})
+
+	state := &types.AgentState{}
+	err := e.streamFinalAnswerToEventBus(
+		t.Context(),
+		"synthesize",
+		state,
+		"sess-collab",
+		[]chat.Message{{Role: "user", Content: "synthesize"}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "第一部分第二部分收尾", state.FinalAnswer)
+	require.Equal(t, []string{"第一部分", "第二部分"}, liveChunks, "final synthesis must stream live even when holdCollaborationAnswer is true")
+	require.Equal(t, "收尾", doneContent)
+	require.Equal(t, state.FinalAnswer, strings.Join(liveChunks, "")+doneContent)
+}
+
+func TestInstanceHooksApplyToRuntimeContextAndFixedResponse(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.SetHooks(NoopEngineHooks{})
+	e.appInfo = `{"gameInfo":{"device_type":"手游、端游"}}`
+
+	rendered := e.RenderUserTurnContent("sess-1", "hi")
+	require.NotContains(t, rendered, `multi_device_type="true"`, "NoopEngineHooks should suppress GameSDK multi_device_type annotations")
+
+	e.config.FixedResponses = map[string]string{
+		"NO_ANSWER": "当前无答案",
+	}
+	// Under NoopEngineHooks, trailing <button-send> is NOT stripped before sentinel matching.
+	rawWithButton := "[[FIXED:NO_ANSWER]]\n<button-send>保留</button-send>"
+	out, err := e.publicAnswer(t.Context(), rawWithButton, nil)
+	require.NoError(t, err)
+	require.Equal(t, rawWithButton, out, "NoopEngineHooks should not strip buttons during fixed response sentinel matching")
+	// Pure sentinel without buttons still expands normally under NoopEngineHooks.
+	outPlain, err := e.publicAnswer(t.Context(), "[[FIXED:NO_ANSWER]]", nil)
+	require.NoError(t, err)
+	require.Equal(t, "当前无答案", outPlain)
+
+	// With default GameSDKHooks, multi_device_type is annotated and buttons are stripped before sentinel expansion.
+	e.SetHooks(NewGameSDKHooks(DefaultGameSDKHooksConfig()))
+	renderedDefault := e.RenderUserTurnContent("sess-1", "hi")
+	require.Contains(t, renderedDefault, `multi_device_type="true"`)
+	outDefault, err := e.publicAnswer(t.Context(), "[[FIXED:NO_ANSWER]]\n<button-send>移除</button-send>", nil)
+	require.NoError(t, err)
+	require.Equal(t, "当前无答案", outDefault)
+}
+
+func TestGameSDKExpandLibrariesStrictGameInfoDeviceTypeOnly(t *testing.T) {
+	setup := func(appInfo string) (*AgentEngine, map[string]any) {
+		e, _ := newRuntimeRetrievalProbeEngine(t)
+		e.config.SearchTargets = types.SearchTargets{
+			retrievalScopeTarget("faq"),
+			retrievalScopeTarget("client"),
+			retrievalScopeTarget("pc"),
+		}
+		e.knowledgeBasesInfo = []*KnowledgeBaseInfo{
+			{ID: "faq", Name: "docs-general", Type: types.KnowledgeBaseTypeDocument},
+			{ID: "client", Name: "docs-client", Type: types.KnowledgeBaseTypeDocument},
+			{ID: "pc", Name: "docs-pc", Type: types.KnowledgeBaseTypeDocument},
+		}
+		e.appInfo = appInfo
+		e.retrieval = newRetrievalControl("q", retrievalScopeForTargets(e.config.SearchTargets))
+		e.retrieval.state.UserInputIDs = []string{"q"}
+		e.retrieval.state.Attempts = []retrievalAttempt{{QuestionID: "q", Tool: "search_knowledge", Completed: true, Outcome: retrievalSuccess}}
+		args := map[string]any{"knowledge_base_ids": []any{"faq"}}
+		return e, args
+	}
+
+	// Top-level device_type must NOT expand KBs.
+	e1, args1 := setup(`{"device_type":"手游、端游"}`)
+	e1.extHooks().ExpandSearchKnowledgeBases(e1, args1)
+	require.Equal(t, []any{"faq"}, args1["knowledge_base_ids"])
+
+	// Slash/pipe delimiters must NOT split for KB expansion.
+	e2, args2 := setup(`{"gameInfo":{"device_type":"手游/端游"}}`)
+	e2.extHooks().ExpandSearchKnowledgeBases(e2, args2)
+	require.Equal(t, []any{"faq"}, args2["knowledge_base_ids"])
+
+	// Exact gameInfo.device_type with original delimiters DOES expand KBs.
+	e3, args3 := setup(`{"gameInfo":{"device_type":"手游、端游"}}`)
+	e3.extHooks().ExpandSearchKnowledgeBases(e3, args3)
+	require.Equal(t, []any{"faq", "client", "pc"}, args3["knowledge_base_ids"])
+}
+
+func TestAskUserMarksAwaitingUserInputForSuggestionsAndButtonSuppression(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u1", "配置登录")
+	e.beginTurn("配置登录", nil, &types.AgentState{})
+
+	var persisted json.RawMessage
+	e.SetRetrievalPersistence(nil, func(_ context.Context, raw json.RawMessage) error {
+		persisted = append(json.RawMessage(nil), raw...)
+		return nil
+	})
+	require.NoError(t, e.bindRetrievalPersistence(t.Context()))
+	require.Nil(t, RetrievalMissingUserFields(persisted))
+
+	state := &types.AgentState{}
+	msgs := []chat.Message{{Role: "user", Content: "配置登录"}}
+	step := types.AgentStep{
+		ToolCalls: []types.ToolCall{{
+			ID:     "ask-1",
+			Name:   agenttools.ToolAskUser,
+			Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请问您接入的是手游还是端游？"}),
+		}},
+	}
+	done, err := e.finishUserQuestion(t.Context(), state, step, &msgs, "sess", "msg")
+	require.NoError(t, err)
+	require.True(t, done)
+
+	// Persisted state marks awaiting_user_input so message_suggestion suppresses follow-up chips.
+	require.True(t, e.hasMissingUserFields())
+	require.NotEmpty(t, RetrievalMissingUserFields(persisted))
+
+	// Button sanitizer also strips <button-send> while awaiting user input.
+	out, err := e.publicAnswer(t.Context(), "请先确认平台。\n<button-send>如何接入</button-send>", nil)
+	require.NoError(t, err)
+	require.Equal(t, "请先确认平台。", out)
+}
+
+func TestAskUserRollsBackAwaitingUserInputOnEmitFailure(t *testing.T) {
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.SetRetrievalUserMessage("u1", "配置登录")
+	e.beginTurn("配置登录", nil, &types.AgentState{})
+
+	var persisted json.RawMessage
+	e.SetRetrievalPersistence(nil, func(_ context.Context, raw json.RawMessage) error {
+		persisted = append(json.RawMessage(nil), raw...)
+		return nil
+	})
+	require.NoError(t, e.bindRetrievalPersistence(t.Context()))
+
+	emitErr := errors.New("stream emit failed")
+	e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, _ event.Event) error {
+		return emitErr
+	})
+
+	state := &types.AgentState{}
+	msgs := []chat.Message{{Role: "user", Content: "配置登录"}}
+	step := types.AgentStep{
+		ToolCalls: []types.ToolCall{{
+			ID:     "ask-1",
+			Name:   agenttools.ToolAskUser,
+			Result: agenttools.AskUserQuestion(types.AskUserPromptRequest{Question: "请问是手游还是端游？"}),
+		}},
+	}
+	done, err := e.finishUserQuestion(t.Context(), state, step, &msgs, "sess", "msg")
+	require.False(t, done)
+	require.ErrorIs(t, err, emitErr)
+	require.False(t, e.hasMissingUserFields(), "AwaitingUserInput must roll back when clarification event fails to publish")
+	require.Nil(t, RetrievalMissingUserFields(persisted))
+}
+
+func TestEngineHooksIsolationAndConfigurability(t *testing.T) {
+	t.Run("NoopEngineHooks disables vertical Game SDK rules", func(t *testing.T) {
+		e, _ := newRuntimeRetrievalProbeEngine(t)
+		e.SetHooks(NoopEngineHooks{})
+		e.config.SearchTargets = types.SearchTargets{retrievalScopeTarget("faq"), retrievalScopeTarget("pc")}
+		e.knowledgeBasesInfo = []*KnowledgeBaseInfo{{ID: "pc", Name: "docs-pc"}}
+		e.appInfo = `{"gameInfo":{"device_type":"端游"}}`
+		e.retrieval = newRetrievalControl("q", retrievalScopeForTargets(e.config.SearchTargets))
+		e.retrieval.state.UserInputIDs = []string{"q"}
+		e.retrieval.state.Attempts = []retrievalAttempt{{QuestionID: "q", Tool: "search_knowledge", Completed: true, Outcome: retrievalSuccess}}
+
+		args := map[string]any{"knowledge_base_ids": []any{"faq"}}
+		e.extHooks().ExpandSearchKnowledgeBases(e, args)
+		require.Equal(t, []any{"faq"}, args["knowledge_base_ids"])
+
+		in := "当前知识库没有找到相关解答。\n<button-send>保留按钮</button-send>"
+		out, err := e.publicAnswer(t.Context(), in, nil)
+		require.NoError(t, err)
+		require.Equal(t, in, out)
+	})
+
+	t.Run("custom GameSDKHooksConfig drives device-to-KB mapping without hardcoding", func(t *testing.T) {
+		e, _ := newRuntimeRetrievalProbeEngine(t)
+		e.SetHooks(NewGameSDKHooks(GameSDKHooksConfig{
+			DeviceToKBNames: map[string][]string{"console": {"docs-console"}},
+		}))
+		e.config.SearchTargets = types.SearchTargets{retrievalScopeTarget("faq"), retrievalScopeTarget("c1")}
+		e.knowledgeBasesInfo = []*KnowledgeBaseInfo{{ID: "c1", Name: "docs-console"}}
+		e.appInfo = `{"gameInfo":{"device_type":"console"}}`
+		e.retrieval = newRetrievalControl("q", retrievalScopeForTargets(e.config.SearchTargets))
+		e.retrieval.state.UserInputIDs = []string{"q"}
+		e.retrieval.state.Attempts = []retrievalAttempt{{QuestionID: "q", Tool: "search_knowledge", Completed: true, Outcome: retrievalSuccess}}
+
+		args := map[string]any{"knowledge_base_ids": []any{"faq"}}
+		e.extHooks().ExpandSearchKnowledgeBases(e, args)
+		require.Equal(t, []any{"faq", "c1"}, args["knowledge_base_ids"])
+	})
+
+	t.Run("RetrievalMissingUserFields remains backward-compatible with legacy snapshots", func(t *testing.T) {
+		legacy := json.RawMessage(`{"version":4,"gaps":[{"status":"needs_user","missing_user_fields":["平台","渠道"]}]}`)
+		require.Equal(t, []string{"平台", "渠道"}, RetrievalMissingUserFields(legacy))
+		v5 := json.RawMessage(`{"version":5,"attempts":[]}`)
+		require.Nil(t, RetrievalMissingUserFields(v5))
+	})
+
+	t.Run("non-timeout failure is not retryable as recovery", func(t *testing.T) {
+		e, probe := newRuntimeRetrievalProbeEngine(t)
+		e.EnableRuntimeRetrieval()
+		e.SetRetrievalUserMessage("q1", "perm fail")
+		e.beginTurn("perm fail", nil, &types.AgentState{})
+		probe.err = errors.New("permission denied")
+		first := retrievalProbeCall(e, "s1", agenttools.ToolSearchKnowledge, `{"query":"perm"}`)
+		require.False(t, first.Result.Success)
+		require.Equal(t, retrievalUnknown, e.retrieval.snapshot().Attempts[0].Outcome)
+	})
 }

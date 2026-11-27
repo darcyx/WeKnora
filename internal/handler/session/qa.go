@@ -117,10 +117,11 @@ type qaRequestContext struct {
 	// is published as live, so leftover inject / after messages from the
 	// previous run are visible to this engine from round 1 and to any client
 	// that reloads the queue.
-	steerCarryOver     []interfaces.StreamEvent
-	steerSourceID      string
-	steerHandoffFailed bool
-	steerPrimaryID     string
+	steerCarryOver        []interfaces.StreamEvent
+	steerSourceID         string
+	steerHandoffFailed    bool
+	steerNeedsSourceSweep bool
+	steerPrimaryID        string
 	// turnLeaseHeld records that executeQA already took the send-side turn
 	// lease for this request, so the QA service does not take a second one.
 	turnLeaseHeld bool
@@ -808,6 +809,9 @@ type sseStreamContext struct {
 	// mode releases on completion (the pipeline returns before the stream
 	// finishes); agent mode releases when AgentQA returns.
 	releaseTurn func()
+	// stopLiveRunHeartbeat cancels the executor-owned live-run lease renewal
+	// goroutine once the turn exits.
+	stopLiveRunHeartbeat func()
 	// turnUsage holds the provider's token usage carried on the stream's
 	// final answer event, so completeQuickAnswerTurn can report it on the
 	// complete event and persist it with the message (issue #3865). Nil for
@@ -905,6 +909,9 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool, m
 			streamCtx.liveRunErr = err
 			return streamCtx
 		}
+		streamCtx.stopLiveRunHeartbeat = stream.StartLiveRunHeartbeat(
+			asyncCtx, h.streamManager, reqCtx.sessionID, reqCtx.assistantMessage.ID,
+		)
 	}
 
 	if err := h.writeAgentQueryEvent(
@@ -915,6 +922,9 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool, m
 		reqCtx.assistantMessage,
 		reqCtx.resume,
 	); err != nil && reqCtx.resume == nil {
+		if streamCtx.stopLiveRunHeartbeat != nil {
+			streamCtx.stopLiveRunHeartbeat()
+		}
 		if streamCtx.steerSink != nil {
 			if clearErr := h.streamManager.ClearLiveRun(context.WithoutCancel(baseCtx), reqCtx.sessionID, reqCtx.assistantMessage.ID); clearErr != nil {
 				logger.Warnf(baseCtx, "Failed to clear live run after stream setup failure: %v", clearErr)
@@ -1533,6 +1543,27 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		logger.Infof(ctx, "Calling agent QA service, session ID: %s", sessionID)
 	}
 
+	// If the handoff's late sweep of the previous run's steer list failed,
+	// retry once here before this run announces itself live so accepted
+	// late-arriving inputs are not stranded on the source list.
+	if reqCtx.steerNeedsSourceSweep && reqCtx.steerSourceID != "" && reqCtx.assistantMessage != nil {
+		if lateAll, _, err := h.streamManager.GetSteerEvents(ctx, sessionID, reqCtx.steerSourceID, 0); err != nil {
+			logger.Warnf(ctx, "steer late-handoff retry read failed for session %s: %v", sessionID, err)
+		} else {
+			late := selectSteerBacklog(lateAll, nil)
+			if len(late) == 0 {
+				reqCtx.steerNeedsSourceSweep = false
+				reqCtx.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
+			} else if err := h.streamManager.AppendSteerEvents(ctx, sessionID, reqCtx.assistantMessage.ID, late); err != nil {
+				logger.Warnf(ctx, "steer late-handoff retry append failed for session %s: %v", sessionID, err)
+			} else {
+				h.markSteerEventsConsumed(ctx, sessionID, reqCtx.steerSourceID, late)
+				reqCtx.steerNeedsSourceSweep = false
+				reqCtx.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
+			}
+		}
+	}
+
 	// Move the previous run's leftovers onto this run's queue before the run
 	// announces itself as live. The other order leaves a window where a
 	// client that reloads the queue sees an empty one and drops messages the
@@ -1645,6 +1676,9 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			}
 			// Agent mode: complete the assistant message in defer (normal mode does it via event handler)
 			if mode == qaModeAgent {
+				if streamCtx.stopLiveRunHeartbeat != nil {
+					defer streamCtx.stopLiveRunHeartbeat()
+				}
 				if streamCtx.releaseTurn != nil {
 					defer streamCtx.releaseTurn()
 				}
@@ -1687,6 +1721,26 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 					}
 					h.completeStreamAssistantMessage(updateCtx, streamCtx, "", "")
 				} else {
+					if reqCtx.steerNeedsSourceSweep && reqCtx.steerSourceID != "" {
+						// Retry the failed late sweep before finalizing; if it still fails,
+						// mark recovery pending so liveAgentRun sweeps source_message_id.
+						if lateAll, _, err := h.streamManager.GetSteerEvents(updateCtx, sessionID, reqCtx.steerSourceID, 0); err != nil {
+							retainMarker = true
+						} else if late := selectSteerBacklog(lateAll, nil); len(late) > 0 {
+							if err := h.streamManager.AppendSteerEvents(updateCtx, sessionID, streamCtx.assistantMessage.ID, late); err != nil {
+								if !h.preservePendingSteers(updateCtx, reqCtx, reqCtx.steerSourceID, late) {
+									retainMarker = true
+								} else {
+									streamCtx.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
+								}
+							} else {
+								h.markSteerEventsConsumed(updateCtx, sessionID, reqCtx.steerSourceID, late)
+								streamCtx.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
+							}
+						} else {
+							streamCtx.assistantMessage.ExecutionContext.SteerHandoffSourceID = ""
+						}
+					}
 					followUp, claimed := h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
 					if !claimed {
 						followUp, claimed = h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
@@ -1701,34 +1755,42 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 					if retainMarker || (claimed && followUp.steerHandoffFailed) {
 						streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
 					}
-					if !h.completeStreamAssistantMessage(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID) {
+					persisted := h.completeStreamAssistantMessage(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID)
+					if !persisted {
 						if claimed {
 							h.closeFailedSteerFollowUp(updateCtx, followUp)
+							claimed = false
 						}
-						return
-					}
-					if !claimed && !retainMarker {
-						followUp, claimed = h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
-					}
-					if claimed && followUp.steerHandoffFailed {
-						retainMarker = true
-						claimed = false
-						if streamCtx.assistantMessage.RunState != types.MessageRunStateSteerRecoveryPending {
-							streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
-							if err := h.messageService.UpdateMessage(updateCtx, streamCtx.assistantMessage); err != nil {
-								logger.Warnf(updateCtx, "failed to mark steer recovery: %v", err)
+						// Do not leave a dead live-run marker blocking the session with 409
+						// after DB persistence fails: always fall through to ClearLiveRun
+						// when no follow-up owns the marker and no steer recovery is pending.
+					} else {
+						if !claimed && !retainMarker {
+							followUp, claimed = h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
+						}
+						if claimed && followUp.steerHandoffFailed {
+							retainMarker = true
+							claimed = false
+							if streamCtx.assistantMessage.RunState != types.MessageRunStateSteerRecoveryPending {
+								streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
+								if err := h.messageService.UpdateMessage(updateCtx, streamCtx.assistantMessage); err != nil {
+									logger.Warnf(updateCtx, "failed to mark steer recovery: %v", err)
+								}
 							}
 						}
-					}
-					if claimed && streamCtx.asyncCtx.Err() != nil {
-						h.closeFailedSteerFollowUp(updateCtx, followUp)
-						claimed = false
-					}
-					if claimed {
-						if streamCtx.releaseTurn != nil {
-							streamCtx.releaseTurn()
+						if claimed && streamCtx.asyncCtx.Err() != nil {
+							h.closeFailedSteerFollowUp(updateCtx, followUp)
+							claimed = false
 						}
-						go h.executeQA(followUp, qaModeAgent, false)
+						if claimed {
+							if streamCtx.stopLiveRunHeartbeat != nil {
+								streamCtx.stopLiveRunHeartbeat()
+							}
+							if streamCtx.releaseTurn != nil {
+								streamCtx.releaseTurn()
+							}
+							go h.executeQA(followUp, qaModeAgent, false)
+						}
 					}
 				}
 				if !retainMarker {

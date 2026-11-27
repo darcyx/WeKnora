@@ -87,6 +87,10 @@ func isClosingFenceLine(line string, fenceChar byte, minLen int) bool {
 // trailing reference block, or follow-up buttons. Unregistered keys are left
 // untouched so ordinary text is never corrupted.
 func expandFixedResponse(content string, fixed map[string]string) (string, bool) {
+	return expandFixedResponseWithStripper(content, fixed, stripFollowUpButtons)
+}
+
+func expandFixedResponseWithStripper(content string, fixed map[string]string, stripButtons func(string) string) (string, bool) {
 	if len(fixed) == 0 {
 		return content, false
 	}
@@ -97,7 +101,9 @@ func expandFixedResponse(content string, fixed map[string]string) (string, bool)
 	// Strip outer wrappers iteratively so buttons/sources inside or outside a fence are handled.
 	for range 2 {
 		candidate = unwrapOuterMarkdownFence(candidate)
-		candidate = strings.TrimSpace(stripFollowUpButtons(candidate))
+		if stripButtons != nil {
+			candidate = strings.TrimSpace(stripButtons(candidate))
+		}
 		candidate = strings.TrimSpace(stripTrailingReferenceSection(candidate))
 	}
 	if !strings.HasPrefix(candidate, fixedSentinelPrefix) || !strings.HasSuffix(candidate, fixedSentinelSuffix) {

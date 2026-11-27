@@ -18,6 +18,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
@@ -569,7 +570,9 @@ func (s *AgentCollaboration) run(ctx context.Context, w collaboration.Work) (col
 		if err = s.streams.SetLiveRun(ctx, session.ID, answer.ID, answer.RequestID); err != nil {
 			return result, err
 		}
+		stopHeartbeat := stream.StartLiveRunHeartbeat(ctx, s.streams, session.ID, answer.ID)
 		defer func() {
+			stopHeartbeat()
 			if err := s.streams.ClearLiveRun(context.WithoutCancel(ctx), session.ID, answer.ID); err != nil {
 				logger.Warnf(ctx, "Failed to clear collaboration live stream: %v", err)
 			}

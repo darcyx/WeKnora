@@ -7,7 +7,6 @@ import (
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
-	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
@@ -262,11 +261,9 @@ func answerEvents(e *AgentEngine) (rendered map[string]string, replaces map[stri
 }
 
 func TestPublicAnswerFailureRetractsStreamedDraft(t *testing.T) {
-	e, _ := newRetrievalProbeEngine(t)
-	e.EnableRetrievalGuard()
-	e.appInfo = `{"channel":"微信小游戏"}`
-	_, err := e.retrieval.register(retrievalFactProposal{GoalQuote: "TapTap sandbox configuration", Fact: "sandbox configuration"})
-	require.NoError(t, err)
+	e, _ := newRuntimeRetrievalProbeEngine(t)
+	e.EnableRuntimeRetrieval()
+	e.beginTurn("TapTap sandbox configuration", nil, &types.AgentState{})
 	e.chatModel = &mockChat{responses: []mockResponse{{chunks: []types.StreamResponse{
 		{ResponseType: types.ResponseTypeAnswer, Content: "streamed draft"},
 		{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "stop"},
@@ -280,44 +277,13 @@ func TestPublicAnswerFailureRetractsStreamedDraft(t *testing.T) {
 		return nil
 	})
 
-	_, err = e.streamThinkingToEventBus(context.Background(), emptyMessages(), emptyTools(), 0, "session")
+	_, err := e.streamThinkingToEventBus(context.Background(), emptyMessages(), emptyTools(), 0, "session")
 	require.ErrorIs(t, err, errRetrievalStateSave)
 	require.Len(t, rendered, 1)
 	for id, text := range rendered {
 		require.Empty(t, text, "a draft the gate refused must not stay visible")
 		require.Equal(t, 1, replaces[id])
 	}
-}
-
-func TestIndependentWorkRetryRetractsStreamedDraft(t *testing.T) {
-	e, _ := newRetrievalProbeEngine(t)
-	e.EnableRetrievalGuard()
-	blocked, err := e.retrieval.register(retrievalFactProposal{GoalQuote: "TapTap sandbox configuration", Fact: "sandbox configuration"})
-	require.NoError(t, err)
-	_, err = e.retrieval.register(retrievalFactProposal{GoalQuote: "TapTap sandbox configuration", Fact: "whitelist purpose", DistinctFrom: []retrievalDistinction{{GapID: blocked, Reason: "independent supported explanation"}}})
-	require.NoError(t, err)
-	stop := types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "stop"}
-	model := &mockChat{responses: []mockResponse{
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "streamed draft"}, stop}},
-		{chunks: []types.StreamResponse{{ResponseType: types.ResponseTypeAnswer, Content: "second round"}, stop}},
-	}}
-	e.chatModel = model
-	rendered, replaces := answerEvents(e)
-	var firstID string
-	// A blocker lands mid-stream, after the round was allowed to stream live.
-	e.eventBus.On(event.EventAgentFinalAnswer, func(_ context.Context, evt event.Event) error {
-		if firstID == "" {
-			firstID = evt.ID
-			return e.retrieval.applyReview(retrievalReview{GapID: blocked, Status: retrievalNeedsUser, MissingUserFields: []string{"渠道"}})
-		}
-		return nil
-	})
-
-	tools := []chat.Tool{{Type: "function", Function: chat.FunctionDef{Name: "search_knowledge"}}}
-	_, _ = e.executeLoop(context.Background(), &types.AgentState{}, "question", emptyMessages(), tools, "session", "message")
-	require.GreaterOrEqual(t, len(model.calls), 2, "the independent-work retry must run")
-	require.Empty(t, rendered[firstID], "the retried round's draft must not stay visible")
-	require.Equal(t, 1, replaces[firstID])
 }
 
 func TestContextWindowRetryRetractsAnswerAndCountsBothCalls(t *testing.T) {

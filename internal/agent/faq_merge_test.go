@@ -101,7 +101,6 @@ func TestKnowledgeSearchAndSkillReadBothRunInOneRound(t *testing.T) {
 			}}
 			e, search := faqDispatchFixture(t, model)
 			e.EnableRuntimeRetrieval()
-			e.chatModel = &runtimeRetrievalChat{mockChat: model}
 			e.config.ParallelToolCalls = parallel
 			reader := newCountingTool(agenttools.ToolReadFile)
 			e.toolRegistry.RegisterTool(reader)
