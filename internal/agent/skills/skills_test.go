@@ -64,10 +64,6 @@ func TestParseSkillFileUTF8BOM(t *testing.T) {
 				skill.Instructions != "Keep this \ufeff character." {
 				t.Fatalf("unexpected parsed skill: %+v", skill)
 			}
-			metadata, err := ParseSkillMetadata(content)
-			if err != nil || metadata.Name != "test-skill" {
-				t.Fatalf("unexpected metadata: %+v, error: %v", metadata, err)
-			}
 		})
 	}
 	if _, err := ParseSkillFile("\ufeff# Missing frontmatter"); err == nil {
@@ -349,22 +345,18 @@ See [GUIDE.md](GUIDE.md) for more info.
 		t.Errorf("Expected guide content, got '%s'", file.Content)
 	}
 
-	if file.IsScript {
-		t.Error("GUIDE.md should not be marked as script")
-	}
-
 	// Load script file
 	scriptFile, err := loader.LoadSkillFile("test-skill", "scripts/hello.py")
 	if err != nil {
 		t.Fatalf("Failed to load script file: %v", err)
 	}
 
-	if !scriptFile.IsScript {
-		t.Error("hello.py should be marked as script")
+	if scriptFile.Content != scriptContent {
+		t.Errorf("Expected script content, got '%s'", scriptFile.Content)
 	}
 
-	t.Logf("Loaded files: GUIDE.md=%d bytes, hello.py=%d bytes (isScript=%v)",
-		len(file.Content), len(scriptFile.Content), scriptFile.IsScript)
+	t.Logf("Loaded files: GUIDE.md=%d bytes, hello.py=%d bytes",
+		len(file.Content), len(scriptFile.Content))
 }
 
 func TestManagerIntegration(t *testing.T) {
@@ -426,32 +418,6 @@ Integration test content.
 	}
 
 	t.Logf("Manager integration test passed: %d skills discovered", len(metadata))
-}
-
-func TestIsScript(t *testing.T) {
-	tests := []struct {
-		path     string
-		expected bool
-	}{
-		{"script.py", true},
-		{"script.sh", true},
-		{"script.bash", true},
-		{"script.js", true},
-		{"script.mjs", true},
-		{"script.cjs", true},
-		{"script.ts", true},
-		{"script.rb", true},
-		{"README.md", false},
-		{"data.json", false},
-		{"config.yaml", false},
-	}
-
-	for _, tt := range tests {
-		result := IsScript(tt.path)
-		if result != tt.expected {
-			t.Errorf("IsScript(%s) = %v, expected %v", tt.path, result, tt.expected)
-		}
-	}
 }
 
 func TestIsOnDemandInstallerPath(t *testing.T) {

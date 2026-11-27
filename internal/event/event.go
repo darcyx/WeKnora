@@ -43,7 +43,6 @@ const (
 	EventChatStream   EventType = "chat.stream"   // 聊天流式输出
 
 	// Agent events
-	EventAgentQuery    EventType = "agent.query"    // Agent 查询开始
 	EventAgentPlan     EventType = "agent.plan"     // Agent 计划生成
 	EventAgentStep     EventType = "agent.step"     // Agent 步骤执行
 	EventAgentTool     EventType = "agent.tool"     // Agent 工具调用

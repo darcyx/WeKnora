@@ -175,9 +175,11 @@ func TestOAuthRetryRecyclesOnlyOutdatedConnections(t *testing.T) {
 		name              string
 		reregister        bool
 		otherUserSurvives bool
+		revokeAfterOAuth  bool
 	}{
 		{name: "client registration unchanged", otherUserSurvives: true},
 		{name: "client registration replaced elsewhere", reregister: true},
+		{name: "policy revoked during oauth", otherUserSurvives: true, revokeAfterOAuth: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			utils.SetSSRFWhitelistFromRaw("127.0.0.1")
@@ -208,7 +210,11 @@ func TestOAuthRetryRecyclesOnlyOutdatedConnections(t *testing.T) {
 
 			alice := types.Principal{Type: types.PrincipalWebUser, ID: "alice"}
 			ctx := ctxForOAuthRetryTest(alice)
+			allowed := true
 			gate := oauthRetryTestGate{authorized: func() {
+				if tc.revokeAfterOAuth {
+					allowed = false
+				}
 				repo.saveToken(alice, service.ID)
 				if tc.reregister {
 					repo.registerClient(service.ID, "client-2")
@@ -216,7 +222,17 @@ func TestOAuthRetryRecyclesOnlyOutdatedConnections(t *testing.T) {
 			}}
 			sess := &MCPOAuthSession{EventBus: event.NewEventBus(), ApprovalCtx: ctx, ExecTimeout: 5 * time.Second}
 
-			aliceConn, err := getOrCreateMCPClientWithOAuthRetry(ctx, manager, service, gate, sess, "tool", "call-1")
+			aliceConn, err := getOrCreateMCPClientWithOAuthRetry(ctx, manager, service, gate, sess, "tool", "call-1", func(context.Context) error {
+				if !allowed {
+					return fmt.Errorf("policy revoked")
+				}
+				return nil
+			})
+			if tc.revokeAfterOAuth {
+				require.ErrorContains(t, err, "policy revoked")
+				require.Nil(t, aliceConn)
+				return
+			}
 			require.NoError(t, err)
 			require.True(t, aliceConn.IsConnected())
 			require.Equal(t, tc.otherUserSurvives, bobConn.IsConnected())
@@ -300,4 +316,9 @@ func TestMCPToolFilesPromptsUnderCallerWorkspaceForSharedAgent(t *testing.T) {
 	require.Equal(t, 1, prompts)
 	require.Equal(t, callerTenant, approvalTenant)
 	require.Equal(t, callerTenant, oauthTenant)
+}
+
+func TestMCPAuthorizationCheckedBeforeInitialConnect(t *testing.T) {
+	_, err := getOrCreateMCPClientWithOAuthRetry(t.Context(), nil, nil, nil, nil, "tool", "call", func(context.Context) error { return fmt.Errorf("disabled") })
+	require.ErrorContains(t, err, "disabled")
 }

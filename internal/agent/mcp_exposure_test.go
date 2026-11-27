@@ -29,13 +29,12 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 	utils.SetSSRFWhitelistFromRaw("127.0.0.1")
 	t.Cleanup(utils.ResetSSRFWhitelistForTest)
 	for _, variant := range []string{
-		"openai", "anthropic", "openai-deferred", "anthropic-deferred",
+		"openai-deferred", "anthropic-deferred",
 		"openai-proxy-deferred", "anthropic-proxy-deferred",
 		"openai-string-proxy-deferred", "anthropic-string-proxy-deferred",
 	} {
 		t.Run(variant, func(t *testing.T) {
 			provider := strings.Split(variant, "-")[0]
-			deferred := strings.HasSuffix(variant, "-deferred")
 			proxyCall := strings.Contains(variant, "-proxy-")
 			const serverID = "8f7a5b68-a7ab-4565-b6f3-1cae2578f040"
 			var executed atomic.Int32
@@ -70,24 +69,21 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 			defer manager.Shutdown()
 			ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
 			registry := agenttools.NewToolRegistry()
-			var metadata *agenttools.MCPMetadataIO
-			if deferred {
-				metadata = &agenttools.MCPMetadataIO{
-					Get: func(context.Context, uint64, string) (*types.MCPMetadata, error) {
-						return &types.MCPMetadata{
-							Instructions: "Order IDs belong to the external customer system.",
-							Tools: []*types.MCPTool{
-								{
-									Name:        "get_order",
-									Description: description,
-									InputSchema: json.RawMessage(
-										`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`,
-									),
-								},
+			metadata := &agenttools.MCPMetadataIO{
+				Get: func(context.Context, uint64, string) (*types.MCPMetadata, error) {
+					return &types.MCPMetadata{
+						Instructions: "Order IDs belong to the external customer system.",
+						Tools: []*types.MCPTool{
+							{
+								Name:        "get_order",
+								Description: description,
+								InputSchema: json.RawMessage(
+									`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`,
+								),
 							},
-						}, nil
-					},
-				}
+						},
+					}, nil
+				},
 			}
 			_, err := agenttools.RegisterMCPTools(
 				ctx,
@@ -110,11 +106,7 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 				metadata,
 			)
 			require.NoError(t, err)
-			if deferred {
-				registry.PrepareMCPTools(ctx)
-			} else {
-				registry.PrepareMCPToolsDirect(ctx)
-			}
+			registry.PrepareMCPTools(ctx)
 			var requests atomic.Int32
 			modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
@@ -161,7 +153,7 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 				}
 				call := requests.Add(1)
 				w.Header().Set("Content-Type", "text/event-stream")
-				if deferred && call <= 2 {
+				if call <= 2 {
 					assert.False(t, proxyVisible, "providers must not offer a proxy before successful describe")
 					assert.Zero(
 						t,
@@ -191,7 +183,7 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 				}
 				assert.True(t, proxyVisible, "a loaded definition enables the compatibility proxy")
 				assert.Contains(t, string(payload["tools"]), "Order IDs belong to the external customer system.")
-				if (!deferred && call == 1) || (deferred && call == 3) {
+				if call == 3 {
 					if proxyCall {
 						arguments := `{"tool_ref":"mt1","arguments":{"id":"42"}}`
 						if strings.Contains(variant, "-string-") {
@@ -250,12 +242,9 @@ func TestMCPExposureWithoutMentionReachesProviderAndExecutes(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "Order shipped.", state.FinalAnswer)
 			require.EqualValues(t, 1, executed.Load())
-			toolRound := 0
-			if deferred {
-				toolRound = 2
-				require.Equal(t, serverID, state.RoundSteps[0].ToolCalls[0].Args["server_id"])
-				require.Equal(t, serverID, state.RoundSteps[1].ToolCalls[0].Args["server_id"])
-			}
+			const toolRound = 2
+			require.Equal(t, serverID, state.RoundSteps[0].ToolCalls[0].Args["server_id"])
+			require.Equal(t, serverID, state.RoundSteps[1].ToolCalls[0].Args["server_id"])
 			if proxyCall {
 				require.Contains(t, state.RoundSteps[toolRound].ToolCalls[0].Args["tool_ref"], "mcpt_")
 			}

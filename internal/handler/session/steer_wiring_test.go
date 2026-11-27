@@ -1,12 +1,15 @@
 package session
 
 import (
+	"context"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -195,4 +198,52 @@ func TestSetupSSEStreamDoesNotWriteSSEWhenLiveRunFails(t *testing.T) {
 	require.True(t, streamCtx.liveRunFailed)
 	assert.NotEqual(t, "text/event-stream", w.Header().Get("Content-Type"),
 		"SetLiveRun failure must not start an SSE response the client cannot recover from")
+}
+
+type failingFirstEventStream struct {
+	interfaces.StreamManager
+}
+
+func (s failingFirstEventStream) AppendEvent(ctx context.Context, sessionID, messageID string, event interfaces.StreamEvent) error {
+	return fmt.Errorf("append failed")
+}
+
+func TestSetupSSEStreamRollsBackLiveMarkerOnInitialEventFailure(t *testing.T) {
+	for _, mode := range []qaMode{qaModeAgent, qaModeNormal} {
+		streams := stream.NewMemoryStreamManager()
+		h := &Handler{streamManager: failingFirstEventStream{streams}}
+		c := newSteerWiringGinContext()
+		req := &qaRequestContext{ctx: t.Context(), c: c, sessionID: "s", requestID: "r", session: &types.Session{ID: "s"}, customAgent: &types.CustomAgent{ID: "a"}, assistantMessage: &types.Message{ID: "m"}}
+		got := h.setupSSEStream(req, false, mode)
+		require.True(t, got.liveRunFailed)
+		require.Error(t, got.liveRunErr)
+		require.NotEqual(t, "text/event-stream", c.Writer.Header().Get("Content-Type"))
+		id, _, err := streams.GetLiveRun(t.Context(), "s")
+		require.NoError(t, err)
+		require.Empty(t, id)
+		got.cancel()
+	}
+}
+
+type rollbackContextMessages struct {
+	interfaces.MessageService
+	deleted []string
+}
+
+func (s *rollbackContextMessages) DeleteMessage(ctx context.Context, _, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.deleted = append(s.deleted, id)
+	return nil
+}
+
+func TestRollbackTurnMessagesSurvivesRequestCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	messages := &rollbackContextMessages{}
+	h := &Handler{messageService: messages}
+	req := &qaRequestContext{sessionID: "s", userMessageID: "u", assistantMessage: &types.Message{ID: "a"}}
+	h.rollbackTurnMessages(ctx, req, true, true)
+	require.Equal(t, []string{"u", "a"}, messages.deleted)
 }

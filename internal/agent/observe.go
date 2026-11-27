@@ -890,43 +890,20 @@ func writePageContextMessage(sb *strings.Builder, msg *PageContextMessage) {
 func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkillInfo) string {
 	var lines []string
 	for _, svc := range mcpServices {
-		if svc == nil {
+		if svc == nil || !svc.Discoverable {
 			continue
 		}
-		if svc.Discoverable && len(svc.ToolNames) > 0 {
-			lines = append(lines, fmt.Sprintf(
-				"Use relevant available MCP functions for service @%s (server_id=%q) for "+
-					"needed evidence or actions. Their descriptions identify the service and original tool names; use "+
-					"discover_mcp_tools if the service needs reconnection or authentication.",
-				sanitizeMustUseField(svc.Name), sanitizeMustUseField(svc.ID)))
-			continue
-		}
-		if svc.Discoverable {
-			lines = append(
-				lines,
-				fmt.Sprintf(
-					"Use discover_mcp_tools(mode=\"list_tools\", server_id=%q) for the selected MCP "+
-						"service @%s. Describe the required tools, then use the offered functions or "+
-						"call_mcp_tool as available for needed evidence or actions; report connection or "+
-						"authentication failures if the service is unavailable.",
-					sanitizeMustUseField(svc.ID),
-					sanitizeMustUseField(svc.Name),
-				),
-			)
-			continue
-		}
-		prefix := mcpToolNamePrefix(svc)
-		if prefix == "" {
-			continue
-		}
-		display := sanitizeMustUseField(svc.Name)
-		if display == "" {
-			display = sanitizeMustUseField(svc.ID)
-		}
-		lines = append(lines, fmt.Sprintf(
-			"Must use MCP tools whose names start with %s (@%s) for needed evidence or actions.",
-			prefix, display,
-		))
+		lines = append(
+			lines,
+			fmt.Sprintf(
+				"Use discover_mcp_tools(mode=\"list_tools\", server_id=%q) for the selected MCP "+
+					"service @%s. Describe the required tools, then use the offered functions or "+
+					"call_mcp_tool as available for needed evidence or actions; report connection or "+
+					"authentication failures if the service is unavailable.",
+				sanitizeMustUseField(svc.ID),
+				sanitizeMustUseField(svc.Name),
+			),
+		)
 	}
 	for _, skill := range skills {
 		if skill == nil || skill.Name == "" {
@@ -950,53 +927,6 @@ func buildMustUseBlock(mcpServices []*PinnedMCPServiceInfo, skills []*PinnedSkil
 func sanitizeMustUseField(s string) string {
 	replacer := strings.NewReplacer("\n", " ", "\r", " ", "<", " ", ">", " ")
 	return strings.TrimSpace(replacer.Replace(s))
-}
-
-// mcpToolNamePrefix returns the shared prefix for an MCP service's registered
-// tools (e.g. mcp_iwiki_ from mcp_iwiki_getdocument). Tool names are
-// mcp_{sanitized_service_name}_{tool}, and the service slug itself may contain
-// underscores (sanitizeName turns spaces/hyphens into "_"), so we take the
-// longest common prefix across the service's tools and trim it back to the last
-// segment boundary instead of naively cutting at the first underscore.
-func mcpToolNamePrefix(svc *PinnedMCPServiceInfo) string {
-	if svc == nil || len(svc.ToolNames) == 0 {
-		return ""
-	}
-	const head = "mcp_"
-	var mcpNames []string
-	for _, toolName := range svc.ToolNames {
-		if strings.HasPrefix(toolName, head) {
-			mcpNames = append(mcpNames, toolName)
-		}
-	}
-	if len(mcpNames) == 0 {
-		return ""
-	}
-	prefix := mcpNames[0]
-	for _, name := range mcpNames[1:] {
-		prefix = commonStringPrefix(prefix, name)
-	}
-	// Trim to the last underscore so the hint names the service prefix
-	// (mcp_{service}_) rather than a partial tool name.
-	if idx := strings.LastIndex(prefix, "_"); idx >= len(head)-1 {
-		prefix = prefix[:idx+1]
-	}
-	if len(prefix) <= len(head) {
-		return ""
-	}
-	return prefix
-}
-
-func commonStringPrefix(a, b string) string {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	i := 0
-	for i < n && a[i] == b[i] {
-		i++
-	}
-	return a[:i]
 }
 
 // RenderUserTurnContent builds the user-turn payload for the current LLM call

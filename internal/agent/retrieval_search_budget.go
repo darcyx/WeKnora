@@ -52,14 +52,6 @@ func (c *retrievalControl) countSearches(g *retrievalGap, questionID, callRef st
 	scoped = scoped && strings.HasPrefix(turn, retrievalCallPrefix)
 	count := 0
 	for _, attempt := range c.state.Attempts {
-		if attempt.FAQOnly {
-			continue
-		}
-		if attempt.Action == retrievalRecovery && len(attempt.RecoveryStages) > 0 {
-			if original := c.attempt(attempt.RecoveryCallID); original != nil && original.FAQOnly {
-				continue
-			}
-		}
 		if !isBudgetedSearchTool(attempt.Tool) || attempt.Outcome == retrievalInput {
 			continue
 		}

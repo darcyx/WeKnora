@@ -20,7 +20,6 @@ type ToolRegistry struct {
 	mcpCallGuard      MCPCallGuard
 	tools             map[string]types.Tool
 	deferred          map[string]bool
-	mcpDirect         bool // Full exposure is an explicit compatibility path.
 	mcpPrepared       bool
 	maxToolOutputSize int // maximum chars for tool output (0 = use DefaultMaxToolOutput)
 }
@@ -198,7 +197,7 @@ func (r *ToolRegistry) ExecuteTool(
 	}
 	common.PipelineInfo(ctx, "AgentTool", "execute_start", map[string]interface{}{
 		"tool": name,
-		"args": args,
+		"args": types.SanitizeObservationText(ctx, string(args)),
 	})
 	tool, err := r.GetTool(name)
 	if err != nil {
@@ -269,7 +268,7 @@ func (r *ToolRegistry) execute(ctx context.Context, tool types.Tool, args json.R
 		}
 		common.PipelineWarn(ctx, "AgentTool", "validation_failed", map[string]interface{}{
 			"tool":   name,
-			"errors": errMsg,
+			"errors": types.SanitizeObservationText(ctx, errMsg),
 		})
 		return &types.ToolResult{
 			Success:          false,
@@ -310,16 +309,16 @@ func (r *ToolRegistry) execute(ctx context.Context, tool types.Tool, args json.R
 
 	fields := map[string]interface{}{
 		"tool": name,
-		"args": args,
+		"args": types.SanitizeObservationText(ctx, string(args)),
 	}
 	if result != nil {
 		fields["success"] = result.Success
 		if result.Error != "" {
-			fields["error"] = result.Error
+			fields["error"] = types.SanitizeObservationText(ctx, result.Error)
 		}
 	}
 	if execErr != nil {
-		fields["error"] = execErr.Error()
+		fields["error"] = types.SanitizeObservationText(ctx, execErr.Error())
 		common.PipelineError(ctx, "AgentTool", "execute_done", fields)
 	} else if result != nil && !result.Success {
 		common.PipelineWarn(ctx, "AgentTool", "execute_done", fields)

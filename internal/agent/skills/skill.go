@@ -77,10 +77,9 @@ type SkillMetadata struct {
 
 // SkillFile represents an additional file within a skill directory (Level 3)
 type SkillFile struct {
-	Name     string // Filename (e.g., "FORMS.md", "scripts/validate.py")
-	Path     string // Absolute path to the file
-	Content  string // File content
-	IsScript bool   // Whether this is an executable script
+	Name    string // Filename (e.g., "FORMS.md", "scripts/validate.py")
+	Path    string // Absolute path to the file
+	Content string // File content
 }
 
 // Validate checks if the skill metadata is valid according to Claude's specification
@@ -237,16 +236,6 @@ func ParseSkillFile(content string) (*Skill, error) {
 	return skill, nil
 }
 
-// ParseSkillMetadata parses only the metadata from a SKILL.md file content
-// This is a lightweight operation for skill discovery (Level 1 only)
-func ParseSkillMetadata(content string) (*SkillMetadata, error) {
-	skill, err := ParseSkillFile(content)
-	if err != nil {
-		return nil, err
-	}
-	return skill.ToMetadata(), nil
-}
-
 // IsOnDemandInstallerPath reports whether path is a first-use dependency
 // installer (scripts/install_deps.py and friends). Skills ship these to defer
 // optional packages to chat time, which is the wrong moment: the work is
@@ -263,43 +252,4 @@ func IsOnDemandInstallerPath(scriptPath string) bool {
 	default:
 		return false
 	}
-}
-
-// IsScript checks if a file path represents an executable script
-func IsScript(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	scriptExtensions := map[string]bool{
-		".py":   true,
-		".sh":   true,
-		".bash": true,
-		".js":   true,
-		".mjs":  true,
-		".cjs":  true,
-		".ts":   true,
-		".rb":   true,
-		".pl":   true,
-		".php":  true,
-	}
-	return scriptExtensions[ext]
-}
-
-// GetScriptLanguage returns the language/interpreter for a script file
-func GetScriptLanguage(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
-	languages := map[string]string{
-		".py":   "python",
-		".sh":   "bash",
-		".bash": "bash",
-		".js":   "node",
-		".mjs":  "node",
-		".cjs":  "node",
-		".ts":   "ts-node",
-		".rb":   "ruby",
-		".pl":   "perl",
-		".php":  "php",
-	}
-	if lang, ok := languages[ext]; ok {
-		return lang
-	}
-	return "unknown"
 }

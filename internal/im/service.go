@@ -2267,24 +2267,6 @@ func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tena
 	if err != nil {
 		return nil, err
 	}
-	// The mapping, not the incoming sender, authorizes migration of an old owner.
-	if cs.IMChannelID == "" {
-		var channels []string
-		if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
-			return nil, err
-		}
-		if len(channels) == 1 && channels[0] == imChannelID {
-			res := s.db.WithContext(ctx).Model(&ChannelSession{}).Where("id = ? AND (im_channel_id IS NULL OR im_channel_id = '')", cs.ID).Update("im_channel_id", imChannelID)
-			if res.Error != nil {
-				return nil, res.Error
-			}
-			if res.RowsAffected > 0 {
-				cs.IMChannelID = imChannelID
-			} else if err := s.db.WithContext(ctx).First(cs, "id = ?", cs.ID).Error; err != nil {
-				return nil, err
-			}
-		}
-	}
 	if cs.IMChannelID != imChannelID {
 		return nil, fmt.Errorf("channel session belongs to a different or ambiguous IM channel")
 	}
@@ -2406,21 +2388,6 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 		return nil, fmt.Errorf("query channel session: %w", result.Error)
 	}
 
-	var channels []string
-	if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
-		return nil, err
-	}
-	if len(channels) == 1 && channels[0] == imChannelID {
-		var legacy ChannelSession
-		err := s.db.WithContext(ctx).Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND thread_id = '' AND (im_channel_id IS NULL OR im_channel_id = '') AND deleted_at IS NULL", msg.Platform, msg.UserID, msg.ChatID, tenantID, agentID).First(&legacy).Error
-		if err == nil {
-			return &legacy, nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-
 	// Create a new WeKnora session. Start untitled when there's text to summarise
 	// so it gets a content-based title after the first message (see HandleMessage);
 	// fall back to the IM identity title otherwise.
@@ -2503,21 +2470,6 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 
 	if result.Error != gorm.ErrRecordNotFound {
 		return nil, fmt.Errorf("query thread session: %w", result.Error)
-	}
-
-	var channels []string
-	if err := s.db.WithContext(ctx).Unscoped().Model(&IMChannel{}).Where("tenant_id = ? AND agent_id = ? AND platform = ?", tenantID, agentID, msg.Platform).Pluck("id", &channels).Error; err != nil {
-		return nil, err
-	}
-	if len(channels) == 1 && channels[0] == imChannelID {
-		var legacy ChannelSession
-		err := s.db.WithContext(ctx).Where("platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND (im_channel_id IS NULL OR im_channel_id = '') AND deleted_at IS NULL", msg.Platform, msg.ChatID, threadID, tenantID, agentID).First(&legacy).Error
-		if err == nil {
-			return &legacy, nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
 	}
 
 	// Start untitled when there's text to summarise so it gets a content-based

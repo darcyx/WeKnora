@@ -155,6 +155,10 @@ func logLLMDebugCall(ctx context.Context, model string, messages []Message, opts
 	if callErr != nil {
 		record.Error = callErr.Error()
 	}
+	for i := range record.Sections {
+		record.Sections[i].Content = types.SanitizeObservationText(ctx, record.Sections[i].Content)
+	}
+	record.Error = types.SanitizeObservationText(ctx, record.Error)
 	logger.LLMDebugLog(ctx, record)
 }
 
@@ -202,5 +206,9 @@ func logLLMDebugStream(ctx context.Context, model string, messages []Message, op
 	if callErr != nil {
 		record.Error = callErr.Error()
 	}
+	for i := range record.Sections {
+		record.Sections[i].Content = types.SanitizeObservationText(ctx, record.Sections[i].Content)
+	}
+	record.Error = types.SanitizeObservationText(ctx, record.Error)
 	logger.LLMDebugLog(ctx, record)
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,14 +21,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// wikiInlineChunkCitationRegex matches internal short handles emitted by the
-// wiki ingest prompt while it classifies supporting chunks. The stable source
-// relationship lives in WikiPage.ChunkRefs, so these handles have no meaning
-// to readers and must not leak into generated Markdown.
-var wikiInlineChunkCitationRegex = regexp.MustCompile(`[ \t]*\[c\d{3,}(?:\s*[,;]\s*c\d{3,})*\]`)
-
 func stripWikiInlineChunkCitations(content string) string {
-	return wikiInlineChunkCitationRegex.ReplaceAllString(content, "")
+	return types.StripWikiInlineChunkCitations(content)
 }
 
 func stripWikiPageInlineChunkCitations(page *types.WikiPage) {
@@ -39,10 +32,6 @@ func stripWikiPageInlineChunkCitations(page *types.WikiPage) {
 	page.Content = stripWikiInlineChunkCitations(page.Content)
 	page.Summary = stripWikiInlineChunkCitations(page.Summary)
 }
-
-// wikiPageRawReadKey 仅供归并写入读取原始存储值；展示读取仍移除旧引用标记。
-// 快照必须与数据库原值一致，不能用展示层规范化后的正文作保存前提。
-type wikiPageRawReadKey struct{}
 
 // wikiPageService implements the WikiPageService interface
 type wikiPageService struct {
@@ -504,7 +493,7 @@ func (s *wikiPageService) GetPageBySlug(ctx context.Context, kbID string, slug s
 	if err != nil {
 		return nil, err
 	}
-	if raw, _ := ctx.Value(wikiPageRawReadKey{}).(bool); !raw {
+	if !types.WikiPageRawRead(ctx) {
 		stripWikiPageInlineChunkCitations(page)
 	}
 	return page, nil
@@ -2076,6 +2065,7 @@ func (s *wikiPageService) MovePage(
 	if err != nil {
 		return nil, err
 	}
+	ctx = types.WithWikiPageWriteSnapshot(ctx, page)
 	page.FolderID = strings.TrimSpace(folderID)
 	if err := s.applyFolderToPage(ctx, page); err != nil {
 		return nil, err
@@ -2197,12 +2187,13 @@ func (s *wikiPageService) recomputePagesForFolders(ctx context.Context, kbID str
 		return err
 	}
 	for _, page := range pages {
+		writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 		if err := s.applyFolderToPage(ctx, page); err != nil {
 			return err
 		}
 		page.UpdatedAt = time.Now()
 		normalizeWikiHierarchy(page)
-		if err := s.repo.UpdateMeta(ctx, page); err != nil {
+		if err := s.repo.UpdateMeta(writeCtx, page); err != nil {
 			logger.Warnf(ctx, "wiki: recompute folder path for page %s failed: %v", page.Slug, err)
 		}
 	}
@@ -2344,8 +2335,9 @@ func (s *wikiPageService) InjectCrossLinks(ctx context.Context, kbID string, aff
 		if !changed {
 			continue
 		}
+		writeCtx := types.WithWikiPageWriteSnapshot(ctx, p)
 		p.Content = newContent
-		if err := s.UpdateAutoLinkedContent(ctx, p); err != nil {
+		if err := s.UpdateAutoLinkedContent(writeCtx, p); err != nil {
 			logger.Warnf(ctx, "wiki: cross-link injection failed for %s: %v", p.Slug, err)
 			continue
 		}

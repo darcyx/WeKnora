@@ -143,11 +143,6 @@ func castValue(val interface{}, targetType string) (interface{}, bool) {
 				return i, true
 			}
 		}
-		if n, ok := val.(json.Number); ok {
-			if i, exact := exactJSONInteger(n); exact {
-				return i, true
-			}
-		}
 
 	case "number":
 		if s, ok := val.(string); ok {

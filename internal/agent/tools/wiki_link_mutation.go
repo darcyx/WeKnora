@@ -44,7 +44,7 @@ func applyIncomingWikiContentRewrite(
 	var changes []appliedWikiContentChange
 	var updatedSlugs []string
 	for _, sourceSlug := range dedupNonEmptyStrings(inLinks) {
-		page, err := service.GetPageBySlug(ctx, kbID, sourceSlug)
+		page, err := service.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, sourceSlug)
 		if err != nil {
 			// Stale/dirty InLinks pointing at already-deleted pages should not
 			// hard-abort a rename or delete; skip missing referrers.

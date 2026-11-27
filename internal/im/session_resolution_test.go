@@ -2,7 +2,6 @@ package im
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -195,34 +194,26 @@ func TestSessionResolutionAllowsStaleMappingRecovery(t *testing.T) {
 	require.Equal(t, cs.ID, existing.ID)
 }
 
-func TestSessionResolutionBindsOnlyUnambiguousBlankChannel(t *testing.T) {
-	for _, ambiguous := range []bool{false, true} {
-		t.Run(fmt.Sprintf("ambiguous=%v", ambiguous), func(t *testing.T) {
+func TestSessionResolutionNeverClaimsBlankLegacyMapping(t *testing.T) {
+	for _, mode := range []string{"user", "thread"} {
+		t.Run(mode, func(t *testing.T) {
 			s := newResolutionService(t)
-			msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "a"}
-			cs, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+			msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "group", ThreadID: "topic"}
+			old, err := s.resolveSession(context.Background(), msg, 1, "agent-x", "channel-a", mode)
 			require.NoError(t, err)
-			require.NoError(t, s.db.Model(&ChannelSession{}).Where("id = ?", cs.ID).Update("im_channel_id", "").Error)
-			require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", cs.SessionID).Update("user_id", "").Error)
-			require.NoError(t, s.db.Create(&IMChannel{ID: "channel", TenantID: 1, AgentID: "agent", Platform: "feishu"}).Error)
-			if ambiguous {
-				require.NoError(t, s.db.Create(&IMChannel{ID: "other", TenantID: 1, AgentID: "agent", Platform: "feishu"}).Error)
-				require.NoError(t, s.db.Delete(&IMChannel{}, "id = ?", "other").Error)
-			}
-			resolved, err := s.resolveSession(context.Background(), msg, 1, "agent", "channel", "user")
+			require.NoError(t, s.db.Model(&ChannelSession{}).Where("id = ?", old.ID).Update("im_channel_id", "").Error)
+			require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", old.SessionID).Update("user_id", "").Error)
+			require.NoError(t, s.db.Create(&IMChannel{ID: "channel-a", TenantID: 1, AgentID: "agent-y", Platform: "feishu"}).Error)
+			require.NoError(t, s.db.Create(&IMChannel{ID: "channel-b", TenantID: 1, AgentID: "agent-x", Platform: "feishu"}).Error)
+			live, err := s.resolveSession(context.Background(), msg, 1, "agent-x", "channel-b", mode)
 			require.NoError(t, err)
-			if ambiguous {
-				require.NotEqual(t, cs.SessionID, resolved.SessionID)
-			} else {
-				require.Equal(t, cs.SessionID, resolved.SessionID)
-			}
-			var session types.Session
-			require.NoError(t, s.db.First(&session, "id = ?", cs.SessionID).Error)
-			if ambiguous {
-				require.Empty(t, session.UserID)
-			} else {
-				require.Equal(t, "im_user:1:channel:feishu:alice", session.UserID)
-			}
+			require.NotEqual(t, old.SessionID, live.SessionID)
+			var oldSession types.Session
+			require.NoError(t, s.db.First(&oldSession, "id = ?", old.SessionID).Error)
+			require.Empty(t, oldSession.UserID)
+			var oldMapping ChannelSession
+			require.NoError(t, s.db.First(&oldMapping, "id = ?", old.ID).Error)
+			require.Empty(t, oldMapping.IMChannelID)
 		})
 	}
 }
@@ -257,4 +248,23 @@ func TestSessionChannelMigrationDownRejectsDuplicatesBeforeChangingIndexes(t *te
 	var count int64
 	require.NoError(t, s.db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_channel_lookup', 'idx_channel_thread_lookup')").Scan(&count).Error)
 	require.EqualValues(t, 2, count)
+}
+
+func TestSessionOwnerBackfillSurvivesAgentReassignment(t *testing.T) {
+	s := newResolutionService(t)
+	msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "alice", ChatID: "group"}
+	old, err := s.resolveSession(context.Background(), msg, 1, "agent-x", "channel-a", "user")
+	require.NoError(t, err)
+	require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", old.SessionID).Update("user_id", "").Error)
+	require.NoError(t, s.db.Create(&IMChannel{ID: "channel-a", TenantID: 1, AgentID: "agent-y", Platform: "feishu"}).Error)
+	migration, err := os.ReadFile("../../migrations/sqlite/000055_im_session_owner_backfill.up.sql")
+	require.NoError(t, err)
+	require.NoError(t, s.db.Exec(string(migration)).Error)
+	var stored types.Session
+	require.NoError(t, s.db.First(&stored, "id = ?", old.SessionID).Error)
+	require.Equal(t, "im_user:1:channel-a:feishu:alice", stored.UserID)
+	require.NoError(t, s.db.Model(&types.Session{}).Where("id = ?", old.SessionID).Update("user_id", "other-owner").Error)
+	require.NoError(t, s.db.Exec(string(migration)).Error)
+	require.NoError(t, s.db.First(&stored, "id = ?", old.SessionID).Error)
+	require.Equal(t, "other-owner", stored.UserID)
 }

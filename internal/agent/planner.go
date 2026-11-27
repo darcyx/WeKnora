@@ -16,7 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// planPrompt asks for bounded, structured steps; empty steps (or legacy SIMPLE) skips planning.
+// planPrompt asks for bounded, structured steps; empty steps skips planning.
 const planPrompt = `Your only job in this turn is to route the request. Decide its intent FIRST, then list any necessary work.
 "explain": the requested deliverable is information about ONE subject: a how-to, troubleshooting advice, or facts from its documentation. The normal answer loop can run a knowledge search. Several headings or questions about the same subject, even if the user says 分别说明 and asks for a summary, are still one explanation. Return empty steps.
 "work": the request asks for independent investigations, real operations, or calculations for DIFFERENT inputs whose results must be combined. List 2–6 prerequisites. Group facts obtained from the same lookup. Do not include the final response, including an email draft. Creating or saving a requested file is separate work. If work depends on missing user input, keep only independent work, or return empty steps.
@@ -96,7 +96,7 @@ func (e *AgentEngine) maybePlan(ctx context.Context, query string, messages []ch
 		return nil, false
 	}
 	plan := strings.TrimSpace(result.Content)
-	if plan == "" || strings.EqualFold(plan, "SIMPLE") {
+	if plan == "" {
 		return nil, false
 	}
 	var parsed struct {

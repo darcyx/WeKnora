@@ -98,7 +98,7 @@ func (t *wikiRenamePageTool) Execute(ctx context.Context, args json.RawMessage) 
 	}
 
 	// Get existing page
-	existingPage, kbID, err := resolveUniqueWikiPage(ctx, t.wikiPageService, params.Slug, kbIDs, t.routes)
+	existingPage, kbID, err := resolveUniqueWikiPage(types.WithWikiPageRawRead(ctx), t.wikiPageService, params.Slug, kbIDs, t.routes)
 	if err != nil {
 		return &types.ToolResult{Success: false, Error: "Failed to resolve page to rename: " + err.Error()}, nil
 	}

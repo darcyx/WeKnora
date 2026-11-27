@@ -497,51 +497,6 @@ func sessionFileStoreFromManager(mgr sandbox.Manager) sandbox.SessionFileStore {
 	return provider.SessionFileStore()
 }
 
-// GetSkillInfo returns detailed information about a skill
-func (m *Manager) GetSkillInfo(ctx context.Context, skillName string) (*SkillInfo, error) {
-	if !m.enabled {
-		return nil, fmt.Errorf("skills are not enabled")
-	}
-
-	if !m.isSkillAllowed(skillName) {
-		return nil, fmt.Errorf("skill not allowed: %s", skillName)
-	}
-	if !m.isSkillUsable(skillName) {
-		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
-	}
-
-	source := m.resolveSource(skillName)
-	skill, err := source.LoadSkillInstructions(skillName)
-	if err != nil {
-		return nil, err
-	}
-	if !m.isSkillToolsSatisfied(skill.RequiredTools) {
-		return nil, fmt.Errorf("skill unavailable without required tools: %s", skillName)
-	}
-
-	files, err := source.ListSkillFiles(skillName)
-	if err != nil {
-		files = []string{} // Non-fatal error
-	}
-
-	return &SkillInfo{
-		Name:         skill.Name,
-		Description:  skill.Description,
-		BasePath:     skill.BasePath,
-		Instructions: skill.Instructions,
-		Files:        files,
-	}, nil
-}
-
-// SkillInfo provides detailed information about a skill
-type SkillInfo struct {
-	Name         string   `json:"name"`
-	Description  string   `json:"description"`
-	BasePath     string   `json:"base_path"`
-	Instructions string   `json:"instructions"`
-	Files        []string `json:"files"`
-}
-
 // Reload refreshes the skill cache by rediscovering all skills
 func (m *Manager) Reload(ctx context.Context) error {
 	if !m.enabled {

@@ -150,7 +150,7 @@ func (t *wikiWritePageTool) Execute(ctx context.Context, args json.RawMessage) (
 	}
 	// Resolve within the selected scope. Without an explicit KB, cached
 	// provenance only affects lookup order and ambiguous slugs are rejected.
-	existingPage, kbID, err := resolveUniqueWikiPage(ctx, t.wikiPageService, params.Slug, kbIDs, t.routes)
+	existingPage, kbID, err := resolveUniqueWikiPage(types.WithWikiPageRawRead(ctx), t.wikiPageService, params.Slug, kbIDs, t.routes)
 	if errors.Is(err, errWikiPageNotFoundInScope) {
 		existingPage = nil
 		sourceKBHints, sourceErr := wikiKnowledgeBasesForSourceDocuments(sourceDocs, t.kbIDs)

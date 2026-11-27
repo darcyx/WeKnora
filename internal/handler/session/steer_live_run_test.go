@@ -291,8 +291,16 @@ func TestSteerFollowUpHandoffKeepsSessionLiveAcrossPreviousClear(t *testing.T) {
 
 	events, _, err := mgr.GetSteerEvents(ctx, "sess-1", followUp.assistantMessage.ID, 0)
 	require.NoError(t, err)
-	require.Len(t, events, 1)
-	assert.Equal(t, "after-2", events[0].ID)
+	require.Len(t, events, 2)
+	assert.Equal(t, "after-1", events[0].ID)
+	assert.True(t, steerEventConsumed(events[0]))
+	assert.Equal(t, "after-2", events[1].ID)
+	// A delayed HTTP rebind of the first input must not enqueue it twice.
+	_, _, err = h.rebindSteerIfLiveRunMoved(ctx, "sess-1", "assist-A", steerEventWithDelivery("after-1", "do this next", steerDeliveryAfter))
+	require.NoError(t, err)
+	events, _, err = mgr.GetSteerEvents(ctx, "sess-1", followUp.assistantMessage.ID, 0)
+	require.NoError(t, err)
+	require.Len(t, selectSteerBacklog(events, nil), 1)
 
 	old, _, err := mgr.GetSteerEvents(ctx, "sess-1", "assist-A", 0)
 	require.NoError(t, err)
@@ -399,6 +407,9 @@ type steerFailingCreateStub struct {
 func (s *steerFailingCreateStub) CreateMessage(context.Context, *types.Message) (*types.Message, error) {
 	return nil, errors.New("db down")
 }
+func (s *steerFailingCreateStub) GetMessage(context.Context, string, string) (*types.Message, error) {
+	return nil, errors.New("db down")
+}
 
 func TestPersistTurnMessagesSkipsWhenAlreadyClaimed(t *testing.T) {
 	msgs := &steerPersistingMessageStub{}
@@ -454,7 +465,8 @@ func TestClaimNextSteerFollowUpClaimFailureRollsBackMessages(t *testing.T) {
 		&sseStreamContext{assistantMessage: &types.Message{ID: "assist-A"}})
 	assert.False(t, ok)
 	assert.Nil(t, followUp)
-	assert.Empty(t, msgs.byID, "ClaimLiveRun failure must not leave a follow-up turn in the database")
+	require.Len(t, msgs.byID, 1, "the accepted stable user row remains recoverable")
+	assert.Equal(t, "do this next", msgs.byID[stableSteerMessageID("sess-1", "after-1")].Content)
 
 	old, _, err := inner.GetSteerEvents(ctx, "sess-1", "assist-A", 0)
 	require.NoError(t, err)
@@ -512,4 +524,183 @@ func TestSteerRetryFindsConsumedReceiptAfterRunCompleted(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "already_injected")
 	assert.NotContains(t, w.Body.String(), "new_run")
+}
+
+type failTransferStream struct{ interfaces.StreamManager }
+
+func (s failTransferStream) AppendSteerEvents(ctx context.Context, sessionID, messageID string, events []interfaces.StreamEvent) error {
+	if messageID != "assist-A" {
+		return errors.New("transfer unavailable")
+	}
+	return s.StreamManager.AppendSteerEvents(ctx, sessionID, messageID, events)
+}
+
+func TestSteerTransferFailureKeepsSourceAndFallbackIsIdempotent(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "sess-1", "assist-A", "req-A"))
+	queued := []interfaces.StreamEvent{steerEventWithDelivery("one", "first", steerDeliveryAfter), steerEventWithDelivery("two", "second", steerDeliveryAfter)}
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "sess-1", "assist-A", queued))
+	msgs := &steerPersistingMessageStub{}
+	h := &Handler{sessionService: &steerOwnedSessionStub{}, messageService: msgs, streamManager: failTransferStream{mgr}}
+	req := &qaRequestContext{sessionID: "sess-1", session: &types.Session{ID: "sess-1"}}
+	_, ok := h.claimNextSteerFollowUp(ctx, req, &sseStreamContext{assistantMessage: &types.Message{ID: "assist-A"}})
+	require.False(t, ok)
+	source, _, err := mgr.GetSteerEvents(ctx, "sess-1", "assist-A", 0)
+	require.NoError(t, err)
+	require.Len(t, selectSteerBacklog(source, nil), 2)
+	require.True(t, h.preservePendingSteers(ctx, req, "assist-A", source))
+	require.True(t, h.preservePendingSteers(ctx, req, "assist-A", source))
+	require.Len(t, msgs.byID, 2)
+}
+
+type steerRecoveryMessages struct{ steerPersistingMessageStub }
+
+func (s *steerRecoveryMessages) UpdateMessage(_ context.Context, msg *types.Message) error {
+	clone := *msg
+	s.byID[msg.ID] = &clone
+	return nil
+}
+
+type failSteerReadStream struct{ interfaces.StreamManager }
+
+func (s failSteerReadStream) GetSteerEvents(context.Context, string, string, int) ([]interfaces.StreamEvent, int, error) {
+	return nil, 0, errors.New("redis unavailable")
+}
+
+func TestFailedFollowUpPersistsTerminalWhenQueueReadFails(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "b", "r"))
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{}}}
+	h := &Handler{messageService: msgs, streamManager: failSteerReadStream{mgr}}
+	req := &qaRequestContext{sessionID: "s", assistantMessage: &types.Message{ID: "b", SessionID: "s"}}
+	h.closeFailedSteerFollowUp(ctx, req)
+	require.True(t, msgs.byID["b"].IsCompleted)
+	require.Equal(t, qaFailureContent, msgs.byID["b"].Content)
+}
+
+func (s *steerLiveRunLookupStub) GetSteerEvents(context.Context, string, string, int) ([]interfaces.StreamEvent, int, error) {
+	return nil, 0, nil
+}
+
+func TestCompletedRunRecoversQueuedInputBeforeClearingMarker(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "a", "r"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "s", "a", []interfaces.StreamEvent{steerEventWithDelivery("queued", "later question", steerDeliveryAfter)}))
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{"a": {ID: "a", SessionID: "s", IsCompleted: true, RunState: types.MessageRunStateSteerRecoveryPending}}}}
+	h := &Handler{messageService: msgs, streamManager: mgr}
+	current, err := h.liveAgentRun(ctx, "s")
+	require.NoError(t, err)
+	require.Empty(t, current)
+	require.Len(t, msgs.byID, 2)
+	for id, msg := range msgs.byID {
+		if id != "a" {
+			require.Equal(t, "later question", msg.Content)
+			require.NotEqual(t, "r", msg.RequestID)
+		}
+	}
+}
+
+type ambiguousClaimStream struct{ interfaces.StreamManager }
+
+func (s ambiguousClaimStream) ClaimLiveRun(ctx context.Context, sessionID, messageID, requestID string) error {
+	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, messageID, requestID); err != nil {
+		return err
+	}
+	return errors.New("claim response timed out")
+}
+func TestClaimSteerFollowUpKeepsRowsWhenClaimCommittedBeforeTimeout(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "a", "r"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "s", "a", []interfaces.StreamEvent{steerEventWithDelivery("one", "first", steerDeliveryAfter)}))
+	msgs := &steerPersistingMessageStub{}
+	h := &Handler{sessionService: &steerOwnedSessionStub{}, messageService: msgs, streamManager: ambiguousClaimStream{mgr}}
+	next, ok := h.claimNextSteerFollowUp(ctx, &qaRequestContext{sessionID: "s", session: &types.Session{ID: "s"}}, &sseStreamContext{assistantMessage: &types.Message{ID: "a"}})
+	require.True(t, ok)
+	require.NotNil(t, msgs.byID[next.assistantMessage.ID])
+	live, _, err := mgr.GetLiveRun(ctx, "s")
+	require.NoError(t, err)
+	require.Equal(t, next.assistantMessage.ID, live)
+}
+
+type uncertainClaimStream struct {
+	interfaces.StreamManager
+	lookupFails  bool
+	consumeFails bool
+}
+
+func (s *uncertainClaimStream) ClaimLiveRun(ctx context.Context, sessionID, messageID, requestID string) error {
+	if err := s.StreamManager.ClaimLiveRun(ctx, sessionID, messageID, requestID); err != nil {
+		return err
+	}
+	s.lookupFails = true
+	s.consumeFails = true
+	return errors.New("claim response lost")
+}
+func (s *uncertainClaimStream) GetLiveRun(ctx context.Context, sessionID string) (string, string, error) {
+	if s.lookupFails {
+		s.lookupFails = false
+		return "", "", errors.New("lookup unavailable")
+	}
+	return s.StreamManager.GetLiveRun(ctx, sessionID)
+}
+func (s *uncertainClaimStream) UpdateSteerEventData(ctx context.Context, sessionID, messageID, eventID string, data map[string]interface{}) (bool, error) {
+	if s.consumeFails {
+		return false, errors.New("write unavailable")
+	}
+	return s.StreamManager.UpdateSteerEventData(ctx, sessionID, messageID, eventID, data)
+}
+func TestUncertainSteerClaimDoesNotCreateDuplicatePrimary(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "a", "r"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "s", "a", []interfaces.StreamEvent{steerEventWithDelivery("one", "first", steerDeliveryAfter)}))
+	streams := &uncertainClaimStream{StreamManager: mgr}
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{}}}
+	h := &Handler{sessionService: &steerOwnedSessionStub{}, messageService: msgs, streamManager: streams}
+	next, handled := h.claimNextSteerFollowUp(ctx, &qaRequestContext{sessionID: "s", session: &types.Session{ID: "s"}}, &sseStreamContext{assistantMessage: &types.Message{ID: "a"}})
+	require.True(t, handled)
+	require.True(t, next.steerHandoffFailed)
+	require.Len(t, msgs.byID, 2)
+	streams.consumeFails = false
+	live, err := h.liveAgentRun(ctx, "s")
+	require.NoError(t, err)
+	require.Empty(t, live)
+	require.Len(t, msgs.byID, 2, "source receipt recovery must reuse the first user row")
+	source, _, err := mgr.GetSteerEvents(ctx, "s", "a", 0)
+	require.NoError(t, err)
+	require.True(t, steerEventConsumed(source[0]))
+}
+
+func TestRebindReturnsReceiptWhenCompletedRunRecoveredInput(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "a", "r"))
+	evt := steerEventWithDelivery("one", "late question", steerDeliveryAfter)
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "s", "a", []interfaces.StreamEvent{evt}))
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{"a": {ID: "a", SessionID: "s", IsCompleted: true, RunState: types.MessageRunStateSteerRecoveryPending}}}}
+	h := &Handler{messageService: msgs, streamManager: mgr}
+	_, status, err := h.rebindSteerIfLiveRunMoved(ctx, "s", "a", evt)
+	require.NoError(t, err)
+	require.Equal(t, "already_injected", status)
+	require.Len(t, msgs.byID, 2)
+}
+
+func TestCompletedRunWithoutRecoveryMarkerKeepsNormalIdleBehavior(t *testing.T) {
+	ctx := t.Context()
+	mgr := stream.NewMemoryStreamManager()
+	require.NoError(t, mgr.SetLiveRun(ctx, "s", "a", "r"))
+	require.NoError(t, mgr.AppendSteerEvents(ctx, "s", "a", []interfaces.StreamEvent{steerEventWithDelivery("one", "late", steerDeliveryAfter)}))
+	msgs := &steerRecoveryMessages{steerPersistingMessageStub{byID: map[string]*types.Message{"a": {ID: "a", SessionID: "s", IsCompleted: true}}}}
+	h := &Handler{messageService: msgs, streamManager: mgr}
+	current, err := h.liveAgentRun(ctx, "s")
+	require.NoError(t, err)
+	require.Empty(t, current)
+	require.Len(t, msgs.byID, 1)
+	events, _, err := mgr.GetSteerEvents(ctx, "s", "a", 0)
+	require.NoError(t, err)
+	require.False(t, steerEventConsumed(events[0]))
 }

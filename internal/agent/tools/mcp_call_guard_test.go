@@ -62,8 +62,12 @@ func TestMCPCallGuardCoversDirectAndProxyBeforeApproval(t *testing.T) {
 			require.NoError(t, err)
 			name, raw := "", json.RawMessage(`{"count":"2"}`)
 			if direct {
-				registry.PrepareMCPToolsDirect(ctx)
-				name = MCPToolNamesByServiceID(registry)[service.ID][0]
+				registry.PrepareMCPTools(ctx)
+				describeTool(ctx, t, registry, service.ID, "get_order")
+				registry.RefreshMCPTools(ctx)
+				names := registeredMCPToolNames(registry, service.ID)
+				require.Len(t, names, 1)
+				name = names[0]
 			} else {
 				described := describeTool(ctx, t, registry, service.ID, "get_order")
 				name = ToolCallMCPTool

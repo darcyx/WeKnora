@@ -67,7 +67,6 @@ type retrievalGap struct {
 
 type retrievalAttempt struct {
 	QuestionID        string              `json:"question_id,omitempty"`
-	FAQOnly           bool                `json:"faq_only,omitempty"`
 	RuntimeManaged    bool                `json:"runtime_managed,omitempty"`
 	ID                string              `json:"id"`
 	Scope             string              `json:"scope"`
@@ -81,7 +80,6 @@ type retrievalAttempt struct {
 	RecoveryCallID    string              `json:"recovery_call_id,omitempty"`
 	RecoveryTargets   types.SearchTargets `json:"recovery_targets,omitempty"`
 	RecoveryStages    []string            `json:"recovery_stages,omitempty"`
-	FAQ               *retrievalFAQState  `json:"faq,omitempty"`
 	StructuredSources bool                `json:"structured_sources,omitempty"`
 	ObservedIDs       []string            `json:"observed_ids,omitempty"`
 	CitableIDs        []string            `json:"citable_ids,omitempty"`
@@ -450,12 +448,6 @@ func (c *retrievalControl) snapshotLocked() retrievalState {
 		s.Attempts[i].RecoveryStages = slices.Clone(s.Attempts[i].RecoveryStages)
 		s.Attempts[i].ObservedIDs = slices.Clone(s.Attempts[i].ObservedIDs)
 		s.Attempts[i].CitableIDs = slices.Clone(s.Attempts[i].CitableIDs)
-		if faq := s.Attempts[i].FAQ; faq != nil {
-			copyFAQ := *faq
-			copyFAQ.Observations = slices.Clone(faq.Observations)
-			copyFAQ.DocumentTargets = faq.DocumentTargets.Clone()
-			s.Attempts[i].FAQ = &copyFAQ
-		}
 	}
 	return s
 }
@@ -552,9 +544,6 @@ func restoreRetrievalControl(state retrievalState) (*retrievalControl, error) {
 		if a.QuestionID != "" && (!slices.Contains(c.state.UserInputIDs, a.QuestionID) || strings.HasPrefix(a.QuestionID, "app_info:")) {
 			return nil, fmt.Errorf("unknown saved search question")
 		}
-		if err := validateRetrievalFAQ(a, g.Scope); err != nil {
-			return nil, err
-		}
 		for _, failure := range a.Failures {
 			if !a.Completed || failure.CallID != a.ID || len(failure.KnowledgeBaseIDs) == 0 ||
 				(failure.Outcome != retrievalTransient && failure.Outcome != retrievalUnknown) {
@@ -586,7 +575,7 @@ func restoreRetrievalControl(state retrievalState) (*retrievalControl, error) {
 			if a.QuestionID == "" {
 				ref = "" // Older snapshots validated search grace per fact.
 			}
-			if g.SearchGrace != questionSearchGrace || !a.FAQOnly && prefix.countSearches(g, a.QuestionID, ref) >= g.SearchGrace || !isBudgetedSearchTool(a.Tool) || !a.RuntimeManaged && previous.Outcome != retrievalSuccess {
+			if g.SearchGrace != questionSearchGrace || prefix.countSearches(g, a.QuestionID, ref) >= g.SearchGrace || !isBudgetedSearchTool(a.Tool) || !a.RuntimeManaged && previous.Outcome != retrievalSuccess {
 				return nil, fmt.Errorf("invalid saved budgeted search")
 			}
 			if failures := outstandingRetrievalFailures(prefix.state.Attempts, g.ID); len(failures) > 0 && !independentRetrievalScope(failures, a.Arguments) {

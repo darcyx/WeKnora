@@ -33,9 +33,8 @@ func TestEmptyMCPSelectionModeTreatedAsNone(t *testing.T) {
 	applyPerRequestMCPScope(context.Background(), cfg, []string{"mcp-1"}, false, []string{"mcp-1"})
 	require.Empty(t, cfg.PinnedMCPServiceIDs)
 
-	eff, mode := resolvePerRequestMCPScope([]string{"mcp-1"}, []string{"mcp-1"}, "", false)
+	eff := resolvePerRequestMCPScope([]string{"mcp-1"}, []string{"mcp-1"}, "", false)
 	require.Empty(t, eff)
-	require.Equal(t, "", mode)
 }
 
 func TestInheritedToolOwnsPolicyExemptsCoreNonWriteTools(t *testing.T) {

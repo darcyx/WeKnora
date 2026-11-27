@@ -387,9 +387,9 @@ func TestRenderUserTurnContent_PageContextUsesHandles(t *testing.T) {
 func TestBuildMustUseBlock_MCPAndSkills(t *testing.T) {
 	block := buildMustUseBlock(
 		[]*PinnedMCPServiceInfo{{
-			ID:        "mcp-1",
-			Name:      "ChemDB",
-			ToolNames: []string{"mcp_chemdb_search"},
+			ID:           "mcp-1",
+			Name:         "ChemDB",
+			Discoverable: true,
 		}},
 		[]*PinnedSkillInfo{{
 			Name: "data-analysis",
@@ -399,27 +399,13 @@ func TestBuildMustUseBlock_MCPAndSkills(t *testing.T) {
 	assert.Contains(t, block, "<must_use>")
 	assert.NotContains(t, block, "<runtime_context")
 	assert.NotContains(t, block, "<instruction>")
-	assert.Contains(t, block, "Must use MCP tools whose names start with mcp_chemdb_")
+	assert.Contains(t, block, `discover_mcp_tools(mode="list_tools", server_id="mcp-1")`)
 	assert.Contains(t, block, "@ChemDB")
 	assert.Contains(t, block, `Must call read_file(path="skill://data-analysis/SKILL.md")`)
 	assert.Contains(t, block, `@Skill "data-analysis"`)
 	assert.Contains(t, block, "task-scoped resource selections")
 	assert.NotContains(t, block, "Missing essential inputs pause dependent calls")
 	assert.NotContains(t, block, "Read the selected Skill first when needed to identify those inputs")
-}
-
-func TestBuildMustUseBlock_MCPToolPrefixOnly(t *testing.T) {
-	block := buildMustUseBlock(
-		[]*PinnedMCPServiceInfo{{
-			ID:        "mcp-1",
-			Name:      "iwiki",
-			ToolNames: []string{"mcp_iwiki_aisearchdocument", "mcp_iwiki_getdocument"},
-		}},
-		nil,
-	)
-	assert.Contains(t, block, "mcp_iwiki_")
-	assert.NotContains(t, block, "aisearchdocument")
-	assert.NotContains(t, block, `tools="`)
 }
 
 func TestBuildMustUseBlock_SkipsMCPWithoutTools(t *testing.T) {
@@ -500,31 +486,6 @@ func TestBuildMessagesWithLLMContextRegistersBoundScopeBeforeFirstModelCall(t *t
 	assert.NotContains(t, userContent, "kb-real-id")
 	assert.NotContains(t, userContent, "chunk-real-id")
 	assert.NotContains(t, userContent, "doc-real-id")
-}
-
-func TestBuildMustUseBlock_MultiWordServicePrefix(t *testing.T) {
-	// Service "My Service" -> tools mcp_my_service_*; the prefix must be the
-	// full service slug, not the first underscore segment (mcp_my_).
-	block := buildMustUseBlock(
-		[]*PinnedMCPServiceInfo{{
-			ID:        "mcp-1",
-			Name:      "My Service",
-			ToolNames: []string{"mcp_my_service_search", "mcp_my_service_get"},
-		}},
-		nil,
-	)
-	assert.Contains(t, block, "mcp_my_service_")
-	assert.NotContains(t, block, "start with mcp_my_ ")
-
-	single := buildMustUseBlock(
-		[]*PinnedMCPServiceInfo{{
-			ID:        "mcp-1",
-			Name:      "My Service",
-			ToolNames: []string{"mcp_my_service_search"},
-		}},
-		nil,
-	)
-	assert.Contains(t, single, "mcp_my_service_")
 }
 
 func TestBuildMustUseBlock_SanitizesNamesIntoSingleLine(t *testing.T) {

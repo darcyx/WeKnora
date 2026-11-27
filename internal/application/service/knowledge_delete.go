@@ -305,9 +305,10 @@ func (s *knowledgeService) cleanupWikiReferences(
 				deletedSlugs = append(deletedSlugs, page.Slug)
 			}
 		} else {
+			writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 			page.SourceRefs = remaining
 			page.ChunkRefs = removeChunkRefs(page.ChunkRefs, sourceChunkRefs)
-			if err := s.wikiService.UpdatePageMeta(ctx, page); err != nil {
+			if err := s.wikiService.UpdatePageMeta(writeCtx, page); err != nil {
 				logger.Warnf(ctx, "wiki cleanup: failed to update source refs for page %s: %v", page.Slug, err)
 				cleanupErr = errors.Join(cleanupErr, err)
 			}

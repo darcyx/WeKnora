@@ -1,39 +1,12 @@
 package agent
 
 import (
-	"encoding/json"
-	"fmt"
 	"maps"
 	"slices"
 	"strings"
 
-	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/types"
 )
-
-type retrievalFAQState struct {
-	Observations    json.RawMessage     `json:"observations"`
-	DocumentTargets types.SearchTargets `json:"document_targets,omitempty"`
-}
-
-func validateRetrievalFAQ(a *retrievalAttempt, gapScope string) error {
-	if a.FAQOnly && (a.Tool != agenttools.ToolSearchKnowledge || !a.RuntimeManaged || a.Action != retrievalInitial && a.Action != retrievalSearch) {
-		return fmt.Errorf("invalid FAQ preflight reservation")
-	}
-	if a.FAQ == nil {
-		return nil
-	}
-	handoffScope := a.Scope
-	if a.FAQOnly {
-		// A document handoff can be outside the FAQ reservation, but never outside this fact.
-		handoffScope = gapScope
-	}
-	if (!a.FAQOnly && a.Action != retrievalInitial) || a.Tool != agenttools.ToolSearchKnowledge || !json.Valid(a.FAQ.Observations) ||
-		!retrievalScopeCovers(handoffScope, retrievalScopeForTargets(a.FAQ.DocumentTargets)) {
-		return fmt.Errorf("invalid FAQ retrieval handoff")
-	}
-	return nil
-}
 
 func mergeFAQSearchResult(faq, documents *types.ToolResult) *types.ToolResult {
 	if documents == nil {

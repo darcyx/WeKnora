@@ -466,7 +466,11 @@ func (s *agentService) CreateAgentEngine(
 	)
 	engine.SetAppConfig(s.cfg)
 	pinnedMCP := s.resolvePinnedMCPServiceInfos(ctx, config)
-	s.attachPinnedMCPToolNames(toolRegistry, pinnedMCP)
+	for _, info := range pinnedMCP {
+		if info != nil && info.ID != "" {
+			info.Discoverable = toolRegistry.HasMCPServer(info.ID)
+		}
+	}
 	engine.SetPinnedMentions(
 		pinnedMCP,
 		s.resolvePinnedSkillInfos(config),
@@ -1702,11 +1706,11 @@ func (s *agentService) registerTools(
 		case tools.ToolDatabaseQuery:
 			toolToRegister = tools.NewDatabaseQueryTool(s.db, config.SearchTargets)
 		case tools.ToolWebSearch:
-			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults).WithAppInfo(types.SanitizeAppInfoJSON(config.AppInfo))
+			toolToRegister = tools.NewWebSearchTool(webClient, config.WebSearchMaxResults).WithAppInfo(types.SanitizeLiveAppInfoJSON(config.AppInfo))
 			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d, providerID: %s", sessionID, config.WebSearchMaxResults, config.WebSearchProviderID)
 
 		case tools.ToolWebFetch:
-			toolToRegister = tools.NewWebFetchTool(webClient).WithAppInfo(types.SanitizeAppInfoJSON(config.AppInfo))
+			toolToRegister = tools.NewWebFetchTool(webClient).WithAppInfo(types.SanitizeLiveAppInfoJSON(config.AppInfo))
 			logger.Infof(ctx, "Registered web_fetch tool for session: %s, providerID: %s",
 				sessionID, config.WebSearchProviderID)
 
@@ -2382,23 +2386,6 @@ func (s *agentService) resolvePinnedMCPServiceInfos(
 		result = append(result, &agent.PinnedMCPServiceInfo{ID: id, Name: id})
 	}
 	return result
-}
-
-func (s *agentService) attachPinnedMCPToolNames(
-	registry *tools.ToolRegistry,
-	pinned []*agent.PinnedMCPServiceInfo,
-) {
-	if registry == nil || len(pinned) == 0 {
-		return
-	}
-	byService := tools.MCPToolNamesByServiceID(registry)
-	for _, info := range pinned {
-		if info == nil || info.ID == "" {
-			continue
-		}
-		info.ToolNames = append([]string(nil), byService[info.ID]...)
-		info.Discoverable = registry.HasMCPServer(info.ID)
-	}
 }
 
 func fallbackPinnedMCPInfos(ids []string) []*agent.PinnedMCPServiceInfo {

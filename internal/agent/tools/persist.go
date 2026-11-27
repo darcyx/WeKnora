@@ -24,17 +24,6 @@ var persistStripFieldsByTool = map[string][]string{
 	ToolEditSandboxFile:       {"content", "content_base64"},
 }
 
-// clientStripFieldsByTool is the lighter omit list for live SSE. The UI
-// needs stdout/stderr to render a terminal card; those streams are already
-// capped by the tool. Persist still uses persistStripFieldsByTool.
-var clientStripFieldsByTool = map[string][]string{
-	ToolReadFile:              {"content", "content_base64", "instructions"},
-	ToolShellExec:             {"content", "content_base64"},
-	LegacyToolReadSandboxFile: {"content", "content_base64"},
-	ToolWriteSandboxFile:      {"content", "content_base64"},
-	ToolEditSandboxFile:       {"content", "content_base64"},
-}
-
 const historicalSandboxOutputChars = 4 * 1024
 
 // ShouldOmitRawToolOutput reports whether the raw XML/text Output should be
@@ -57,11 +46,7 @@ func SanitizeToolDataForPersist(toolName string, data map[string]interface{}) ma
 
 // SanitizeToolDataForClient retains transient metadata only for live clients.
 func SanitizeToolDataForClient(toolName string, data map[string]interface{}) map[string]interface{} {
-	omit := clientStripFieldsByTool[toolName]
-	if omit == nil {
-		omit = persistStripFieldsByTool[toolName]
-	}
-	out := sanitizeToolData(data, omit)
+	out := sanitizeToolData(data, persistStripFieldsByTool[toolName])
 	if !dataChangeTools[toolName] {
 		delete(out, "data_change")
 	}

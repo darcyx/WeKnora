@@ -5,8 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"regexp"
 	"time"
 )
+
+var wikiInlineChunkCitationRegex = regexp.MustCompile(`[ \t]*\[c\d{3,}(?:\s*[,;]\s*c\d{3,})*\]`)
+
+// StripWikiInlineChunkCitations removes legacy internal citation handles from displayed text.
+func StripWikiInlineChunkCitations(content string) string {
+	return wikiInlineChunkCitationRegex.ReplaceAllString(content, "")
+}
+
+type wikiPageRawReadKey struct{}
+
+// WithWikiPageRawRead requests database content for a guarded mutation read.
+func WithWikiPageRawRead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, wikiPageRawReadKey{}, true)
+}
+
+func WikiPageRawRead(ctx context.Context) bool {
+	raw, _ := ctx.Value(wikiPageRawReadKey{}).(bool)
+	return raw
+}
 
 type wikiPageWriteSnapshotKey struct{}
 

@@ -242,7 +242,7 @@ func (h *Handler) buildResumeRequest(
 		sharedAgentReadOnly: shared && req.SharedAgentReadOnly,
 		userMessageID:       req.UserMessageID,
 		channel:             msg.Channel,
-		appInfo:             types.SanitizeAppInfoJSON(req.AppInfo),
+		appInfo:             types.SanitizeLiveAppInfoJSON(req.AppInfo),
 		runNote:             req.RunNote,
 		quotedContext:       req.QuotedContext,
 		questionOrigin:      req.QuestionOrigin,

@@ -25,8 +25,7 @@ var _ SkillSource = (*Loader)(nil)
 type imageSkillSource interface {
 	SkillSource
 
-	// RemoteScriptPath returns the absolute in-sandbox path of one script.
-	RemoteScriptPath(name, relativePath string) (string, error)
+	imageSkillSource()
 }
 
 var _ imageSkillSource = (*TenantSkillSource)(nil)

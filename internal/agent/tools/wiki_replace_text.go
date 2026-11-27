@@ -115,11 +115,13 @@ func (t *wikiReplaceTextTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 
 	// Get the existing page
-	existingPage, kbID, err := resolveUniqueWikiPage(ctx, t.wikiPageService, params.Slug, kbIDs, t.routes)
+	existingPage, kbID, err := resolveUniqueWikiPage(types.WithWikiPageRawRead(ctx), t.wikiPageService, params.Slug, kbIDs, t.routes)
 	if err != nil {
 		return &types.ToolResult{Success: false, Error: fmt.Sprintf("Failed to fetch page %s: %v", params.Slug, err)}, nil
 	}
 
+	ctx = types.WithWikiPageWriteSnapshot(ctx, existingPage)
+	existingPage.Content = types.StripWikiInlineChunkCitations(existingPage.Content)
 	replacementCount := strings.Count(existingPage.Content, params.OldText)
 	if replacementCount == 0 {
 		return &types.ToolResult{Success: false, Error: "old_text not found in the current page content. Ensure you copy it exactly as it appears."}, nil

@@ -20,9 +20,10 @@ import (
 )
 
 type proxyApprovalGate struct {
-	request  approval.PendingRequest
-	reject   bool
-	disabled bool
+	request       approval.PendingRequest
+	reject        bool
+	disabled      bool
+	afterApproval func()
 }
 
 func (g *proxyApprovalGate) IsEnabled(context.Context, uint64, string, string) (bool, error) {
@@ -38,6 +39,9 @@ func (g *proxyApprovalGate) RequestAndWait(
 	request approval.PendingRequest,
 ) (approval.Decision, error) {
 	g.request = request
+	if g.afterApproval != nil {
+		g.afterApproval()
+	}
 	return approval.Decision{Approved: !g.reject, Reason: "rejected by test user"}, nil
 }
 
@@ -166,4 +170,47 @@ func TestMCPProxyHTTPApprovalArgumentsAndImages(t *testing.T) {
 	result = invoke(`{"count":2}`)
 	require.False(t, result.Success)
 	require.Equal(t, int32(2), calls.Load())
+}
+
+func TestMCPRevokedDuringApprovalIsNotCalled(t *testing.T) {
+	utils.SetSSRFWhitelistFromRaw("127.0.0.1")
+	t.Cleanup(utils.ResetSSRFWhitelistForTest)
+	for _, direct := range []bool{false, true} {
+		t.Run(map[bool]string{true: "direct", false: "proxy"}[direct], func(t *testing.T) {
+			var calls atomic.Int32
+			server := sdkserver.NewMCPServer("approval", "1", sdkserver.WithToolCapabilities(false))
+			server.AddTool(sdkmcp.NewTool("lookup"), func(context.Context, sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+				calls.Add(1)
+				return sdkmcp.NewToolResultText("ok"), nil
+			})
+			httpServer := httptest.NewServer(sdkserver.NewStreamableHTTPServer(server, sdkserver.WithStateLess(true)))
+			defer httpServer.Close()
+			manager := internalmcp.NewMCPManager(nil)
+			defer manager.Shutdown()
+			service := &types.MCPService{ID: "svc", TenantID: 7, Enabled: true, Name: "service", URL: &httpServer.URL, TransportType: types.MCPTransportHTTPStreamable}
+			ctx := catalogTestContext()
+			registry := NewToolRegistry()
+			gate := &proxyApprovalGate{}
+			_, err := RegisterMCPTools(ctx, registry, []*types.MCPService{service}, manager, gate, 0, nil, nil)
+			require.NoError(t, err)
+			described := describeTool(ctx, t, registry, service.ID, "lookup")
+			name := ToolCallMCPTool
+			raw, err := json.Marshal(map[string]any{"tool_ref": described.ToolRef, "arguments": map[string]any{}})
+			require.NoError(t, err)
+			if direct {
+				registry.PrepareMCPTools(ctx)
+				registry.RefreshMCPTools(ctx)
+				names := registeredMCPToolNames(registry, service.ID)
+				require.Len(t, names, 1)
+				name = names[0]
+				raw = []byte(`{}`)
+			}
+			gate.afterApproval = func() { gate.disabled = true }
+			ctx = WithToolExecContext(ctx, &ToolExecContext{EventBus: event.NewEventBus(), ToolCallID: "call", SessionID: "s", AssistantMessageID: "m", ApprovalCtx: ctx})
+			result, err := registry.ExecuteTool(ctx, name, raw)
+			require.NoError(t, err)
+			require.False(t, result.Success)
+			require.Zero(t, calls.Load())
+		})
+	}
 }

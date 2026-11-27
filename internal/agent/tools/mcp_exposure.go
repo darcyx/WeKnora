@@ -67,6 +67,7 @@ func (t *MCPRegisteredTool) Execute(ctx context.Context, args json.RawMessage) (
 		target.serverVersion = current.serverVersion
 		target.savedAt = current.savedAt
 		target.revalidate = current.revalidate
+		target.checkCurrent = func(ctx context.Context) error { return t.catalog.checkCallTarget(ctx, target) }
 		return target.Execute(ctx, args)
 	}
 	return mcpDiscoveryFailure(
@@ -100,31 +101,22 @@ func (r *ToolRegistry) mcpCatalog() *MCPCatalog {
 // describe. This is application-level deferred loading via ordinary functions.
 // Production readers use persisted metadata and perform no upstream discovery.
 func (r *ToolRegistry) PrepareMCPTools(ctx context.Context) {
-	r.prepareMCPToolsWithMode(ctx, mcpStartupGrace, false)
+	r.prepareMCPToolsWithGrace(ctx, mcpStartupGrace)
 }
 
-// PrepareMCPToolsDirect is the full-exposure compatibility path.
-func (r *ToolRegistry) PrepareMCPToolsDirect(ctx context.Context) {
-	r.prepareMCPTools(ctx, mcpStartupGrace)
-}
-
-func (r *ToolRegistry) prepareMCPTools(ctx context.Context, grace time.Duration) {
-	r.prepareMCPToolsWithMode(ctx, grace, true)
-}
-
-func (r *ToolRegistry) prepareMCPToolsWithMode(ctx context.Context, grace time.Duration, direct bool) {
+func (r *ToolRegistry) prepareMCPToolsWithGrace(ctx context.Context, grace time.Duration) {
 	c := r.mcpCatalog()
 	if c == nil || c.authorize(ctx) != nil {
 		return
 	}
-	r.mcpPrepared, r.mcpDirect = true, direct
+	r.mcpPrepared = true
 	discovery := r.tools[ToolDiscoverMCPTools].(*MCPDiscoverTool)
-	discovery.directExposure, discovery.advertiseSources = direct, true
+	discovery.advertiseSources = true
 	c.preloadOnce.Do(func() {
 		c.preloadDone = make(chan struct{})
 		go func() {
 			defer close(c.preloadDone)
-			// prepareMCPToolsWithMode selects on preloadDone, so a panic in the
+			// prepareMCPToolsWithGrace selects on preloadDone, so a panic in the
 			// fan-out below must not skip the close; the barrier also records
 			// every service this pass left unfinished.
 			defer RecoverGoroutine(ctx, "MCP catalog preload", func() { c.markPreloadFailed() })
@@ -285,7 +277,7 @@ func (r *ToolRegistry) RefreshMCPTools(ctx context.Context) {
 			continue
 		}
 		for _, tool := range visible {
-			if !r.mcpDirect && !c.advertised(tool) {
+			if !c.advertised(tool) {
 				continue
 			}
 			c.rememberAdvertised(tool)

@@ -71,10 +71,6 @@ func TestExampleSkillsIntegration(t *testing.T) {
 		t.Fatalf("Failed to load analyze_form.py: %v", err)
 	}
 
-	if !scriptFile.IsScript {
-		t.Error("analyze_form.py should be marked as script")
-	}
-
 	t.Logf("analyze_form.py content length: %d characters", len(scriptFile.Content))
 
 	// Test list files
@@ -85,7 +81,7 @@ func TestExampleSkillsIntegration(t *testing.T) {
 
 	t.Logf("Files in pdf-processing skill:")
 	for _, f := range files {
-		t.Logf("  - %s (script: %v)", f, IsScript(f))
+		t.Logf("  - %s", f)
 	}
 }
 
@@ -143,14 +139,6 @@ func TestManagerWithExampleSkills(t *testing.T) {
 	}
 
 	t.Logf("Level 3 (resources): Loaded FORMS.md with %d characters", len(formsContent))
-
-	// Test GetSkillInfo
-	info, err := manager.GetSkillInfo(ctx, "pdf-processing")
-	if err != nil {
-		t.Fatalf("Failed to get skill info: %v", err)
-	}
-
-	t.Logf("Skill info: name=%s, files=%d", info.Name, len(info.Files))
 }
 
 func truncate(s string, maxLen int) string {

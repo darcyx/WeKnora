@@ -72,12 +72,6 @@ func (e *AgentEngine) resourceNavigationHasOneWiki(messages []chat.Message) bool
 	var wiki *retrievalAttempt
 	for i := range state.Attempts {
 		a := &state.Attempts[i]
-		if a.FAQOnly {
-			if a.Outcome != retrievalSuccess || len(a.Failures) > 0 {
-				return false
-			}
-			continue
-		}
 		if wiki != nil || a.QuestionID != state.questionID() || a.Tool != agenttools.ToolWikiReadPage || !a.Completed || a.Outcome != retrievalSuccess || len(a.Failures) > 0 {
 			return false
 		}

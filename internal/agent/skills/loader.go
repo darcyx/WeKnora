@@ -242,10 +242,9 @@ func (l *Loader) LoadSkillFile(skillName, relativePath string) (*SkillFile, erro
 	}
 
 	return &SkillFile{
-		Name:     relativePath,
-		Path:     absFilePath, // Use absolute path for sandbox execution
-		Content:  string(content),
-		IsScript: IsScript(relativePath),
+		Name:    relativePath,
+		Path:    absFilePath, // Use absolute path for sandbox execution
+		Content: string(content),
 	}, nil
 }
 

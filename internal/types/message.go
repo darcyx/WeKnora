@@ -658,7 +658,9 @@ func (a *AgentSteps) Scan(value interface{}) error {
 // Returns:
 //   - error: Any error encountered during the hook execution
 func (m *Message) BeforeCreate(tx *gorm.DB) (err error) {
-	m.ID = uuid.New().String()
+	if m.ID == "" {
+		m.ID = uuid.New().String()
+	}
 	if m.KnowledgeReferences == nil {
 		m.KnowledgeReferences = make(References, 0)
 	}
@@ -683,6 +685,9 @@ func (m *Message) BeforeCreate(tx *gorm.DB) (err error) {
 // MessageRunStateAwaitingInput marks an assistant message whose run ended
 // suspended on an agent prompt and will resume once the user answers.
 const MessageRunStateAwaitingInput = "awaiting_input"
+
+// MessageRunStateSteerRecoveryPending marks a completed turn whose accepted queue needs recovery.
+const MessageRunStateSteerRecoveryPending = "steer_recovery_pending"
 
 // MessageSearchMode represents the search mode for message search
 type MessageSearchMode string

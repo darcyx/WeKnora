@@ -80,7 +80,7 @@ func (e *AgentEngine) prepareRuntimeRetrieval(ctx context.Context, tc types.LLMT
 		if isBudgetedSearchTool(tc.Function.Name) {
 			action = retrievalSearch
 		}
-		if !previous.FAQOnly && previous.Tool == tc.Function.Name && previous.Outcome == retrievalInput {
+		if previous.Tool == tc.Function.Name && previous.Outcome == retrievalInput {
 			action, recoveryID = retrievalRecovery, previous.ID
 		}
 	}
@@ -94,8 +94,7 @@ func (e *AgentEngine) prepareRuntimeRetrieval(ctx context.Context, tc types.LLMT
 			action, recoveryID = retrievalRecovery, attempt.ID
 			break
 		}
-		// FAQ and document searches share a tool name. Only scoped stage failures above can replay FAQ work.
-		if attempt.FAQOnly || attempt.Arguments != string(encoded) {
+		if attempt.Arguments != string(encoded) {
 			continue
 		}
 		if attempt.Outcome != retrievalSuccess {

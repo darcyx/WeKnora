@@ -117,7 +117,10 @@ type qaRequestContext struct {
 	// is published as live, so leftover inject / after messages from the
 	// previous run are visible to this engine from round 1 and to any client
 	// that reloads the queue.
-	steerCarryOver []interfaces.StreamEvent
+	steerCarryOver     []interfaces.StreamEvent
+	steerSourceID      string
+	steerHandoffFailed bool
+	steerPrimaryID     string
 	// turnLeaseHeld records that executeQA already took the send-side turn
 	// lease for this request, so the QA service does not take a second one.
 	turnLeaseHeld bool
@@ -212,15 +215,6 @@ func marshalAppInfo(ext map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("marshal ext app info: %w", err)
 	}
 	return string(payload), nil
-}
-
-// redactAppInfo returns a copy of v without keys that name credentials.
-func redactAppInfo(v interface{}) interface{} {
-	return types.RedactAppInfo(v)
-}
-
-func isCredentialKey(key string) bool {
-	return types.IsCredentialKey(key)
 }
 
 // parseQARequest parses and validates a QA request, returns the request context
@@ -913,18 +907,26 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool, m
 		}
 	}
 
-	if !reqCtx.skipSSE {
-		setSSEHeaders(reqCtx.c)
-	}
-
-	h.writeAgentQueryEvent(
+	if err := h.writeAgentQueryEvent(
 		reqCtx.ctx,
 		reqCtx.sessionID,
 		reqCtx.userMessageID,
 		reqCtx.userCreatedAt,
 		reqCtx.assistantMessage,
 		reqCtx.resume,
-	)
+	); err != nil && reqCtx.resume == nil {
+		if streamCtx.steerSink != nil {
+			if clearErr := h.streamManager.ClearLiveRun(context.WithoutCancel(baseCtx), reqCtx.sessionID, reqCtx.assistantMessage.ID); clearErr != nil {
+				logger.Warnf(baseCtx, "Failed to clear live run after stream setup failure: %v", clearErr)
+			}
+		}
+		streamCtx.liveRunFailed = true
+		streamCtx.liveRunErr = err
+		return streamCtx
+	}
+	if !reqCtx.skipSSE {
+		setSSEHeaders(reqCtx.c)
+	}
 	if reqCtx.resume != nil {
 		h.writeRunResumedEvent(reqCtx.ctx, reqCtx.sessionID, reqCtx.assistantMessage.ID, reqCtx.resume.Prompt.ID)
 	}
@@ -1294,17 +1296,29 @@ func (h *Handler) persistTurnMessages(ctx context.Context, reqCtx *qaRequestCont
 				reqCtx.attachmentMetas...,
 			)
 		}
-		userMsg, err := h.createUserMessage(
-			ctx,
-			reqCtx.sessionID,
-			reqCtx.userInput,
-			reqCtx.requestID,
-			reqCtx.mentionedItems,
-			convertImageAttachments(reqCtx.images),
-			userMessageAttachments,
-			reqCtx.channel,
-			reqCtx.suggestionAttribution,
-		)
+		var userMsg *types.Message
+		var err error
+		if reqCtx.steerPrimaryID != "" {
+			userMsg, err = h.messageService.CreateMessage(ctx, &types.Message{ID: stableSteerMessageID(reqCtx.sessionID, reqCtx.steerPrimaryID), SessionID: reqCtx.sessionID, Role: "user", Content: reqCtx.userInput, RequestID: reqCtx.requestID, MentionedItems: reqCtx.mentionedItems, CreatedAt: time.Now(), IsCompleted: true, Channel: reqCtx.channel})
+		} else {
+			userMsg, err = h.createUserMessage(
+				ctx,
+				reqCtx.sessionID,
+				reqCtx.userInput,
+				reqCtx.requestID,
+				reqCtx.mentionedItems,
+				convertImageAttachments(reqCtx.images),
+				userMessageAttachments,
+				reqCtx.channel,
+				reqCtx.suggestionAttribution,
+			)
+		}
+		if err != nil && reqCtx.steerPrimaryID != "" {
+			existing, lookupErr := h.messageService.GetMessage(ctx, reqCtx.sessionID, stableSteerMessageID(reqCtx.sessionID, reqCtx.steerPrimaryID))
+			if lookupErr == nil && existing != nil && existing.Role == "user" && existing.Content == reqCtx.userInput && existing.RequestID == reqCtx.requestID {
+				userMsg, err = existing, nil
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -1338,7 +1352,14 @@ func (h *Handler) rollbackTurnMessages(ctx context.Context, reqCtx *qaRequestCon
 	if h.messageService == nil || reqCtx == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	sessionID := reqCtx.sessionID
+	// A steer primary can also have been acknowledged by another replica's
+	// recovery; keep that stable user row when rolling back this assistant.
+	if reqCtx.steerPrimaryID != "" {
+		user = false
+	}
 	if user && reqCtx.userMessageID != "" {
 		if err := h.messageService.DeleteMessage(ctx, sessionID, reqCtx.userMessageID); err != nil {
 			logger.Warnf(ctx, "turn rollback failed for user message %s: %v", reqCtx.userMessageID, err)
@@ -1368,6 +1389,13 @@ func (h *Handler) rejectIfOtherAgentRunLive(ctx context.Context, reqCtx *qaReque
 		self = reqCtx.assistantMessage.ID
 	}
 	if liveID == self {
+		return nil
+	}
+	current, err := h.liveAgentRun(ctx, reqCtx.sessionID)
+	if err != nil {
+		return errors.NewServiceUnavailableError("Failed to recover queued messages")
+	}
+	if current == "" {
 		return nil
 	}
 	return errors.NewConflictError("another turn is already running in this session")
@@ -1440,6 +1468,14 @@ func (h *Handler) holdQATurn(ctx context.Context, reqCtx *qaRequestContext) (con
 func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle bool) {
 	ctx := reqCtx.ctx
 	sessionID := reqCtx.sessionID
+	started := false
+	if reqCtx.skipSSE && reqCtx.resume == nil && reqCtx.steerSourceID != "" {
+		defer func() {
+			if !started {
+				h.closeFailedSteerFollowUp(ctx, reqCtx)
+			}
+		}()
+	}
 
 	// Persist the input-bar state used for this request so reopening the
 	// session can rehydrate agent / model / KB / web-search / MCP selections.
@@ -1468,12 +1504,6 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		}
 		return
 	}
-	// A new message moves on from any prompt still waiting for an answer.
-	// Its run is closed first so the history this turn loads is well formed.
-	if reqCtx.resume == nil {
-		h.supersedeSuspendedRuns(ctx, sessionID)
-	}
-
 	ctx, releaseQATurn, held := h.holdQATurn(ctx, reqCtx)
 	if !held {
 		return
@@ -1481,24 +1511,6 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	// setupSSEStream clones reqCtx.ctx. The turn's admission members have to
 	// be on that context or a detached tool call waits on its own hold.
 	reqCtx.ctx = ctx
-
-	// Agent mode: emit agent query event before message creation
-	if mode == qaModeAgent {
-		if err := event.Emit(ctx, event.Event{
-			Type:      event.EventAgentQuery,
-			SessionID: sessionID,
-			RequestID: reqCtx.requestID,
-			Data: event.AgentQueryData{
-				SessionID: sessionID,
-				Query:     reqCtx.query,
-				RequestID: reqCtx.requestID,
-			},
-		}); err != nil {
-			releaseQATurn()
-			logger.Errorf(ctx, "Failed to emit agent query event: %v", err)
-			return
-		}
-	}
 
 	createdUser := reqCtx.userMessageID == ""
 	createdAssistant := reqCtx.assistantMessage == nil || reqCtx.assistantMessage.ID == ""
@@ -1530,7 +1542,14 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			ctx, sessionID, reqCtx.assistantMessage.ID, reqCtx.steerCarryOver,
 		); err != nil {
 			logger.Warnf(ctx, "steer carry-over append failed for session %s: %v", sessionID, err)
+			if reqCtx.steerSourceID != "" && !h.preservePendingSteers(context.WithoutCancel(ctx), reqCtx, reqCtx.steerSourceID, reqCtx.steerCarryOver) {
+				releaseQATurn()
+				return
+			}
+		} else if reqCtx.steerSourceID != "" {
+			h.markSteerEventsConsumed(ctx, sessionID, reqCtx.steerSourceID, reqCtx.steerCarryOver)
 		}
+		reqCtx.steerCarryOver = nil
 	}
 
 	// Setup SSE stream
@@ -1540,8 +1559,19 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		if streamCtx.cancel != nil {
 			streamCtx.cancel()
 		}
-		releaseQATurn()
 		h.rollbackTurnMessages(ctx, reqCtx, createdUser, createdAssistant)
+		// A steer follow-up has already persisted and consumed its user input.
+		// Keep that input and close its pre-created assistant so history does
+		// not retain an indefinitely running turn.
+		if reqCtx.skipSSE && reqCtx.resume == nil && reqCtx.steerSourceID == "" && !createdAssistant && reqCtx.assistantMessage != nil && h.messageService != nil {
+			reqCtx.assistantMessage.Content = qaFailureContent
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			if err := h.completeAssistantMessage(cleanupCtx, reqCtx.assistantMessage, "", ""); err != nil {
+				logger.Warnf(ctx, "Failed to close steer follow-up after stream setup failure: %v", err)
+			}
+			cancel()
+		}
+		releaseQATurn()
 		if reqCtx.c != nil && !reqCtx.skipSSE {
 			if stderrors.Is(streamCtx.liveRunErr, stream.ErrLiveRunExists) {
 				_ = reqCtx.c.Error(errors.NewConflictError("another turn is already running in this session"))
@@ -1550,6 +1580,11 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			}
 		}
 		return
+	}
+
+	// The new turn is admitted and its stream is ready; settle prior history before loading it.
+	if reqCtx.resume == nil {
+		h.supersedeSuspendedRuns(ctx, sessionID)
 	}
 
 	// Normal mode: register completion handler on EventAgentFinalAnswer
@@ -1585,6 +1620,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	}
 
 	// Execute QA asynchronously
+	started = true
 	asyncDone := make(chan struct{})
 	go func() {
 		defer close(asyncDone)
@@ -1610,7 +1646,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			// Agent mode: complete the assistant message in defer (normal mode does it via event handler)
 			if mode == qaModeAgent {
 				if streamCtx.releaseTurn != nil {
-					streamCtx.releaseTurn()
+					defer streamCtx.releaseTurn()
 				}
 				if streamCtx.streamHandler != nil {
 					if suspension := streamCtx.streamHandler.Suspension(); suspension != nil && suspension.Detached {
@@ -1627,36 +1663,78 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 					types.TenantIDContextKey, reqCtx.session.TenantID,
 				)
 
+				retainMarker := false
 				// Claim any follow-up before completing this row. liveAgentRun
 				// treats a completed assistant as idle and would ClearLiveRun
 				// the old marker — exactly the new_run window. The follow-up
 				// SetLiveRun's first; this run's CAS ClearLiveRun then no-ops.
 				if streamCtx.asyncCtx.Err() != nil {
-					// The turn was cancelled — a user stop. Stopping means
-					// stopping: queued follow-ups are dropped rather than
-					// fired off as a brand-new run the user did not ask for.
 					injected := map[string]struct{}{}
 					if streamCtx.steerSink != nil {
 						injected = streamCtx.steerSink.InjectedIDs()
 					}
-					h.discardSteerBacklog(updateCtx, sessionID, streamCtx.assistantMessage.ID, injected)
+					if stderrors.Is(context.Cause(streamCtx.asyncCtx), admission.ErrLeaseLost) {
+						events, _, err := h.streamManager.GetSteerEvents(updateCtx, sessionID, streamCtx.assistantMessage.ID, 0)
+						if err != nil || !h.preservePendingSteers(updateCtx, reqCtx, streamCtx.assistantMessage.ID, selectSteerBacklog(events, injected)) {
+							logger.Warnf(updateCtx, "failed to preserve pending steer input for session %s", sessionID)
+							retainMarker = true
+						}
+					} else {
+						h.discardSteerBacklog(updateCtx, sessionID, streamCtx.assistantMessage.ID, injected)
+					}
+					if retainMarker {
+						streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
+					}
 					h.completeStreamAssistantMessage(updateCtx, streamCtx, "", "")
 				} else {
-					kicked := h.kickNextRunFromSteerBacklog(updateCtx, reqCtx, streamCtx)
-					h.completeStreamAssistantMessage(
-						updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID,
-					)
-					// A /steer that landed while we were completing still sits
-					// on this run. Claim it before ClearLiveRun so it is not
-					// stranded on a list nobody will drain.
-					if !kicked {
-						h.kickNextRunFromSteerBacklog(updateCtx, reqCtx, streamCtx)
+					followUp, claimed := h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
+					if !claimed {
+						followUp, claimed = h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
+					}
+					if !claimed {
+						events, _, err := h.streamManager.GetSteerEvents(updateCtx, sessionID, streamCtx.assistantMessage.ID, 0)
+						if err != nil || !h.preservePendingSteers(updateCtx, reqCtx, streamCtx.assistantMessage.ID, selectSteerBacklog(events, nil)) {
+							logger.Warnf(updateCtx, "failed to preserve pending steer input for session %s", sessionID)
+							retainMarker = true
+						}
+					}
+					if retainMarker || (claimed && followUp.steerHandoffFailed) {
+						streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
+					}
+					if !h.completeStreamAssistantMessage(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID) {
+						if claimed {
+							h.closeFailedSteerFollowUp(updateCtx, followUp)
+						}
+						return
+					}
+					if !claimed && !retainMarker {
+						followUp, claimed = h.claimNextSteerFollowUp(updateCtx, reqCtx, streamCtx)
+					}
+					if claimed && followUp.steerHandoffFailed {
+						retainMarker = true
+						claimed = false
+						if streamCtx.assistantMessage.RunState != types.MessageRunStateSteerRecoveryPending {
+							streamCtx.assistantMessage.RunState = types.MessageRunStateSteerRecoveryPending
+							if err := h.messageService.UpdateMessage(updateCtx, streamCtx.assistantMessage); err != nil {
+								logger.Warnf(updateCtx, "failed to mark steer recovery: %v", err)
+							}
+						}
+					}
+					if claimed && streamCtx.asyncCtx.Err() != nil {
+						h.closeFailedSteerFollowUp(updateCtx, followUp)
+						claimed = false
+					}
+					if claimed {
+						if streamCtx.releaseTurn != nil {
+							streamCtx.releaseTurn()
+						}
+						go h.executeQA(followUp, qaModeAgent, false)
 					}
 				}
-				if err := h.streamManager.ClearLiveRun(
-					updateCtx, sessionID, streamCtx.assistantMessage.ID,
-				); err != nil {
-					logger.Warnf(updateCtx, "live run cleanup failed for session %s: %v", sessionID, err)
+				if !retainMarker {
+					if err := h.streamManager.ClearLiveRun(updateCtx, sessionID, streamCtx.assistantMessage.ID); err != nil {
+						logger.Warnf(updateCtx, "live run cleanup failed for session %s: %v", sessionID, err)
+					}
 				}
 				logger.Infof(streamCtx.asyncCtx, "Agent QA service completed for session: %s", sessionID)
 			}
@@ -2294,10 +2372,10 @@ func (h *Handler) sessionTenantInfoContext(ctx context.Context) (context.Context
 // a successful completion whose file authorization evidence is still missing.
 func (h *Handler) completeStreamAssistantMessage(
 	ctx context.Context, streamCtx *sseStreamContext, query, userMessageID string,
-) {
+) bool {
 	if streamCtx.streamHandler != nil {
 		if suspension := streamCtx.streamHandler.Suspension(); suspension != nil && suspension.Detached {
-			return
+			return false
 		}
 	}
 	if streamCtx.streamHandler != nil && streamCtx.streamHandler.executionError != nil {
@@ -2321,13 +2399,14 @@ func (h *Handler) completeStreamAssistantMessage(
 				Data: event.ErrorData{Stage: "message_persistence", Error: "Failed to save assistant message"},
 			})
 		}
-		return
+		return false
 	}
 	if streamCtx.streamHandler != nil {
 		if err := streamCtx.streamHandler.publishCompletion(ctx); err != nil {
 			logger.Errorf(ctx, "Append persisted message completion failed: %v", err)
 		}
 	}
+	return true
 }
 
 // completeAssistantMessage marks an assistant message as complete, updates it,

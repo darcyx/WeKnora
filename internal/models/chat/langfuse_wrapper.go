@@ -31,7 +31,7 @@ func (l *langfuseChat) Chat(ctx context.Context, messages []Message, opts *ChatO
 	genCtx, gen := mgr.StartGeneration(ctx, langfuse.GenerationOptions{
 		Name:            "chat.completion",
 		Model:           l.inner.GetModelName(),
-		Input:           buildLangfuseMessages(messages),
+		Input:           types.SanitizeObservationValue(ctx, buildLangfuseMessages(messages)),
 		ModelParameters: buildLangfuseModelParams(opts),
 		Metadata:        buildLangfuseChatMetadata(l.inner.GetModelID(), purpose, prefixFingerprint, false, opts),
 	})
@@ -46,7 +46,7 @@ func (l *langfuseChat) Chat(ctx context.Context, messages []Message, opts *ChatO
 			resp.Content, resp.ReasoningContent, resp.FinishReason, resp.ToolCalls,
 		)
 	}
-	gen.Finish(output, usage, err)
+	gen.Finish(types.SanitizeObservationValue(ctx, output), usage, sanitizeObservationError(ctx, err))
 	return resp, err
 }
 
@@ -60,14 +60,14 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 	genCtx, gen := mgr.StartGeneration(ctx, langfuse.GenerationOptions{
 		Name:            "chat.completion.stream",
 		Model:           l.inner.GetModelName(),
-		Input:           buildLangfuseMessages(messages),
+		Input:           types.SanitizeObservationValue(ctx, buildLangfuseMessages(messages)),
 		ModelParameters: buildLangfuseModelParams(opts),
 		Metadata:        buildLangfuseChatMetadata(l.inner.GetModelID(), purpose, prefixFingerprint, true, opts),
 	})
 
 	ch, err := l.inner.ChatStream(genCtx, messages, opts)
 	if err != nil {
-		gen.Finish(nil, nil, err)
+		gen.Finish(nil, nil, sanitizeObservationError(ctx, err))
 		return ch, err
 	}
 	if ch == nil {
@@ -123,7 +123,7 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 		output := buildLangfuseGenerationOutput(
 			string(contentBuf), string(reasoningBuf), finishReason, toolCalls,
 		)
-		gen.Finish(output, convertUsage(usage), streamErr)
+		gen.Finish(types.SanitizeObservationValue(ctx, output), convertUsage(usage), sanitizeObservationError(ctx, streamErr))
 	}()
 	return wrapped, nil
 }
@@ -181,10 +181,14 @@ func buildLangfuseMessages(messages []Message) []map[string]interface{} {
 			"role": m.Role,
 		}
 		if m.Content != "" {
-			entry["content"] = m.Content
+			entry["content"] = types.SanitizeAppInfoInText(m.Content)
 		}
 		if len(m.MultiContent) > 0 {
-			entry["content"] = m.MultiContent
+			parts := append([]MessageContentPart(nil), m.MultiContent...)
+			for i := range parts {
+				parts[i].Text = types.SanitizeAppInfoInText(parts[i].Text)
+			}
+			entry["content"] = parts
 		}
 		if len(m.Images) > 0 {
 			images := make([]string, len(m.Images))
@@ -301,4 +305,11 @@ func wrapChatLangfuse(c Chat, err error) (Chat, error) {
 		return c, nil
 	}
 	return &langfuseChat{inner: c}, nil
+}
+
+func sanitizeObservationError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", types.SanitizeObservationText(ctx, err.Error()))
 }

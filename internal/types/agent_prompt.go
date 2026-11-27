@@ -217,8 +217,10 @@ type ToolApprovalPromptRequest struct {
 	// GrantRisk is the risk Grant would be given for, and GrantLabel its
 	// description, whether or not the card offers it: an automation's owner
 	// may later allow the same call for its future runs.
-	GrantRisk  string `json:"grant_risk,omitempty"`
-	GrantLabel string `json:"grant_label,omitempty"`
+	GrantRisk      string `json:"grant_risk,omitempty"`
+	GrantLabel     string `json:"grant_label,omitempty"`
+	ApprovedRisk   string `json:"approved_risk,omitempty"`
+	ApprovedAlways *bool  `json:"approved_always,omitempty"`
 }
 
 // ToolApprovalPromptResponse is the Response of an AgentPromptKindToolApproval.

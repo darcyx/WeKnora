@@ -155,7 +155,6 @@ type PinnedMCPServiceInfo struct {
 	ID           string
 	Name         string
 	Description  string
-	ToolNames    []string // Registered tool.function names for this service (mcp_{service}_{tool})
 }
 
 // PinnedSkillInfo describes a skill explicitly @mentioned for this turn.
@@ -183,30 +182,6 @@ type KnowledgeBaseInfo struct {
 	// Description: that one says what the KB is for, this one says what is
 	// actually in it. nil when never generated.
 	Profile *types.KnowledgeBaseProfile
-}
-
-// PlaceholderDefinition defines a placeholder exposed to UI/configuration
-// Deprecated: Use types.PromptPlaceholder instead
-type PlaceholderDefinition struct {
-	Name        string `json:"name"`
-	Label       string `json:"label"`
-	Description string `json:"description"`
-}
-
-// AvailablePlaceholders lists all supported prompt placeholders for UI hints
-// This returns agent mode specific placeholders
-func AvailablePlaceholders() []PlaceholderDefinition {
-	// Use centralized placeholder definitions from types package
-	placeholders := types.PlaceholdersByField(types.PromptFieldAgentSystemPrompt)
-	result := make([]PlaceholderDefinition, len(placeholders))
-	for i, p := range placeholders {
-		result[i] = PlaceholderDefinition{
-			Name:        p.Name,
-			Label:       p.Label,
-			Description: p.Description,
-		}
-	}
-	return result
 }
 
 // promptProfileMaxQuestions caps the typical questions rendered per KB. The
@@ -353,16 +328,6 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabl
 		}
 	}
 	return b.String()
-}
-
-// formatToolGuidance uses the actual registry, so disabled capabilities never
-// leak into the runtime instructions. Mechanics and limits live in tool schemas.
-func formatToolGuidance(names []string) string {
-	return formatToolGuidanceForMode(names, false, sandbox.WorkspaceLayout{})
-}
-
-func formatToolGuidanceForMode(names []string, skillInstallMode bool, layout sandbox.WorkspaceLayout) string {
-	return formatToolGuidanceWithDesktop(names, skillInstallMode, layout, false)
 }
 
 // sandboxDesktopGuidance describes the graphical desktop of a sandbox whose
@@ -569,27 +534,6 @@ type BuildSystemPromptOptions struct {
 	WorkspaceLayout  sandbox.WorkspaceLayout
 	// DesktopEnabled mirrors the sandbox configuration's desktop switch.
 	DesktopEnabled bool
-}
-
-// BuildSystemPrompt builds the progressive RAG system prompt
-// This is the main function to use - it uses a unified template with dynamic web search status
-func BuildSystemPrompt(
-	knowledgeBases []*KnowledgeBaseInfo,
-	webSearchEnabled bool,
-	systemPromptTemplate ...string,
-) string {
-	return BuildSystemPromptWithOptions(knowledgeBases, webSearchEnabled, nil, systemPromptTemplate...)
-}
-
-// BuildSystemPromptWithOptions builds the system prompt with additional options like skills
-func BuildSystemPromptWithOptions(
-	knowledgeBases []*KnowledgeBaseInfo,
-	webSearchEnabled bool,
-	options *BuildSystemPromptOptions,
-	systemPromptTemplate ...string,
-) string {
-	sections := BuildSystemPromptSections(knowledgeBases, webSearchEnabled, options, systemPromptTemplate...)
-	return renderSystemPromptSections(sections)
 }
 
 func renderSystemPromptSections(sections []SystemPromptSection) string {

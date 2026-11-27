@@ -167,6 +167,19 @@ func finishToolSpan(span *langfuse.Span, tc types.ToolCall, execErr error, durat
 	}, spanErr)
 }
 
+func finishToolSpanSanitized(ctx context.Context, span *langfuse.Span, tc types.ToolCall, err error, duration int64) {
+	if tc.Result != nil {
+		copyResult := *tc.Result
+		copyResult.Output = types.SanitizeObservationText(ctx, copyResult.Output)
+		copyResult.Error = types.SanitizeObservationText(ctx, copyResult.Error)
+		tc.Result = &copyResult
+	}
+	if err != nil {
+		err = errors.New(types.SanitizeObservationText(ctx, err.Error()))
+	}
+	finishToolSpan(span, tc, err, duration)
+}
+
 // dataKeys returns the sorted top-level keys of a tool's Data map.
 func dataKeys(data map[string]interface{}) []string {
 	keys := make([]string, 0, len(data))
@@ -179,36 +192,29 @@ func dataKeys(data map[string]interface{}) []string {
 
 // toolDisplayNames maps internal tool names to user-friendly display labels.
 var toolDisplayNames = map[string]string{
-	agenttools.ToolDiscoverMCPTools:          "查看外部工具",
-	agenttools.ToolCallMCPTool:               "调用外部工具",
-	agenttools.ToolThinking:                  "深度思考",
-	agenttools.ToolTodoWrite:                 "制定计划",
-	agenttools.ToolSearchKnowledge:           "检索知识库",
-	agenttools.ToolReadDocument:              "阅读文档",
-	agenttools.ToolListDocuments:             "浏览文档列表",
-	agenttools.ToolQueryKnowledgeGraph:       "查询知识图谱",
-	agenttools.LegacyToolGrepChunks:          "关键词搜索",
-	agenttools.LegacyToolKnowledgeSearch:     "知识搜索",
-	agenttools.LegacyToolListKnowledgeChunks: "查看文档分块",
-	agenttools.LegacyToolGetDocumentInfo:     "获取文档信息",
-	agenttools.ToolSearchConversations:       "回顾历史对话",
-	agenttools.ToolAskUser:                   "向用户提问",
-	agenttools.ToolRequestSecureForm:         "请求登录凭据",
-	agenttools.ToolBrowserFillSecret:         "填写登录凭据",
-	agenttools.ToolSearchMemory:              "查询长期记忆",
-	agenttools.ToolDatabaseQuery:             "查询数据",
-	agenttools.ToolDataAnalysis:              "数据分析",
-	agenttools.ToolDataSchema:                "查看数据结构",
-	agenttools.ToolWebSearch:                 "搜索网页",
-	agenttools.ToolWebFetch:                  "获取网页",
-	agenttools.LegacyToolExecuteSkillScript:  "执行技能脚本",
-	agenttools.LegacyToolReadSkill:           "读取技能",
-	agenttools.ToolReadFile:                  "读取文件",
-	agenttools.ToolListSandboxFiles:          "列出沙箱文件",
-	agenttools.LegacyToolReadSandboxFile:     "读取沙箱文件",
-	agenttools.ToolWriteSandboxFile:          "写入沙箱文件",
-	agenttools.ToolEditSandboxFile:           "编辑沙箱文件",
-	agenttools.ToolShellExec:                 "执行沙箱命令",
+	agenttools.ToolDiscoverMCPTools:    "查看外部工具",
+	agenttools.ToolCallMCPTool:         "调用外部工具",
+	agenttools.ToolThinking:            "深度思考",
+	agenttools.ToolTodoWrite:           "制定计划",
+	agenttools.ToolSearchKnowledge:     "检索知识库",
+	agenttools.ToolReadDocument:        "阅读文档",
+	agenttools.ToolListDocuments:       "浏览文档列表",
+	agenttools.ToolQueryKnowledgeGraph: "查询知识图谱",
+	agenttools.ToolSearchConversations: "回顾历史对话",
+	agenttools.ToolAskUser:             "向用户提问",
+	agenttools.ToolRequestSecureForm:   "请求登录凭据",
+	agenttools.ToolBrowserFillSecret:   "填写登录凭据",
+	agenttools.ToolSearchMemory:        "查询长期记忆",
+	agenttools.ToolDatabaseQuery:       "查询数据",
+	agenttools.ToolDataAnalysis:        "数据分析",
+	agenttools.ToolDataSchema:          "查看数据结构",
+	agenttools.ToolWebSearch:           "搜索网页",
+	agenttools.ToolWebFetch:            "获取网页",
+	agenttools.ToolReadFile:            "读取文件",
+	agenttools.ToolListSandboxFiles:    "列出沙箱文件",
+	agenttools.ToolWriteSandboxFile:    "写入沙箱文件",
+	agenttools.ToolEditSandboxFile:     "编辑沙箱文件",
+	agenttools.ToolShellExec:           "执行沙箱命令",
 }
 
 // toolHintSensitiveArgs lists tools whose arguments should NOT be shown in hints
@@ -619,7 +625,7 @@ func (e *AgentEngine) runToolCallAnswered(
 	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
 		repaired, truncated := agenttools.RepairJSONDetail(argsStr)
 		if repairErr := json.Unmarshal([]byte(repaired), &args); repairErr != nil {
-			logger.Errorf(ctx, "%s Failed to parse arguments (repair failed): %v", toolTag, err)
+			logger.Errorf(ctx, "%s Failed to parse arguments (repair failed): %s", toolTag, types.SanitizeObservationText(ctx, err.Error()))
 			return types.ToolCall{
 				ID:               tc.ID,
 				Name:             tc.Function.Name,
@@ -721,7 +727,7 @@ func (e *AgentEngine) runToolCallAnswered(
 		executionName, executionArgs = target.Name, target.Args
 	}
 
-	logger.Debugf(ctx, "%s Args: %s", toolTag, tc.Function.Arguments)
+	logger.Debugf(ctx, "%s Args: %s", toolTag, types.SanitizeObservationText(ctx, tc.Function.Arguments))
 
 	toolCallStartTime := time.Now()
 
@@ -765,7 +771,7 @@ func (e *AgentEngine) runToolCallAnswered(
 	argumentResolution, _ := toolSpanInput["argument_resolution"].(string)
 	toolCtx, toolSpan := mgr.StartSpan(ctx, langfuse.SpanOptions{
 		Name:  "agent.tool." + executionName,
-		Input: toolSpanInput,
+		Input: types.SanitizeObservationValue(ctx, toolSpanInput),
 		Metadata: map[string]interface{}{
 			"iteration":               iteration,
 			"round":                   round,
@@ -858,7 +864,7 @@ func (e *AgentEngine) runToolCallAnswered(
 	}
 
 	if err != nil {
-		logger.Errorf(ctx, "%s Failed in %dms: %v", toolTag, duration, err)
+		logger.Errorf(ctx, "%s Failed in %dms: %s", toolTag, duration, types.SanitizeObservationText(ctx, err.Error()))
 		if toolCall.Result == nil {
 			toolCall.Result = &types.ToolResult{}
 		}
@@ -886,7 +892,7 @@ func (e *AgentEngine) runToolCallAnswered(
 			logger.Errorf(ctx, "%s Cannot record retrieval outcome: %v", toolTag, observeErr)
 		}
 	}
-	finishToolSpan(toolSpan, toolCall, err, duration)
+	finishToolSpanSanitized(ctx, toolSpan, toolCall, err, duration)
 
 	// Pipeline event for monitoring
 	toolSuccess := toolCall.Result != nil && toolCall.Result.Success
@@ -899,7 +905,7 @@ func (e *AgentEngine) runToolCallAnswered(
 		"success":      toolSuccess,
 	}
 	if toolCall.Result != nil && toolCall.Result.Error != "" {
-		pipelineFields["error"] = toolCall.Result.Error
+		pipelineFields["error"] = types.SanitizeObservationText(ctx, toolCall.Result.Error)
 	}
 	if err != nil {
 		common.PipelineError(ctx, "Agent", "tool_call_result", pipelineFields)
@@ -910,11 +916,11 @@ func (e *AgentEngine) runToolCallAnswered(
 	}
 
 	if toolCall.Result != nil && toolCall.Result.Output != "" {
-		preview := toolOutputPreview(toolCall.Result.Output)
+		preview := toolOutputPreview(types.SanitizeObservationText(ctx, toolCall.Result.Output))
 		logger.Debugf(ctx, "%s Output preview:\n%s", toolTag, preview)
 	}
 	if toolCall.Result != nil && toolCall.Result.Error != "" {
-		logger.Debugf(ctx, "%s Tool error: %s", toolTag, toolCall.Result.Error)
+		logger.Debugf(ctx, "%s Tool error: %s", toolTag, types.SanitizeObservationText(ctx, toolCall.Result.Error))
 	}
 
 	return toolCall

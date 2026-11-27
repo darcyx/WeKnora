@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -259,6 +260,14 @@ func (preflightMessages) UpdateMessageRetrievalState(context.Context, string, st
 	return nil
 }
 
+func tryAgentFAQForTest(ctx context.Context, s *sessionService, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (bool, error) {
+	evaluation, err := s.preflightAgentFAQ(ctx, req, cfg, bus, model, reranker, history)
+	if err != nil {
+		return false, err
+	}
+	return emitAgentFAQEvaluation(ctx, req, bus, evaluation)
+}
+
 func TestFAQFallsThroughForCurrentProjectState(t *testing.T) {
 	const query = "账密注册的功能开关状态"
 	selection := strings.Replace(preflightSelection, "支付", query, 1)
@@ -279,7 +288,7 @@ func TestFAQFallsThroughForCurrentProjectState(t *testing.T) {
 			require.Contains(t, messages[1].Content, "仅注册")
 			return &types.ChatResponse{Content: decision}, nil
 		}}
-		answered, err := s.tryAgentFAQ(t.Context(), req, cfg, event.NewEventBus(), model, nil, nil)
+		answered, err := tryAgentFAQForTest(t.Context(), s, req, cfg, event.NewEventBus(), model, nil, nil)
 		require.NoError(t, err)
 		require.False(t, answered, decision)
 
@@ -319,7 +328,7 @@ func TestFAQFollowupSearchReadsCurrentExactEntry(t *testing.T) {
 	kbs.rows[0].ChunkMetadata = entry.Metadata
 	req.Query = "手游 pay 可以用内网域名吗？不传回调参数会用哪个地址？"
 	model := &graphReplyChat{resp: &types.ChatResponse{Content: `{"decision":"insufficient"}`}}
-	answered, err := s.tryAgentFAQ(t.Context(), req, cfg, event.NewEventBus(), model, &scoredReranker{scores: []float64{0.9}}, nil)
+	answered, err := tryAgentFAQForTest(t.Context(), s, req, cfg, event.NewEventBus(), model, &scoredReranker{scores: []float64{0.9}}, nil)
 	require.NoError(t, err)
 	require.False(t, answered)
 	require.Equal(t, []string{title}, cfg.FAQPreflightQuestions)
@@ -352,7 +361,7 @@ func TestFAQPreflightDoesNotBypassPinnedSkills(t *testing.T) {
 	repo.exact = func(context.Context, string) ([]*types.Chunk, error) { return []*types.Chunk{repo.chunk}, nil }
 	bus := event.NewEventBus()
 	model := graphReplyChat{resp: &types.ChatResponse{Content: preflightSelection}}
-	answered, err := s.tryAgentFAQ(t.Context(), req, cfg, bus, model, nil, nil)
+	answered, err := tryAgentFAQForTest(t.Context(), s, req, cfg, bus, model, nil, nil)
 	require.NoError(t, err)
 	require.False(t, answered, "an exact FAQ must not skip the user's authorized @skill")
 	require.Nil(t, s.steerFAQ(req, cfg, bus, model, nil, nil))
@@ -537,12 +546,12 @@ func TestFAQPreflightBudgetAndParentCancellation(t *testing.T) {
 		// A sub-call timeout must not turn into parent cancellation.
 		return nil, context.DeadlineExceeded
 	}}
-	answered, err := s.tryAgentFAQ(t.Context(), req, cfg, event.NewEventBus(), model, nil, nil)
+	answered, err := tryAgentFAQForTest(t.Context(), s, req, cfg, event.NewEventBus(), model, nil, nil)
 	require.NoError(t, err, "preflight timeout must leave the parent request usable")
 	require.False(t, answered)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = s.tryAgentFAQ(ctx, req, cfg, event.NewEventBus(), model, nil, nil)
+	_, err = tryAgentFAQForTest(ctx, s, req, cfg, event.NewEventBus(), model, nil, nil)
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -558,7 +567,7 @@ func TestFAQPreflightDiscardsAnswerWhenBudgetContextExpires(t *testing.T) {
 	defer cancel()
 	evaluation := s.evaluateAgentFAQ(ctx, req, cfg, model, nil, nil)
 	require.Nil(t, evaluation.Match)
-	require.True(t, errors.Is(evaluation.Observations[len(evaluation.Observations)-1].Err, context.DeadlineExceeded))
+	require.Equal(t, "err_timeout", evaluation.Outcome)
 }
 
 func TestFAQPreflightSharesBudgetAcrossStagesAndSteer(t *testing.T) {
@@ -873,6 +882,54 @@ func TestFAQAnswerQuoteGrounded(t *testing.T) {
 	require.False(t, faqAnswerQuoteGrounded(answer, "首先确认...不存在的内容"))
 	require.False(t, faqAnswerQuoteGrounded(answer, "..."))
 	require.False(t, faqAnswerQuoteGrounded(answer, "一...二"))
+
+	list := "第一步。\n2. 第二步。\n3. 第三步。\n最后一段。"
+	require.True(t, faqAnswerQuoteGrounded(list, "第一步。2. 第二步。\n3. 第三步。"))
+	require.True(t, faqAnswerQuoteGrounded(strings.ReplaceAll(list, "\n", "\r\n"), "第一步。2. 第二步。\n3. 第三步。"))
+	require.True(t, faqAnswerQuoteGrounded(list, "第一步。2. 第二步。...第三步。"))
+	require.False(t, faqAnswerQuoteGrounded(list, "第一步。2. 错误步骤。"))
+	require.False(t, faqAnswerQuoteGrounded(list, "第三步。...第一步。2. 第二步。"))
+	require.False(t, faqAnswerQuoteGrounded(list, "第三步。最后一段。"))
+	require.False(t, faqAnswerQuoteGrounded(list, "第一步。2.第二步。"))
+}
+
+func TestFAQPreflightAcceptsNumberedListQuoteFromTrace(t *testing.T) {
+	const question = "怎么添加支付白名单"
+	const title = "支付白名单适用于哪些情况，如何设置？"
+	const answer = "**适用情况：** 支付白名单主要用于微信小游戏沙盒环境、Google Play、iOS 等受限测试场景，使指定测试账号能够在正式开放前验证支付流程。是否需要白名单以及配置入口由支付渠道决定，不是所有渠道通用。\n\n**如何设置：** \n1. 平台服务中心进入 **游戏控制台 → 游戏接入 → 支付配置**，点击「**支付白名单**」Tab。\n2. **新建白名单**：点击右上角「**新建白名单**」，右侧抽屉打开新建表单。\n3. 选择「**白名单范围**」：单选具体支付渠道\n4. 填写「**白名单账号**」：手动输入每行一个账号\n5. 在「**添加原因**」填写添加说明。\n6. 设置「**有效期**」：选择 1天 / 3天 / 30天 / 1年，或在截止日期中手动指定\n7. 点击「**确认新建**」提交"
+	const selection = `{"matched_facts":["怎么添加支付白名单"],"unanswered_parts_of_original_request":[],"requires_steps":true,"answer_kind":"steps","selected_id":"1","standalone_unconditional":true,"decision":"direct_answer"}`
+	const review = `{"reason":"FAQ provides complete step-by-step instructions for adding payment whitelist, matching user request.","coverage":[{"request_quote":"怎么添加支付白名单","answer_quote":"1. 平台服务中心进入 **游戏控制台 → 游戏接入 → 支付配置**，点击「**支付白名单**」Tab。2. **新建白名单**：点击右上角「**新建白名单**」，右侧抽屉打开新建表单。"}],"preconditions":[],"supported":true}`
+	s, req, cfg, repo := preflightFixture(t)
+	req.Query = question
+	metadata, err := json.Marshal(types.FAQChunkMetadata{StandardQuestion: title, Answers: []string{answer}})
+	require.NoError(t, err)
+	repo.chunk.ID = "73e125a2-c5cf-4fc8-98d4-568a047c2d5f"
+	repo.chunk.Content, repo.chunk.Metadata = title, metadata
+	row := s.knowledgeBaseService.(*preflightKBs).rows[0]
+	row.ID, row.Content, row.ChunkMetadata = repo.chunk.ID, title, metadata
+	model := preflightChat{
+		call: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: selection, FinishReason: "stop"}, nil
+		},
+		review: func(context.Context, []chat.Message) (*types.ChatResponse, error) {
+			return &types.ChatResponse{Content: review, FinishReason: "stop"}, nil
+		},
+	}
+	bus := event.NewEventBus()
+	var published string
+	bus.On(event.EventAgentFinalAnswer, func(_ context.Context, e event.Event) error {
+		published = e.Data.(event.AgentFinalAnswerData).Content
+		return nil
+	})
+	evaluation, err := s.preflightAgentFAQ(t.Context(), req, cfg, bus, model, &scoredReranker{scores: []float64{0.7940729585472857}}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "hit_reviewed", evaluation.Outcome)
+	require.Equal(t, repo.chunk.ID, evaluation.Match.Result.ID)
+	require.Equal(t, answer, evaluation.Answer)
+	ok, err := emitAgentFAQEvaluation(t.Context(), req, bus, evaluation)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, answer, published)
 }
 
 type faqModelLookupStub struct {
@@ -1195,4 +1252,10 @@ func TestFAQCoverageDoesNotEnableBroadSearchForOversizedHistory(t *testing.T) {
 	s.evaluateAgentFAQCoverage(t.Context(), req, req.Query, cfg, model, &scoredReranker{scores: []float64{0.99}}, history, nil, false, evaluation)
 	require.Equal(t, "miss_insufficient", evaluation.Outcome)
 	require.False(t, evaluation.BroadDocumentSearch)
+}
+
+func TestResumableAgentRequestPreservesOnlyAppToken(t *testing.T) {
+	req := &types.QARequest{AppInfo: `{"token":"synthetic-token","secret":"hidden","nested":{"token":"hidden"}}`}
+	saved := resumableAgentRequest(t.Context(), req)
+	require.JSONEq(t, `{"token":"synthetic-token","nested":{}}`, saved.AppInfo)
 }

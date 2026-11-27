@@ -38,7 +38,7 @@ func TestMCPProxyPreservesNumericArgumentsOnWire(t *testing.T) {
 		"id":{"type":"integer"},"amount":{"type":"number"},
 		"nested":{"type":"object","properties":{"ids":{"type":"array","items":{"type":"integer"}}}}
 	}}`
-	for _, mode := range []string{"original", "edited_approval", "resumed_approval"} {
+	for _, mode := range []string{"original", "edited_approval", "resumed_approval", "legacy_approval", "risk_escalated", "always_escalated"} {
 		t.Run(mode, func(t *testing.T) {
 			server := sdkserver.NewMCPServer("precision", "1", sdkserver.WithToolCapabilities(false))
 			server.AddTool(sdkmcp.Tool{Name: "store_record", RawInputSchema: json.RawMessage(schema)},
@@ -91,14 +91,29 @@ func TestMCPProxyPreservesNumericArgumentsOnWire(t *testing.T) {
 			require.NoError(t, err)
 			tool := describeTool(ctx, t, registry, service.ID, "store_record")
 			meta := &ToolExecContext{EventBus: event.NewEventBus(), ToolCallID: "store-record", ApprovalCtx: ctx}
-			if mode == "resumed_approval" {
-				meta.Answered = &types.AgentPrompt{ID: "approved", Kind: types.AgentPromptKindToolApproval}
+			if mode == "resumed_approval" || mode == "legacy_approval" || mode == "risk_escalated" || mode == "always_escalated" {
+				request := `{"service_id":"precision","mcp_tool_name":"store_record","approved_risk":"write","approved_always":true}`
+				if mode == "legacy_approval" {
+					request = `{"service_id":"precision","mcp_tool_name":"store_record"}`
+				}
+				if mode == "risk_escalated" {
+					request = `{"service_id":"precision","mcp_tool_name":"store_record","approved_risk":"read","approved_always":true}`
+				}
+				if mode == "always_escalated" {
+					request = `{"service_id":"precision","mcp_tool_name":"store_record","approved_risk":"write","approved_always":false}`
+				}
+				meta.Answered = &types.AgentPrompt{ID: "approved", Kind: types.AgentPromptKindToolApproval, Request: types.JSON(request)}
 			}
 			ctx = WithToolExecContext(ctx, meta)
 			args, err := json.Marshal(map[string]any{"tool_ref": tool.ToolRef, "arguments": input})
 			require.NoError(t, err)
 			result, err := registry.ExecuteTool(ctx, ToolCallMCPTool, args)
 			require.NoError(t, err)
+			if mode == "legacy_approval" || mode == "risk_escalated" || mode == "always_escalated" {
+				require.False(t, result.Success)
+				require.Empty(t, captured)
+				return
+			}
 			require.True(t, result.Success, result.Error)
 			require.Len(t, captured, 1)
 			// Inspect the actual HTTP payload before the server SDK decodes numbers.

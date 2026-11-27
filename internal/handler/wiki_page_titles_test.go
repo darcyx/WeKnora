@@ -268,3 +268,30 @@ func TestGetPageBacklinkTitlesThroughRepository(t *testing.T) {
 	assert.NotContains(t, body.InLinkTitles, "deleted")
 	assert.NotContains(t, body.InLinkTitles, "missing")
 }
+
+func TestUpdatePageWithLegacyCitationUsesRawSnapshot(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.KnowledgeBase{}, &types.WikiPage{}, &types.WikiPageRevision{}, &types.WikiFolder{}))
+	require.NoError(t, db.Create(&types.KnowledgeBase{ID: "kb-1", TenantID: 42}).Error)
+	wiki := service.NewWikiPageService(repository.NewWikiPageRepository(db), nil, nil, nil, nil, nil)
+	created, err := wiki.CreatePage(context.Background(), &types.WikiPage{TenantID: 42, KnowledgeBaseID: "kb-1", Slug: "concept/a", Title: "Old", Content: "body"})
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", created.ID).Update("content", "body [c003]").Error)
+	h := &WikiPageHandler{wikiService: wiki, kbService: fakeWikiPageTitlesKBService{}}
+	r := gin.New()
+	r.PUT("/knowledgebase/:kb_id/wiki/pages/*slug", func(c *gin.Context) { c.Set(types.TenantIDContextKey.String(), uint64(42)); h.UpdatePage(c) })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/knowledgebase/kb-1/wiki/pages/concept/a", strings.NewReader(`{"title":"New"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "[c003]")
+}
+
+func TestWikiFolderErrorMapsPageConflictToHTTP409(t *testing.T) {
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	writeWikiFolderError(c, fmt.Errorf("move page: %w", repository.ErrWikiPageConflict))
+	require.Equal(t, http.StatusConflict, rec.Code)
+}

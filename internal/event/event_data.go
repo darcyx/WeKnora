@@ -130,14 +130,6 @@ type AgentActionData struct {
 	Duration   int64                  `json:"duration_ms"`
 }
 
-// AgentQueryData represents agent query event data
-type AgentQueryData struct {
-	SessionID string                 `json:"session_id"`
-	Query     string                 `json:"query"`
-	RequestID string                 `json:"request_id,omitempty"`
-	Extra     map[string]interface{} `json:"extra,omitempty"`
-}
-
 // AgentCompleteData represents agent completion event data
 type AgentCompleteData struct {
 	// Artifacts contains runtime-delivered child files (types.MessageArtifacts).

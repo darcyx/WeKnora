@@ -425,7 +425,7 @@ func (s *WikiLintService) AutoFix(ctx context.Context, kbID string) (int, error)
 			if issue.TargetSlug == "" {
 				continue
 			}
-			page, err := s.wikiService.GetPageBySlug(ctx, kbID, issue.PageSlug)
+			page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, issue.PageSlug)
 			if err != nil {
 				continue
 			}
@@ -442,14 +442,15 @@ func (s *WikiLintService) AutoFix(ctx context.Context, kbID string) (int, error)
 			if !changed {
 				continue
 			}
+			writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 			page.Content = updated
-			if err := s.wikiService.UpdateAutoLinkedContent(ctx, page); err == nil {
+			if err := s.wikiService.UpdateAutoLinkedContent(writeCtx, page); err == nil {
 				fixed++
 			}
 
 		case LintIssueEmptyContent:
 			// Archive pages with very little content instead of deleting
-			page, err := s.wikiService.GetPageBySlug(ctx, kbID, issue.PageSlug)
+			page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, issue.PageSlug)
 			if err != nil {
 				continue
 			}
@@ -457,8 +458,9 @@ func (s *WikiLintService) AutoFix(ctx context.Context, kbID string) (int, error)
 			if page.PageType == types.WikiPageTypeIndex {
 				continue
 			}
+			writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 			page.Status = types.WikiPageStatusArchived
-			if _, err := s.wikiService.UpdatePage(ctx, page); err == nil {
+			if _, err := s.wikiService.UpdatePage(writeCtx, page); err == nil {
 				fixed++
 			}
 
@@ -471,7 +473,7 @@ func (s *WikiLintService) AutoFix(ctx context.Context, kbID string) (int, error)
 			if issue.TargetSlug == "" {
 				continue
 			}
-			page, err := s.wikiService.GetPageBySlug(ctx, kbID, issue.PageSlug)
+			page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, issue.PageSlug)
 			if err != nil || page == nil {
 				continue
 			}
@@ -484,8 +486,9 @@ func (s *WikiLintService) AutoFix(ctx context.Context, kbID string) (int, error)
 					fixed++
 				}
 			} else if len(remaining) != len(page.SourceRefs) {
+				writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 				page.SourceRefs = remaining
-				if err := s.wikiService.UpdatePageMeta(ctx, page); err == nil {
+				if err := s.wikiService.UpdatePageMeta(writeCtx, page); err == nil {
 					fixed++
 				}
 			}

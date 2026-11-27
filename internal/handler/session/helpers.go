@@ -415,7 +415,7 @@ func (h *Handler) writeAgentQueryEvent(
 	userCreatedAt time.Time,
 	assistantMessage *types.Message,
 	resume *types.AgentResume,
-) {
+) error {
 	assistantMessageID := ""
 	var assistantCreatedAt time.Time
 	if assistantMessage != nil {
@@ -434,10 +434,10 @@ func (h *Handler) writeAgentQueryEvent(
 			"session_id": sessionID,
 			"message_id": assistantMessageID,
 		})
-		return
+		return err
 	}
 	if resume != nil {
-		return
+		return nil
 	}
 	status := "Thinking…"
 	if strings.HasPrefix(types.LanguageFromContextOrDefault(ctx), "zh") {
@@ -450,6 +450,7 @@ func (h *Handler) writeAgentQueryEvent(
 	}); err != nil {
 		logger.Warnf(ctx, "Failed to stream initial thinking status for message %s: %v", assistantMessageID, err)
 	}
+	return nil
 }
 
 // Helper function for type assertion with default value
@@ -521,10 +522,3 @@ func searchResultFromMap(refMap map[string]interface{}) *types.SearchResult {
 	}
 	return sr
 }
-
-// createDefaultSummaryConfig and fillSummaryConfigDefaults used to build
-// per-session SummaryConfig from tenant-level ConversationConfig + config.yaml
-// defaults. Both helpers became unreachable when the chat pipeline moved to
-// CustomAgent (builtin-quick-answer / smart-reasoning) and the tenant-level
-// ConversationConfig field was removed; deleting them avoids the only
-// remaining references to that defunct path.

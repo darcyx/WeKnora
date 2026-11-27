@@ -38,14 +38,6 @@ func (t *BaseTool) Parameters() json.RawMessage {
 	return t.schema
 }
 
-// ToolExecutor is a helper interface for executing tools
-type ToolExecutor interface {
-	types.Tool
-
-	// GetContext returns any context-specific data needed for tool execution
-	GetContext() map[string]interface{}
-}
-
 // Shared helper functions for tool output formatting
 
 // GetRelevanceLevel converts a score to a human-readable relevance level

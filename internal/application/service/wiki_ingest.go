@@ -1685,7 +1685,7 @@ func (s *wikiIngestService) sanitizeDeadSummaryLinks(
 			continue
 		}
 		summarySlug := "summary/" + slugify(r.KnowledgeID)
-		page, err := s.wikiService.GetPageBySlug(ctx, kbID, summarySlug)
+		page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, summarySlug)
 		if err != nil || page == nil {
 			continue
 		}
@@ -1711,8 +1711,9 @@ func (s *wikiIngestService) sanitizeDeadSummaryLinks(
 		if !changed {
 			continue
 		}
+		writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 		page.Content = newContent
-		if err := s.wikiService.UpdateAutoLinkedContent(ctx, page); err != nil {
+		if err := s.wikiService.UpdateAutoLinkedContent(writeCtx, page); err != nil {
 			logger.Warnf(ctx, "wiki ingest: failed to sanitize dead links in summary %s: %v", summarySlug, err)
 			continue
 		}
@@ -1875,7 +1876,7 @@ func (s *wikiIngestService) cleanDeadLinks(ctx context.Context, kbID string, aff
 	// nothing once we're touching content anyway.
 	cleaned := 0
 	for _, slug := range affectedSlugs {
-		page, err := s.wikiService.GetPageBySlug(ctx, kbID, slug)
+		page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, slug)
 		if err != nil || page == nil {
 			continue
 		}
@@ -1927,8 +1928,9 @@ func (s *wikiIngestService) cleanDeadLinks(ctx context.Context, kbID string, aff
 
 		// (4) Persist. UpdateAutoLinkedContent skips the version bump
 		// because dead-link cleanup is a machine-only edit.
+		writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 		page.Content = newContent
-		if err := s.wikiService.UpdateAutoLinkedContent(ctx, page); err != nil {
+		if err := s.wikiService.UpdateAutoLinkedContent(writeCtx, page); err != nil {
 			logger.Warnf(ctx, "wiki: failed to clean dead links in page %s: %v", page.Slug, err)
 			continue
 		}
@@ -1973,7 +1975,7 @@ func (s *wikiIngestService) injectCrossLinks(
 
 	updated := 0
 	for _, slug := range affectedSlugs {
-		page, err := s.wikiService.GetPageBySlug(ctx, kbID, slug)
+		page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, slug)
 		if err != nil || page == nil {
 			continue
 		}
@@ -2009,8 +2011,9 @@ func (s *wikiIngestService) injectCrossLinks(
 		if !changed {
 			continue
 		}
+		writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 		page.Content = newContent
-		if err := s.wikiService.UpdateAutoLinkedContent(ctx, page); err != nil {
+		if err := s.wikiService.UpdateAutoLinkedContent(writeCtx, page); err != nil {
 			logger.Warnf(ctx, "wiki ingest: cross-link injection failed for %s: %v", page.Slug, err)
 			continue
 		}
@@ -2386,13 +2389,14 @@ func splitSummaryLine(raw string) (summary string, content string) {
 // This ensures users don't see half-built pages during the ingest process.
 func (s *wikiIngestService) publishDraftPages(ctx context.Context, kbID string, slugs []string) {
 	for _, slug := range slugs {
-		page, err := s.wikiService.GetPageBySlug(ctx, kbID, slug)
+		page, err := s.wikiService.GetPageBySlug(types.WithWikiPageRawRead(ctx), kbID, slug)
 		if err != nil || page == nil {
 			continue
 		}
 		if page.Status == types.WikiPageStatusDraft {
+			writeCtx := types.WithWikiPageWriteSnapshot(ctx, page)
 			page.Status = types.WikiPageStatusPublished
-			if err := s.wikiService.UpdatePageMeta(ctx, page); err != nil {
+			if err := s.wikiService.UpdatePageMeta(writeCtx, page); err != nil {
 				logger.Warnf(ctx, "wiki ingest: failed to publish page %s: %v", slug, err)
 			}
 		}

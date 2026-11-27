@@ -80,8 +80,6 @@ func TestTenantSkillSourceHidesUnusableSkillsFromEveryLookup(t *testing.T) {
 	require.Error(t, err)
 	_, err = src.LoadSkillFile("ready-disabled", "scripts/run.py")
 	require.Error(t, err)
-	_, err = src.RemoteScriptPath("ready-disabled", "scripts/run.py")
-	require.Error(t, err)
 }
 
 // Level 2 comes from the database projection: the request path must not depend
@@ -128,11 +126,10 @@ func TestTenantSkillSourceReadsLevel3FilesFromTheBundle(t *testing.T) {
 	require.Equal(t, "form notes", file.Content)
 	require.Equal(t, "/opt/weknora/tenant/skills/pdf/reference/FORMS.md", file.Path,
 		"the path the model is shown must be the one it can execute or read in the sandbox")
-	require.False(t, file.IsScript)
 
 	script, err := src.LoadSkillFile("pdf", "scripts/extract.py")
 	require.NoError(t, err)
-	require.True(t, script.IsScript)
+	require.Equal(t, "/opt/weknora/tenant/skills/pdf/scripts/extract.py", script.Path)
 }
 
 func TestTenantSkillSourceDownloadsEachBundleOnce(t *testing.T) {
@@ -169,8 +166,6 @@ func TestTenantSkillSourceRefusesPathsOutsideTheSkill(t *testing.T) {
 	for _, rel := range []string{"../other/secret", "/etc/passwd", ""} {
 		_, err := src.LoadSkillFile("pdf", rel)
 		require.Error(t, err, "rel=%q", rel)
-		_, err = src.RemoteScriptPath("pdf", rel)
-		require.Error(t, err, "rel=%q", rel)
 	}
 }
 
@@ -184,9 +179,9 @@ func TestTenantSkillSourceReportsAMissingBundleWithoutBlockingExecution(t *testi
 	_, err := src.LoadSkillFile("pdf", "scripts/extract.py")
 	require.Error(t, err)
 
-	remote, err := src.RemoteScriptPath("pdf", "scripts/extract.py")
+	basePath, err := src.GetSkillBasePath("pdf")
 	require.NoError(t, err)
-	require.Equal(t, "/opt/weknora/tenant/skills/pdf/scripts/extract.py", remote)
+	require.Equal(t, "/opt/weknora/tenant/skills/pdf", basePath)
 }
 
 func TestManagerIgnoresHostSkillsWhenTenantSourceIsAttached(t *testing.T) {
@@ -361,9 +356,9 @@ func TestTenantSkillSourceAtUsesTheGivenRoot(t *testing.T) {
 	meta, err := src.DiscoverSkills()
 	require.NoError(t, err)
 	require.Equal(t, "/Users/dev/.weknora/skills/pdf", meta[0].BasePath)
-	script, err := src.RemoteScriptPath("pdf", "scripts/run.py")
+	customDir, err := src.GetSkillBasePath("pdf")
 	require.NoError(t, err)
-	require.Equal(t, "/Users/dev/.weknora/skills/pdf/scripts/run.py", script)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf", customDir)
 
 	legacy := NewTenantSkillSource(rows, nil)
 	dir, err := legacy.GetSkillBasePath("pdf")

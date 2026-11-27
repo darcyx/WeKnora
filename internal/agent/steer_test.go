@@ -501,7 +501,7 @@ func agentRegistryForTest(t *testing.T, name string) *agenttools.ToolRegistry {
 }
 
 func TestSteerGuidanceAppliesToCustomAgentPrompt(t *testing.T) {
-	prompt := BuildSystemPromptWithOptions(nil, false, nil, "Custom agent instructions.")
+	prompt := renderSystemPromptSections(BuildSystemPromptSections(nil, false, nil, "Custom agent instructions."))
 	assert.Contains(t, prompt, "Custom agent instructions.")
 	assert.Contains(t, prompt, steerGuidance)
 	assert.Contains(t, prompt, "preserve unfinished objectives")

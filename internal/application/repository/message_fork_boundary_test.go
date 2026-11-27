@@ -23,9 +23,7 @@ func newMessageRepositoryForForkTest(t *testing.T) (*messageRepository, *gorm.DB
 
 func seedMessage(t *testing.T, db *gorm.DB, id, sessionID, role string, at time.Time) {
 	t.Helper()
-	// Message.BeforeCreate always assigns a fresh UUID, which would discard
-	// the IDs these tests use as both expected results and the composite
-	// cursor. Skip hooks so the seeded identity is the one the queries see.
+	// Seed directly without unrelated initialization for these cursor fixtures.
 	require.NoError(t, db.Session(&gorm.Session{SkipHooks: true}).Create(&types.Message{
 		ID:        id,
 		SessionID: sessionID,
@@ -131,4 +129,20 @@ func messageIDs(messages []*types.Message) []string {
 		ids = append(ids, m.ID)
 	}
 	return ids
+}
+
+func TestCreateMessagePreservesProvidedIDAndInitializesDefaults(t *testing.T) {
+	repo, _ := newMessageRepositoryForForkTest(t)
+	supplied := &types.Message{ID: "stable-id", SessionID: "s", Role: "user"}
+	saved, err := repo.CreateMessage(t.Context(), supplied)
+	require.NoError(t, err)
+	require.Equal(t, "stable-id", saved.ID)
+	require.NotNil(t, saved.KnowledgeReferences)
+	require.NotNil(t, saved.AgentSteps)
+	generated, err := repo.CreateMessage(t.Context(), &types.Message{SessionID: "s", Role: "user"})
+	require.NoError(t, err)
+	require.NotEmpty(t, generated.ID)
+	require.NotEqual(t, saved.ID, generated.ID)
+	_, err = repo.CreateMessage(t.Context(), &types.Message{ID: "stable-id", SessionID: "s", Role: "user"})
+	require.Error(t, err, "duplicate stable IDs must be rejected")
 }

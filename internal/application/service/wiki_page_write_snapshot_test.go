@@ -211,3 +211,29 @@ func TestWikiPageSnapshotServiceKeepsIncrementalBacklinkMaintenance(t *testing.T
 		require.Equal(t, 1, target.Version, "原子反链不制造内容版本")
 	}
 }
+
+func TestWikiRawMutationSnapshotPreservesDisplayAndRejectsStaleWrites(t *testing.T) {
+	svc, page, db := newWikiSnapshotService(t)
+	ctx := context.Background()
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", page.ID).Update("content", "Old body [c003]").Error)
+	shown, err := svc.GetPageBySlug(ctx, page.KnowledgeBaseID, page.Slug)
+	require.NoError(t, err)
+	require.Equal(t, "Old body", shown.Content)
+	raw, err := svc.GetPageBySlug(types.WithWikiPageRawRead(ctx), page.KnowledgeBaseID, page.Slug)
+	require.NoError(t, err)
+	require.Equal(t, "Old body [c003]", raw.Content)
+	guarded := types.WithWikiPageWriteSnapshot(ctx, raw)
+	raw.Title = "New title"
+	updated, err := svc.UpdatePage(guarded, raw)
+	require.NoError(t, err)
+	require.Equal(t, "New title", updated.Title)
+	read, err := svc.GetPageBySlug(types.WithWikiPageRawRead(ctx), page.KnowledgeBaseID, page.Slug)
+	require.NoError(t, err)
+	guarded = types.WithWikiPageWriteSnapshot(ctx, read)
+	require.NoError(t, db.Model(&types.WikiPage{}).Where("id = ?", page.ID).Update("source_refs", types.StringArray{"new|New"}).Error)
+	read.Content = "stale automated rewrite"
+	require.ErrorIs(t, svc.UpdateAutoLinkedContent(guarded, read), apprepo.ErrWikiPageConflict)
+	current, err := svc.GetPageBySlug(ctx, page.KnowledgeBaseID, page.Slug)
+	require.NoError(t, err)
+	require.NotEqual(t, "stale automated rewrite", current.Content)
+}

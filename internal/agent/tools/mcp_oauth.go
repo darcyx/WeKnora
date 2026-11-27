@@ -95,7 +95,13 @@ func getOrCreateMCPClientWithOAuthRetry(
 	gate approval.MCPApproval,
 	oauthSess *MCPOAuthSession,
 	mcpToolName, toolCallID string,
+	check ...func(context.Context) error,
 ) (mcp.MCPClient, error) {
+	if len(check) > 0 && check[0] != nil {
+		if err := check[0](ctx); err != nil {
+			return nil, err
+		}
+	}
 	client, err := mcpManager.GetOrCreateClient(ctx, service)
 	if err == nil {
 		return client, nil
@@ -118,6 +124,11 @@ func getOrCreateMCPClientWithOAuthRetry(
 	_ = mcpManager.CloseClientsAfterAuthorization(
 		retryCtx, tenantID, service.ID, types.MCPOAuthPrincipalFromContext(retryCtx),
 	)
+	if len(check) > 0 && check[0] != nil {
+		if err := check[0](retryCtx); err != nil {
+			return nil, err
+		}
+	}
 	return mcpManager.GetOrCreateClient(retryCtx, service)
 }
 

@@ -178,11 +178,6 @@ func (t *WriteSkillFileTool) Execute(ctx context.Context, args json.RawMessage) 
 	}, nil
 }
 
-// Cleanup releases any resources.
-func (t *WriteSkillFileTool) Cleanup(ctx context.Context) error {
-	return nil
-}
-
 var editSkillFileTool = BaseTool{
 	name: ToolEditSkillFile,
 	description: `Replace exact text in a file inside the skill directory being installed.
@@ -373,11 +368,6 @@ func (t *EditSkillFileTool) Execute(ctx context.Context, args json.RawMessage) (
 			clean, replacements, len(content)),
 		Data: data,
 	}, nil
-}
-
-// Cleanup releases any resources.
-func (t *EditSkillFileTool) Cleanup(ctx context.Context) error {
-	return nil
 }
 
 // resolveSkillFilePath turns a model-supplied path into an absolute path

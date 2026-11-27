@@ -74,9 +74,10 @@ type PendingRequest struct {
 	// grants; see types.ToolApprovalPromptRequest. GrantRisk is the call's
 	// risk, empty meaning write: only a write may be remembered from the
 	// card, while a standing grant may also cover a destructive call.
-	Grant      string
-	GrantScope string
-	GrantRisk  policy.Risk
+	Grant          string
+	GrantScope     string
+	GrantRisk      policy.Risk
+	ApprovedAction *policy.Action
 	// Snapshot, when set, is the run state to resume from: the wait is cut
 	// to the hot-wait window and then suspends instead of timing out.
 	Snapshot        []byte
@@ -402,6 +403,13 @@ func (g *Gate) awaitToolApproval(ctx context.Context, req PendingRequest) (Decis
 		return Decision{}, fmt.Errorf("tool approval: EventBus is nil")
 	}
 
+	var approvedRisk string
+	var approvedAlways *bool
+	if req.ApprovedAction != nil {
+		approvedRisk = string(req.ApprovedAction.Risk)
+		always := req.ApprovedAction.Always
+		approvedAlways = &always
+	}
 	request, err := json.Marshal(types.ToolApprovalPromptRequest{
 		ServiceID:          req.ServiceID,
 		ServiceName:        req.ServiceName,
@@ -414,6 +422,7 @@ func (g *Gate) awaitToolApproval(ctx context.Context, req PendingRequest) (Decis
 		GrantLapsed:        lapse,
 		GrantRisk:          grantRiskLabel(req),
 		GrantLabel:         grantLabel(req),
+		ApprovedRisk:       approvedRisk, ApprovedAlways: approvedAlways,
 	})
 	if err != nil {
 		return Decision{}, fmt.Errorf("encode tool approval: %w", err)

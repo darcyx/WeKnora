@@ -225,9 +225,8 @@ func (s *TenantSkillSource) LoadSkillFile(name, relativePath string) (*SkillFile
 		Name: relativePath,
 		// The path the model sees is the in-image one, because that is where
 		// it can act on the file.
-		Path:     path.Join(basePath, clean),
-		Content:  string(content),
-		IsScript: IsScript(clean),
+		Path:    path.Join(basePath, clean),
+		Content: string(content),
 	}, nil
 }
 
@@ -266,27 +265,7 @@ func (s *TenantSkillSource) GetSkillBasePath(name string) (string, error) {
 	return s.skillDir(row.Name)
 }
 
-// RemoteScriptPath returns the absolute in-image path of one script. It is
-// keyed on the skill name, which is also the directory the installer wrote.
-//
-// It deliberately does not consult the archive. The image is what executes,
-// and a skill whose archive failed to store - the install logs a warning and
-// carries on - is still installed and runnable.
-func (s *TenantSkillSource) RemoteScriptPath(name, relativePath string) (string, error) {
-	row, err := s.row(name)
-	if err != nil {
-		return "", err
-	}
-	clean, err := safeSkillRelPath(relativePath)
-	if err != nil {
-		return "", err
-	}
-	basePath, err := s.skillDir(row.Name)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(basePath, clean), nil
-}
+func (*TenantSkillSource) imageSkillSource() {}
 
 func (s *TenantSkillSource) row(name string) (*types.TenantSkillEntity, error) {
 	if row, ok := s.byName[name]; ok {

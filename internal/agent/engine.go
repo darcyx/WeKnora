@@ -328,32 +328,6 @@ func (e *AgentEngine) Cleanup(ctx context.Context) {
 	}
 }
 
-// NewAgentEngineWithSkills creates a new agent engine with skills support
-func NewAgentEngineWithSkills(
-	config *types.AgentConfig,
-	chatModel chat.Chat,
-	toolRegistry *agenttools.ToolRegistry,
-	eventBus *event.EventBus,
-	knowledgeBasesInfo []*KnowledgeBaseInfo,
-	selectedDocs []*SelectedDocumentInfo,
-	sessionID string,
-	systemPromptTemplate string,
-	skillsManager *skills.Manager,
-) *AgentEngine {
-	engine := NewAgentEngine(
-		config,
-		chatModel,
-		toolRegistry,
-		eventBus,
-		knowledgeBasesInfo,
-		selectedDocs,
-		sessionID,
-		systemPromptTemplate,
-	)
-	engine.skillsManager = skillsManager
-	return engine
-}
-
 // SetAppConfig sets the application config for prompt template resolution.
 // This allows the engine to read default prompts from config/prompt_templates/ YAML files.
 func (e *AgentEngine) SetAppConfig(cfg *appconfig.Config) {
@@ -460,7 +434,7 @@ func (e *AgentEngine) Execute(
 	common.PipelineInfo(ctx, "Agent", "execute_start", map[string]interface{}{
 		"session_id":   sessionID,
 		"message_id":   messageID,
-		"query":        query,
+		"query":        types.SanitizeObservationText(ctx, query),
 		"context_msgs": len(llmContext),
 	})
 
@@ -481,7 +455,7 @@ func (e *AgentEngine) Execute(
 	spanCtx, agentSpan := langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{
 		Name: "agent.execute",
 		Input: map[string]interface{}{
-			"query":        truncateRunes(query, langfuseQueryPreview),
+			"query":        truncateRunes(types.SanitizeObservationText(ctx, query), langfuseQueryPreview),
 			"query_len":    len(query),
 			"context_msgs": len(llmContext),
 			"image_count":  imgCount,
@@ -515,7 +489,7 @@ func (e *AgentEngine) Execute(
 		state.AddUsage(*e.config.FAQPreflightUsage)
 		state.TurnUsage.Accumulate(*e.config.FAQPreflightUsage)
 	}
-	defer func() { finishAgentSpan(agentSpan, state, err) }()
+	defer func() { finishAgentSpan(ctx, agentSpan, state, err) }()
 
 	// Initialize messages with history
 	var imgs []string
@@ -598,7 +572,7 @@ func (e *AgentEngine) emitExecutionError(ctx context.Context, sessionID string, 
 // finishAgentSpan records the final outcome of an agent execution onto the
 // top-level Langfuse span. Extracted so the same payload is used for both
 // success and error return paths in Execute().
-func finishAgentSpan(span *langfuse.Span, state *types.AgentState, err error) {
+func finishAgentSpan(ctx context.Context, span *langfuse.Span, state *types.AgentState, err error) {
 	if span == nil {
 		return
 	}
@@ -612,7 +586,10 @@ func finishAgentSpan(span *langfuse.Span, state *types.AgentState, err error) {
 		"tool_calls":       totalToolCalls,
 		"complete":         state.IsComplete,
 		"final_answer_len": len(state.FinalAnswer),
-		"final_answer":     truncateRunes(state.FinalAnswer, langfuseQueryPreview),
+		"final_answer":     truncateRunes(types.SanitizeObservationText(ctx, state.FinalAnswer), langfuseQueryPreview),
+	}
+	if err != nil {
+		err = fmt.Errorf("%s", types.SanitizeObservationText(ctx, err.Error()))
 	}
 	span.Finish(output, map[string]interface{}{
 		"rounds":     state.CurrentRound,
@@ -1113,12 +1090,16 @@ func (e *AgentEngine) runReActIteration(
 			}
 		}
 		out["duration_ms"] = time.Since(roundStart).Milliseconds()
+		traceErr := retErr
+		if traceErr != nil {
+			traceErr = fmt.Errorf("%s", types.SanitizeObservationText(ctx, traceErr.Error()))
+		}
 		roundSpan.Finish(out, map[string]interface{}{
 			"round":       round,
 			"tool_calls":  toolCallCount,
 			"outcome":     outcome.String(),
 			"duration_ms": time.Since(roundStart).Milliseconds(),
-		}, retErr)
+		}, traceErr)
 	}()
 
 	// Compact older history before the next assistant response when the

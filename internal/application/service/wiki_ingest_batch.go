@@ -2189,7 +2189,7 @@ func (s *wikiIngestService) reduceSlugUpdatesOnce(
 	ctx context.Context, chatModel chat.Chat, kbID, slug string, updates []SlugUpdate,
 	tenantID uint64, batchCtx *WikiBatchContext, pageResult **types.WikiPage,
 ) (changed bool, affectedType string, additionFailed bool, updateDeferred bool, err error) {
-	readCtx := context.WithValue(ctx, wikiPageRawReadKey{}, true)
+	readCtx := types.WithWikiPageRawRead(ctx)
 	page, err := s.wikiService.GetPageBySlug(readCtx, kbID, slug)
 	if ctx.Err() != nil {
 		return false, "", false, false, ctx.Err()

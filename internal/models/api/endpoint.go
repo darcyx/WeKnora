@@ -272,10 +272,17 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 // LogRequest emits the standard request log line with image payloads
 // compacted so data URIs do not flood the log.
 func LogRequest(ctx context.Context, url, model string, body []byte, stream bool) {
-	pretty := body
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, body, "", "  "); err == nil {
-		pretty = buf.Bytes()
+	pretty := []byte(types.SanitizeObservationText(ctx, string(body)))
+	var value any
+	if json.Unmarshal(body, &value) == nil {
+		if sanitized, err := json.MarshalIndent(types.SanitizeObservationValue(ctx, value), "", "  "); err == nil {
+			pretty = sanitized
+		}
+	} else {
+		var buf bytes.Buffer
+		if json.Indent(&buf, pretty, "", "  ") == nil {
+			pretty = buf.Bytes()
+		}
 	}
 	logger.Infof(ctx, "[LLM Request] endpoint=%s, model=%s, stream=%v, request:\n%s",
 		url, model, stream, secutils.CompactImageDataURLForLog(string(pretty)))

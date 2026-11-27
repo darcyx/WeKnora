@@ -1,0 +1,1 @@
+-- Ownership backfill is intentionally retained on rollback.

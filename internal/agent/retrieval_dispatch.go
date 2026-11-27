@@ -324,7 +324,7 @@ func (e *AgentEngine) includeProjectIntegrationLibraries(args map[string]any) {
 	hasSearch := false
 	for i := len(state.Attempts) - 1; i >= 0; i-- {
 		attempt := state.Attempts[i]
-		if attempt.QuestionID == state.questionID() && isBudgetedSearchTool(attempt.Tool) && !attempt.FAQOnly {
+		if attempt.QuestionID == state.questionID() && isBudgetedSearchTool(attempt.Tool) {
 			hasSearch = attempt.Completed && attempt.Outcome == retrievalSuccess && len(attempt.Failures) == 0
 			break
 		}

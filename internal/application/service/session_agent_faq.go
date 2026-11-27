@@ -45,14 +45,6 @@ func (e *faqMatchUnavailableError) Error() string {
 func (e *faqMatchUnavailableError) Unwrap() error        { return e.cause }
 func (e *faqMatchUnavailableError) Is(target error) bool { return target == errFAQMatchUnavailable }
 
-func (s *sessionService) tryAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (bool, error) {
-	evaluation, err := s.preflightAgentFAQ(ctx, req, cfg, bus, model, reranker, history)
-	if err != nil {
-		return false, err
-	}
-	return emitAgentFAQEvaluation(ctx, req, bus, evaluation)
-}
-
 // preflightAgentFAQ evaluates without publishing; nil means not eligible.
 func (s *sessionService) preflightAgentFAQ(ctx context.Context, req *types.QARequest, cfg *types.AgentConfig, bus *event.EventBus, model chat.Chat, reranker rerank.Reranker, history []chat.Message) (*agentFAQEvaluation, error) {
 	// Requests that can never be answered directly skip the preflight cost.
@@ -104,13 +96,11 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 			} else {
 				evaluation.Outcome = "err_interrupted"
 			}
-			evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		}
 	}()
 	evaluation.Query = req.Query
-	if err := faqEvaluationInterrupted(ctx, req); err != nil {
+	if faqEvaluationInterrupted(ctx, req) != nil {
 		evaluation.Outcome = "err_interrupted"
-		evaluation.observe("faq_interrupted", req.Query, nil, nil, err)
 		return evaluation
 	}
 	query := req.Query
@@ -140,7 +130,6 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 		}()
 	}
 	result, err := s.findAgentExactFAQs(ctx, query, cfg)
-	evaluation.observeSearch("faq_exact", query, result, err)
 	rawExact := err == nil && len(result.Candidates) == 1 && len(result.Matches) == 1
 	rewrite := rewriteResult{query: query}
 	if err != nil || len(result.CompletedTargets) == 0 || len(result.Matches) > 0 {
@@ -167,18 +156,13 @@ func (s *sessionService) evaluateAgentFAQ(ctx context.Context, req *types.QARequ
 		return evaluation
 	}
 	if len(result.Matches) == 0 {
-		if rewritten != nil {
-			evaluation.observe("faq_rewrite", req.Query, nil, nil, rewrite.err)
-		}
-		if err := faqEvaluationInterrupted(ctx, req); err != nil {
+		if faqEvaluationInterrupted(ctx, req) != nil {
 			evaluation.Outcome = "err_interrupted"
-			evaluation.observe("faq_interrupted", query, nil, nil, err)
 			return evaluation
 		}
 		if rewrite.query != query {
 			query = rewrite.query
 			result, err = s.findAgentExactFAQs(ctx, query, cfg)
-			evaluation.observeSearch("faq_exact", query, result, err)
 			if err != nil {
 				evaluation.Outcome = "err_exact_search"
 				return evaluation

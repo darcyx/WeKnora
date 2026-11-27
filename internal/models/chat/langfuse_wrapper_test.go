@@ -144,3 +144,15 @@ func TestLangfuseTracksIsolatedTemperatureZero(t *testing.T) {
 		t.Fatal("ordinary unset temperature was recorded")
 	}
 }
+
+func TestBuildLangfuseMessagesRedactsAppInfoWithoutMutatingInput(t *testing.T) {
+	body := `<app_info>{"token":"synthetic-token","name":"visible"}</app_info>`
+	input := []Message{{Role: "user", Content: body}, {Role: "user", MultiContent: []MessageContentPart{{Text: body}}}}
+	got := buildLangfuseMessages(input)
+	if strings.Contains(got[0]["content"].(string), "synthetic-token") || strings.Contains(got[1]["content"].([]MessageContentPart)[0].Text, "synthetic-token") {
+		t.Fatal("trace retained the app token")
+	}
+	if input[0].Content != body || input[1].MultiContent[0].Text != body {
+		t.Fatal("trace serialization modified model input")
+	}
+}

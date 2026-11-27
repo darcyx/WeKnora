@@ -573,19 +573,8 @@ func (h *AgentStreamHandler) handleReferences(ctx context.Context, evt event.Eve
 	defer h.mu.Unlock()
 
 	// Extract knowledge references
-	// Try to cast directly to []*types.SearchResult first
 	if searchResults, ok := data.References.([]*types.SearchResult); ok {
 		h.knowledgeRefs = append(h.knowledgeRefs, searchResults...)
-	} else if refs, ok := data.References.([]interface{}); ok {
-		// Fallback: convert from []interface{}
-		for _, ref := range refs {
-			if sr, ok := ref.(*types.SearchResult); ok {
-				h.knowledgeRefs = append(h.knowledgeRefs, sr)
-			} else if refMap, ok := ref.(map[string]interface{}); ok {
-				// Parse from map if needed
-				h.knowledgeRefs = append(h.knowledgeRefs, searchResultFromMap(refMap))
-			}
-		}
 	}
 
 	// Update assistant message references

@@ -514,16 +514,9 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*typ
 
 	// Add guidance for next steps
 	output += "\n=== Next Steps ===\n"
-	if len(webResults) > 0 {
-		output += "- Titles, URLs, snippets, and content snippets are usable search-summary evidence.\n"
-		output += "- If the evidence is sufficient, answer now. Use web_fetch only for claims that need full-page verification.\n"
-		output += "- If fetching fails, retain these results, disclose that page content was not verified, and avoid presenting dynamic facts as certain.\n"
-	} else {
-		output += "- No web search results found. Consider:\n"
-		output += "  - Try different search queries or keywords\n"
-		output += "  - Check if question can be answered from knowledge base instead\n"
-		output += "  - Verify if the topic requires real-time information\n"
-	}
+	output += "- Titles, URLs, snippets, and content snippets are usable search-summary evidence.\n"
+	output += "- If the evidence is sufficient, answer now. Use web_fetch only for claims that need full-page verification.\n"
+	output += "- If fetching fails, retain these results, disclose that page content was not verified, and avoid presenting dynamic facts as certain.\n"
 
 	return &types.ToolResult{
 		Success: true,

@@ -74,6 +74,7 @@ func (s *sessionService) AgentQA(
 	req *types.QARequest,
 	eventBus *event.EventBus,
 ) error {
+	ctx = types.WithObservationAppInfo(ctx, req.AppInfo)
 	if s.cfg != nil && s.cfg.Agent != nil && s.cfg.Agent.QATotalTimeoutSeconds > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.Agent.QATotalTimeoutSeconds)*time.Second)
@@ -305,7 +306,7 @@ func resumableAgentRequest(ctx context.Context, req *types.QARequest) types.Resu
 		AssistantAccess:     req.AssistantAccess,
 		UserMessageID:       req.UserMessageID,
 		Language:            types.LanguageFromContextOrDefault(ctx),
-		AppInfo:             types.SanitizeAppInfoJSON(req.AppInfo),
+		AppInfo:             types.SanitizeLiveAppInfoJSON(req.AppInfo),
 		LocalBrowserEnabled: req.LocalBrowserEnabled,
 		RunNote:             req.RunNote,
 		QuotedContext:       req.QuotedContext,
@@ -395,13 +396,6 @@ func (s *sessionService) buildAgentConfig(
 	}
 	applyRequestReasoningEffort(req.ReasoningEffort, &agentConfig.Thinking, &agentConfig.ReasoningEffort)
 	agentConfig.ResourceNavigationFastAnswer = eligibleResourceNavigation(req, agentConfig)
-	// An unset MCP mode means "all" at runtime, but the share scope and the
-	// agent UI both present it as none. A shared run must not hand receivers
-	// every MCP service (with the owner's credentials) that its owner believes
-	// is off.
-	if req.SharedAgentReadOnly && agentConfig.MCPSelectionMode == "" {
-		agentConfig.MCPSelectionMode = "none"
-	}
 
 	// Falls back to global configuration if no specific timeout is set for the agent.
 	if agentConfig.LLMCallTimeout == 0 && s.cfg.Agent != nil && s.cfg.Agent.LLMCallTimeout > 0 {
@@ -448,9 +442,9 @@ func (s *sessionService) buildAgentConfig(
 
 	// An unset list selects the default tools; an empty one means none.
 	agentConfig.AllowedTools = tools.EffectiveAllowedTools(customAgent.Config.AllowedTools)
-	// Apply per-turn @Skill / @MCP scope. Each helper narrows the agent's
-	// whitelist to the mentioned items and records the pinned set used for the
-	// <must_use> hint, keeping all scope logic in one place per resource type.
+	// Apply per-turn @Skill / @MCP priority. Each helper records the authorized
+	// mentioned items as the pinned set for the <must_use> hint without narrowing
+	// the agent's configured scope.
 	isSharedAgent := req.SharedAgentReadOnly
 	applyPerRequestSkillScope(ctx, agentConfig, customAgent.Config.SkillsSelectionMode, req.SkillNames)
 	applyPerRequestMCPScope(ctx, agentConfig, customAgent.Config.MCPServices, isSharedAgent, req.MCPServiceIDs)
@@ -612,7 +606,7 @@ func applyPerRequestMCPScope(
 		return
 	}
 	mentioned := dedupPreservingOrder(requested)
-	effective, _ := resolvePerRequestMCPScope(
+	effective := resolvePerRequestMCPScope(
 		mentioned, agentPresetMCPs, agentConfig.MCPSelectionMode, isSharedAgent,
 	)
 	if len(effective) == 0 {
@@ -632,30 +626,31 @@ func resolvePerRequestMCPScope(
 	mentioned, agentMCPs []string,
 	selectionMode string,
 	isSharedAgent bool,
-) (effective []string, mode string) {
+) []string {
 	if len(mentioned) == 0 {
-		return nil, selectionMode
+		return nil
 	}
 	if isSharedAgent {
 		mentioned = intersectPreservingRequestOrder(mentioned, agentMCPs)
 		if len(mentioned) == 0 {
-			return nil, selectionMode
+			return nil
 		}
 	}
+	var effective []string
 	switch selectionMode {
 	case "none", "":
-		return nil, selectionMode
+		return nil
 	case "selected":
 		effective = intersectPreservingRequestOrder(mentioned, agentMCPs)
 	case "all":
 		effective = mentioned
 	default:
-		return nil, selectionMode
+		return nil
 	}
 	if len(effective) == 0 {
-		return nil, selectionMode
+		return nil
 	}
-	return effective, "selected"
+	return effective
 }
 
 func intersectPreservingRequestOrder(requested []string, allowed []string) []string {

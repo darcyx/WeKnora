@@ -91,7 +91,9 @@ func TestResumeRestoresFirstDeferredMCPCall(t *testing.T) {
 			}}}}
 			e := newTestEngine(t, model)
 			e.toolRegistry = newRegistry()
-			_, err = e.Resume(ctx, "s", "m", nil, data, answeredPrompt("call"))
+			prompt := answeredPrompt("call")
+			prompt.Request = types.JSON(`{"service_id":"svc","mcp_tool_name":"write","approved_risk":"write","approved_always":true}`)
+			_, err = e.Resume(ctx, "s", "m", nil, data, prompt)
 			require.NoError(t, err)
 			_, err = e.toolRegistry.GetTool(readTool["function_name"].(string))
 			require.NoError(t, err, "described but uncalled tools must survive approval resume")

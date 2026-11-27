@@ -14,6 +14,7 @@ type replaceTextWikiService struct {
 	interfaces.WikiPageService
 	page        *types.WikiPage
 	updateCalls int
+	snapshot    *types.WikiPage
 }
 
 func (s *replaceTextWikiService) GetPageBySlug(_ context.Context, _, _ string) (*types.WikiPage, error) {
@@ -21,7 +22,8 @@ func (s *replaceTextWikiService) GetPageBySlug(_ context.Context, _, _ string) (
 	return &pageCopy, nil
 }
 
-func (s *replaceTextWikiService) UpdatePage(_ context.Context, page *types.WikiPage) (*types.WikiPage, error) {
+func (s *replaceTextWikiService) UpdatePage(ctx context.Context, page *types.WikiPage) (*types.WikiPage, error) {
+	s.snapshot, _ = types.WikiPageWriteSnapshotFromContext(ctx)
 	s.updateCalls++
 	pageCopy := *page
 	s.page = &pageCopy
@@ -142,5 +144,15 @@ func TestWikiReplaceTextNotFoundDoesNotPersist(t *testing.T) {
 	}
 	if service.updateCalls != 0 {
 		t.Fatalf("UpdatePage calls = %d, want 0", service.updateCalls)
+	}
+}
+
+func TestWikiReplaceTextMatchesDisplayedLegacyCitationText(t *testing.T) {
+	service, result := executeReplaceText(t, "alpha [c003]beta", "alphabeta", "replaced")
+	if !result.Success || service.page.Content != "replaced" {
+		t.Fatalf("result=%+v page=%q", result, service.page.Content)
+	}
+	if service.snapshot == nil || service.snapshot.Content != "alpha [c003]beta" {
+		t.Fatalf("raw snapshot not retained: %+v", service.snapshot)
 	}
 }

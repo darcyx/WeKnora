@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func registeredMCPToolNames(r *ToolRegistry, serverID string) []string {
+	var out []string
+	for _, name := range r.ListTools() {
+		tool, err := r.GetTool(name)
+		if err != nil {
+			continue
+		}
+		if direct, ok := tool.(*MCPRegisteredTool); ok && direct.service != nil && direct.service.ID == serverID {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestMCPDirectExposurePreservesEveryDescriptionAndRawSchema(t *testing.T) {
 	ctx := catalogTestContext()
 	server := &types.MCPService{ID: "orders", Name: "订单", Enabled: true}
@@ -31,16 +47,17 @@ func TestMCPDirectExposurePreservesEveryDescriptionAndRawSchema(t *testing.T) {
 			`"properties":{"id":{"$ref":"#/definitions/id"}},` +
 			`"oneOf":[{"required":["id"]}],"additionalProperties":false}`,
 	)
+	enabledNames := []string{
+		"查询", "查询!", "get-order", "get_order", "Get_Order",
+		strings.Repeat("long", 30) + "a", strings.Repeat("long", 30) + "b",
+	}
 	c := newMCPCatalog(
 		ctx,
 		[]*types.MCPService{server},
 		gate,
 		func(context.Context, *types.MCPService, bool) ([]*MCPTool, error) {
 			var tools []*MCPTool
-			for _, name := range []string{
-				"查询", "查询!", "get-order", "get_order", "Get_Order",
-				strings.Repeat("long", 30) + "a", strings.Repeat("long", 30) + "b", "disabled",
-			} {
+			for _, name := range append(append([]string(nil), enabledNames...), "disabled") {
 				tool := NewMCPTool(
 					server,
 					&types.MCPTool{Name: name, Description: description, InputSchema: schema},
@@ -57,7 +74,11 @@ func TestMCPDirectExposurePreservesEveryDescriptionAndRawSchema(t *testing.T) {
 	)
 	r := NewToolRegistry()
 	installMCPCatalog(r, c)
-	r.prepareMCPTools(ctx, time.Second)
+	r.PrepareMCPTools(ctx)
+	for _, toolName := range enabledNames {
+		describeTool(ctx, t, r, server.ID, toolName)
+	}
+	r.RefreshMCPTools(ctx)
 	defs := r.GetModelFunctionDefinitions()
 	require.Len(t, defs, 9, "seven distinct authorized tools plus two recovery tools")
 	names := map[string]bool{}
@@ -128,8 +149,12 @@ func TestMCPDirectExecutionPreservesValidationApprovalAndImages(t *testing.T) {
 	gate := &proxyApprovalGate{}
 	_, err := RegisterMCPTools(ctx, registry, []*types.MCPService{service}, manager, gate, 0, nil, nil)
 	require.NoError(t, err)
-	registry.prepareMCPTools(ctx, time.Second)
-	name := MCPToolNamesByServiceID(registry)[service.ID][0]
+	registry.PrepareMCPTools(ctx)
+	describeTool(ctx, t, registry, service.ID, "get_order")
+	registry.RefreshMCPTools(ctx)
+	names := registeredMCPToolNames(registry, service.ID)
+	require.Len(t, names, 1)
+	name := names[0]
 	ctx = WithToolExecContext(
 		ctx,
 		&ToolExecContext{EventBus: event.NewEventBus(), ToolCallID: "direct-call", ApprovalCtx: ctx},
@@ -186,18 +211,24 @@ func TestMCPDirectExposureLateStartupAndNonInteractiveContext(t *testing.T) {
 	r := NewToolRegistry()
 	installMCPCatalog(r, c)
 	start := time.Now()
-	r.prepareMCPTools(ctx, 100*time.Millisecond)
+	r.prepareMCPToolsWithGrace(ctx, 100*time.Millisecond)
 	require.Less(t, time.Since(start), time.Second)
-	require.Len(t, MCPToolNamesByServiceID(r)[fast.ID], 1)
-	require.Empty(t, MCPToolNamesByServiceID(r)[slow.ID])
+	require.Equal(t, "ready", c.servers[fast.ID].summary(fast.ID).Status)
+	require.Equal(t, "loading", c.servers[slow.ID].summary(slow.ID).Status)
+	describeTool(ctx, t, r, fast.ID, "lookup")
+	r.RefreshMCPTools(ctx)
+	require.Len(t, registeredMCPToolNames(r, fast.ID), 1)
+	require.Empty(t, registeredMCPToolNames(r, slow.ID))
 	close(release)
 	select {
 	case <-c.preloadDone:
 	case <-time.After(time.Second):
 		t.Fatal("startup never completed")
 	}
+	require.Equal(t, "ready", c.servers[slow.ID].summary(slow.ID).Status)
+	describeTool(ctx, t, r, slow.ID, "lookup")
 	r.RefreshMCPTools(ctx)
-	require.Len(t, MCPToolNamesByServiceID(r)[slow.ID], 1)
+	require.Len(t, registeredMCPToolNames(r, slow.ID), 1)
 }
 
 func TestMCPDirectExposureRevalidatesIdentityPolicyAndSchema(t *testing.T) {
@@ -220,8 +251,12 @@ func TestMCPDirectExposureRevalidatesIdentityPolicyAndSchema(t *testing.T) {
 	)
 	r := NewToolRegistry()
 	installMCPCatalog(r, c)
-	r.prepareMCPTools(ctx, time.Second)
-	name := MCPToolNamesByServiceID(r)[service.ID][0]
+	r.PrepareMCPTools(ctx)
+	describeTool(ctx, t, r, service.ID, "get")
+	r.RefreshMCPTools(ctx)
+	names := registeredMCPToolNames(r, service.ID)
+	require.Len(t, names, 1)
+	name := names[0]
 	bound, _ := r.GetTool(name)
 	// Keep the advertised definition and prove it cannot cross identities.
 	other := types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalWebUser, ID: "someone-else"})
@@ -233,7 +268,7 @@ func TestMCPDirectExposureRevalidatesIdentityPolicyAndSchema(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.Success)
 	r.RefreshMCPTools(ctx)
-	require.Empty(t, MCPToolNamesByServiceID(r)[service.ID])
+	require.Empty(t, registeredMCPToolNames(r, service.ID))
 	require.Len(t, r.GetModelFunctionDefinitions(), 1, "withdraw the proxy when no callable tools remain")
 	gate.disabled["s/get"] = false
 	current.UpdatedAt = current.UpdatedAt.Add(time.Second)
@@ -243,10 +278,13 @@ func TestMCPDirectExposureRevalidatesIdentityPolicyAndSchema(t *testing.T) {
 	require.False(t, result.Success)
 	require.Contains(t, result.Error, "definition changed")
 	r.RefreshMCPTools(ctx)
+	require.Empty(t, registeredMCPToolNames(r, service.ID), "schema changes require rediscovery before re-exposing")
+	describeTool(ctx, t, r, service.ID, "get")
+	r.RefreshMCPTools(ctx)
 	require.Equal(
 		t,
 		[]string{name},
-		MCPToolNamesByServiceID(r)[service.ID],
+		registeredMCPToolNames(r, service.ID),
 		"schema changes keep the raw tool identity",
 	)
 	current.Enabled = false
@@ -254,7 +292,7 @@ func TestMCPDirectExposureRevalidatesIdentityPolicyAndSchema(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.Success)
 	r.RefreshMCPTools(ctx)
-	require.Empty(t, MCPToolNamesByServiceID(r)[service.ID])
+	require.Empty(t, registeredMCPToolNames(r, service.ID))
 }
 
 func TestMCPDeferredSourcesStaySmallAndOnlyDescribedToolsLoad(t *testing.T) {
@@ -389,10 +427,10 @@ func TestMCPExposureRestorePreservesUncalledDefinitionsAndCurrentPolicy(t *testi
 			r.RestoreMCPExposure(refs)
 			r.RefreshMCPTools(ctx)
 			if mode == "same" {
-				require.Len(t, MCPToolNamesByServiceID(r)["server-1"], 1)
+				require.Len(t, registeredMCPToolNames(r, "server-1"), 1)
 				require.Equal(t, refs, r.MCPExposureSnapshot())
 			} else {
-				require.Empty(t, MCPToolNamesByServiceID(r)["server-1"])
+				require.Empty(t, registeredMCPToolNames(r, "server-1"))
 			}
 		})
 	}

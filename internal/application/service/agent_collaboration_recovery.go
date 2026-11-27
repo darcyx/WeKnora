@@ -321,7 +321,7 @@ func (s *AgentCollaboration) resumeParent(ctx context.Context, b *collaboration.
 
 		KnowledgeBaseIDs: saved.KnowledgeBaseIDs, KnowledgeIDs: saved.KnowledgeIDs, TagScopes: saved.TagScopes,
 		MCPServiceIDs: saved.MCPServiceIDs, SkillNames: saved.SkillNames, WebSearchEnabled: saved.WebSearchEnabled,
-		LocalBrowserEnabled: saved.LocalBrowserEnabled, AppInfo: types.SanitizeAppInfoJSON(saved.AppInfo),
+		LocalBrowserEnabled: saved.LocalBrowserEnabled, AppInfo: types.SanitizeLiveAppInfoJSON(saved.AppInfo),
 		RunNote: saved.RunNote, QuotedContext: saved.QuotedContext,
 		QuestionOrigin: saved.QuestionOrigin, PageContext: saved.PageContext, AssistantAccess: saved.AssistantAccess,
 		Mode: types.RunModeAttended, Suspendable: true, Resume: &types.AgentResume{Snapshot: data},

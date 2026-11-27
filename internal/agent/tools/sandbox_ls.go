@@ -256,11 +256,6 @@ func (t *ListSandboxFilesTool) Execute(ctx context.Context, args json.RawMessage
 	}, nil
 }
 
-// Cleanup releases any resources.
-func (t *ListSandboxFilesTool) Cleanup(ctx context.Context) error {
-	return nil
-}
-
 // formatSandboxModTime renders a mod time in the RFC3339 shape the tool has
 // historically emitted. Zero times render as the empty string so LLM output
 // stays visually clean.
